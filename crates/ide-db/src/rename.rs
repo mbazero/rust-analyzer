@@ -360,6 +360,9 @@ fn rename_reference(
                 "Invalid name `{}`: not a lifetime identifier",
                 new_name.display(sema.db, edition)
             ),
+            IdentifierKind::QualifiedPath(_, _) => {
+                bail!("Cannot use move-and-rename for lifetime or label")
+            }
         }
     } else {
         match ident_kind {
@@ -374,6 +377,10 @@ fn rename_reference(
                     "Invalid name `{}`: cannot rename to `self`",
                     new_name.display(sema.db, edition)
                 );
+            }
+            IdentifierKind::QualifiedPath(_, _) => {
+                // This should have been handled earlier in the chain
+                bail!("Qualified path detected unexpectedly in rename_reference")
             }
         }
     }
@@ -676,16 +683,23 @@ fn source_edit_from_def(
     Ok((file_id.file_id(sema.db), edit.finish()))
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum IdentifierKind {
     Ident,
     Lifetime,
     Underscore,
     LowercaseSelf,
+    /// A qualified path like `crate::module::Item` used for move-and-rename
+    QualifiedPath(Vec<Name>, Name),
 }
 
 impl IdentifierKind {
     pub fn classify(edition: Edition, new_name: &str) -> Result<(Name, IdentifierKind)> {
+        // Check if this is a qualified path (contains ::)
+        if new_name.contains("::") {
+            return Self::parse_qualified_path(edition, new_name);
+        }
+
         match parser::LexedStr::single_token(edition, new_name) {
             Some(res) => match res {
                 (SyntaxKind::IDENT, _) => Ok((Name::new_root(new_name), IdentifierKind::Ident)),
@@ -707,5 +721,53 @@ impl IdentifierKind {
             },
             None => bail!("Invalid name `{}`: not an identifier", new_name),
         }
+    }
+
+    fn parse_qualified_path(edition: Edition, path_str: &str) -> Result<(Name, IdentifierKind)> {
+        // Parse the path by splitting on ::
+        let segments: Vec<&str> = path_str.split("::").collect();
+
+        if segments.is_empty() {
+            bail!("Invalid path `{}`: empty path", path_str);
+        }
+
+        // The last segment is the new name
+        let final_name = segments.last().unwrap();
+
+        // Validate the final name is a valid identifier
+        match parser::LexedStr::single_token(edition, final_name) {
+            Some((SyntaxKind::IDENT, _)) => {},
+            _ if SyntaxKind::from_keyword(final_name, edition).is_some()
+                && !matches!(*final_name, "self" | "crate" | "super" | "Self") => {},
+            _ => bail!("Invalid path `{}`: final segment must be a valid identifier", path_str),
+        }
+
+        // Parse and validate each segment
+        let mut module_path = Vec::new();
+        for (i, segment) in segments.iter().enumerate() {
+            // Skip the last segment as it's the item name
+            if i == segments.len() - 1 {
+                break;
+            }
+
+            // Validate each segment
+            match *segment {
+                "crate" | "super" | "self" => {
+                    module_path.push(Name::new_root(segment));
+                }
+                _ => match parser::LexedStr::single_token(edition, segment) {
+                    Some((SyntaxKind::IDENT, _)) => {
+                        module_path.push(Name::new_root(segment));
+                    }
+                    _ if SyntaxKind::from_keyword(segment, edition).is_some() => {
+                        module_path.push(Name::new_root(segment));
+                    }
+                    _ => bail!("Invalid path `{}`: segment `{}` is not a valid identifier", path_str, segment),
+                }
+            }
+        }
+
+        let item_name = Name::new_root(final_name);
+        Ok((item_name.clone(), IdentifierKind::QualifiedPath(module_path, item_name)))
     }
 }

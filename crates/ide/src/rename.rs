@@ -111,6 +111,11 @@ pub(crate) fn rename(
     let edition = file_id.edition(db);
     let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
 
+    // Handle qualified path (move-and-rename) case
+    if let IdentifierKind::QualifiedPath(ref module_path, ref item_name) = kind {
+        return move_and_rename(db, &sema, position, syntax, module_path, item_name);
+    }
+
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
     let alias_fallback =
         alias_fallback(syntax, position, &new_name.display(db, edition).to_string());
@@ -129,6 +134,9 @@ pub(crate) fn rename(
                         IdentifierKind::Underscore => bail!("Cannot alias reference to `_`"),
                         IdentifierKind::LowercaseSelf => {
                             bail!("Cannot rename alias reference to `self`")
+                        }
+                        IdentifierKind::QualifiedPath(_, _) => {
+                            bail!("Cannot use move-and-rename with import aliases")
                         }
                     };
                     let mut usages = def.usages(&sema).all();
@@ -158,7 +166,7 @@ pub(crate) fn rename(
             if let Definition::Local(local) = def {
                 if let Some(self_param) = local.as_self_param(sema.db) {
                     cov_mark::hit!(rename_self_to_param);
-                    return rename_self_to_param(&sema, local, self_param, &new_name, kind);
+                    return rename_self_to_param(&sema, local, self_param, &new_name, kind.clone());
                 }
                 if kind == IdentifierKind::LowercaseSelf {
                     cov_mark::hit!(rename_to_self);
@@ -574,6 +582,114 @@ fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: String) -> O
     replacement_text.push_str("Self");
 
     Some(TextEdit::replace(self_param.syntax().text_range(), replacement_text))
+}
+
+/// Handles move-and-rename operation when renaming an item to a qualified path
+fn move_and_rename(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    position: FilePosition,
+    syntax: &SyntaxNode,
+    module_path: &[Name],
+    item_name: &Name,
+) -> RenameResult<SourceChange> {
+    
+
+    // Find the definition being renamed
+    let defs = find_definitions(sema, syntax, position, item_name)?
+        .collect::<Vec<_>>();
+
+    // For now, we only support moving a single item
+    if defs.len() != 1 {
+        bail!("Move-and-rename requires exactly one definition");
+    }
+
+    let (_frange, _, def, _, _) = defs.into_iter().next().unwrap();
+
+    // Get the item syntax node
+    let item_node = syntax.token_at_offset(position.offset)
+        .find_map(|token| {
+            token.parent_ancestors().find(|node| {
+                matches!(
+                    node.kind(),
+                    SyntaxKind::STRUCT | SyntaxKind::ENUM | SyntaxKind::FN |
+                    SyntaxKind::TRAIT | SyntaxKind::TYPE_ALIAS | SyntaxKind::CONST |
+                    SyntaxKind::STATIC | SyntaxKind::UNION | SyntaxKind::MACRO_DEF
+                )
+            })
+        })
+        .ok_or_else(|| format_err!("Could not find movable item at position"))?;
+
+    // Get the text of the item to move
+    let _item_text = item_node.text().to_string();
+
+    // Get the current module
+    let current_module = def.module(db)
+        .ok_or_else(|| format_err!("Could not determine current module"))?;
+
+    // Build the target module path
+    let _target_module = resolve_or_create_module(
+        db,
+        sema,
+        current_module,
+        module_path,
+        position.file_id,
+    )?;
+
+    // Create the source change
+    let mut source_change = SourceChangeBuilder::new(position.file_id);
+
+    // Delete the item from the original location
+    source_change.delete(item_node.text_range());
+
+    // TODO: Add the item to the target module
+    // TODO: Update all references to point to the new location
+
+    Ok(source_change.finish())
+}
+
+/// Resolves or creates a module path, creating files as needed
+fn resolve_or_create_module(
+    db: &RootDatabase,
+    _sema: &Semantics<'_, RootDatabase>,
+    from_module: hir::Module,
+    path: &[Name],
+    _anchor_file: FileId,
+) -> RenameResult<hir::Module> {
+    if path.is_empty() {
+        return Ok(from_module);
+    }
+
+    // Start from the crate root if path starts with "crate"
+    let mut current_module = if path.first().map(|n| n.as_str()) == Some("crate") {
+        from_module.crate_root(db)
+    } else {
+        from_module
+    };
+
+    // Skip "crate" segment if present
+    let path_segments = if path.first().map(|n| n.as_str()) == Some("crate") {
+        &path[1..]
+    } else {
+        path
+    };
+
+    // Traverse/create each segment
+    for segment_name in path_segments {
+        // Try to find existing child module
+        let children = current_module.children(db);
+        let existing = children.into_iter()
+            .find(|child| child.name(db).as_ref() == Some(segment_name));
+
+        if let Some(child) = existing {
+            current_module = child;
+        } else {
+            // Module doesn't exist, we need to create it
+            bail!("Module creation not yet implemented: {}", segment_name.as_str());
+        }
+    }
+
+    Ok(current_module)
 }
 
 #[cfg(test)]
@@ -3587,6 +3703,19 @@ fn bar(v: Foo) {
     v.foo(123);
 }
         "#,
+        );
+    }
+
+    #[test]
+    fn test_move_and_rename_basic() {
+        // Test that we detect qualified paths properly
+        // For now, this should fail with "Module creation not yet implemented"
+        check_expect(
+            "crate::finish::Final",
+            r#"
+struct Fi$0nal;
+            "#,
+            expect![[r#"error: Module creation not yet implemented: finish"#]],
         );
     }
 }
