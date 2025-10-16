@@ -10,6 +10,7 @@ use ide_db::{
     defs::{Definition, NameClass, NameRefClass},
     rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
     source_change::SourceChangeBuilder,
+    imports::insert_use::ImportScope,
 };
 use itertools::Itertools;
 use std::fmt::Write;
@@ -672,39 +673,57 @@ fn move_and_rename(
     builder.insert(insert_pos, format!("\n\n{}", item_text));
 
     // Update all references to point to the new location
-    // Note: We need to do this AFTER the move, so the path resolution works correctly
-    // However, since we're building the SourceChange before applying it, we need to
-    // think about this differently.
-    //
-    // For now, we'll just rename all usages to use a fully qualified path.
-    // A more sophisticated implementation would:
-    // - Add proper use statements
-    // - Use the shortest path from each usage site
-    // - Handle re-exports and visibility
+    // We use smart import management to add use statements and short names
 
     // Find all usages of the moved item
     let usages = def.usages(sema).all();
 
     // Build the fully qualified path to the new location
-    let mut new_path = String::new();
-    for segment in module_path {
-        if !new_path.is_empty() {
-            new_path.push_str("::");
-        }
-        new_path.push_str(segment.as_str());
-    }
-    if !new_path.is_empty() {
-        new_path.push_str("::");
-    }
-    new_path.push_str(item_name.as_str());
+    let full_path_str = if module_path.is_empty() {
+        item_name.as_str().to_string()
+    } else {
+        format!("{}::{}",
+            module_path.iter().map(|n| n.as_str()).collect::<Vec<_>>().join("::"),
+            item_name.as_str()
+        )
+    };
 
-    // Update all references to use the new path
+    // Group references by file and update them
     for (file_id, references) in usages.iter() {
-        builder.edit_file(file_id.file_id(db));
+        let file_id = file_id.file_id(db);
 
-        for reference in references {
-            // Replace the reference with the fully qualified path
-            builder.replace(reference.range, new_path.clone());
+        // Skip the source file where we already deleted the item
+        // (it's already being edited and we don't want overlapping edits)
+        if file_id == position.file_id {
+            continue;
+        }
+
+        builder.edit_file(file_id);
+
+        // Parse the file to get syntax tree
+        let source_file = sema.parse_guess_edition(file_id);
+
+        // Check if we can add imports (file has an import scope)
+        let can_add_imports = ImportScope::find_insert_use_container(
+            source_file.syntax(),
+            sema
+        ).is_some();
+
+        if can_add_imports {
+            // Add use statement at the beginning of the file
+            let use_stmt = format!("use {};\n", full_path_str);
+            let insert_pos = source_file.syntax().text_range().start();
+            builder.insert(insert_pos, use_stmt);
+
+            // Replace all references with just the short name
+            for reference in references {
+                builder.replace(reference.range, item_name.as_str().to_string());
+            }
+        } else {
+            // No import scope - use fully qualified path
+            for reference in references {
+                builder.replace(reference.range, full_path_str.clone());
+            }
         }
     }
 
@@ -3815,5 +3834,71 @@ struct Fi$0nal;
         if let Err(RenameError(err)) = result {
             assert!(err.contains("Module 'nonexistent' does not exist"));
         }
+    }
+
+    #[test]
+    fn test_move_with_use_statement() {
+        // Test that references get proper use statements instead of qualified paths
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Fi$0nal { value: i32 }
+
+fn usage() {
+    let x = Final { value: 42 };
+}
+
+mod bar;
+//- /bar.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::bar::Final").unwrap();
+        assert!(result.is_ok(), "Expected rename to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+
+        // Should have edits to both lib.rs and bar.rs
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // Expected behavior:
+        // - lib.rs should have "use crate::bar::Final;" and use "Final { value: 42 }"
+        // - bar.rs should have "struct Final { value: i32 }"
+    }
+
+    #[test]
+    fn test_move_multiple_references_with_imports() {
+        // Test that multiple references in the same file get a single use statement
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Fi$0nal;
+
+fn usage1() {
+    let x = Final;
+}
+
+fn usage2() {
+    let y = Final;
+}
+
+mod bar;
+//- /bar.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::bar::Final").unwrap();
+        assert!(result.is_ok(), "Expected rename to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+
+        // Should have edits to both lib.rs and bar.rs
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // Expected behavior:
+        // - lib.rs should have a single "use crate::bar::Final;"
+        // - Both references should use short name "Final"
     }
 }
