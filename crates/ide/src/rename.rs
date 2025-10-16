@@ -640,6 +640,9 @@ fn move_and_rename(
         module_path,
     )?;
 
+    // Phase 5.2.2: Validate visibility constraints before moving
+    validate_visibility_move(db, &def, current_module, target_module)?;
+
     // Get the target module's file
     let module_source = target_module.definition_source(db);
 
@@ -921,6 +924,78 @@ fn reindent_item(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Validates visibility constraints when moving items between modules
+/// Returns an error if the move would break public API
+fn validate_visibility_move(
+    db: &RootDatabase,
+    def: &Definition,
+    source_module: hir::Module,
+    target_module: hir::Module,
+) -> RenameResult<()> {
+    use hir::HasVisibility;
+
+    // Get the item's visibility (if it has one)
+    let item_visibility = match def {
+        Definition::Module(m) => Some(m.visibility(db)),
+        Definition::Function(f) => Some(f.visibility(db)),
+        Definition::Adt(adt) => Some(adt.visibility(db)),
+        Definition::Variant(v) => Some(v.visibility(db)),
+        Definition::Const(c) => Some(c.visibility(db)),
+        Definition::Static(s) => Some(s.visibility(db)),
+        Definition::Trait(t) => Some(t.visibility(db)),
+        Definition::TypeAlias(ta) => Some(ta.visibility(db)),
+        Definition::Macro(m) => Some(m.visibility(db)),
+        _ => None,
+    };
+
+    // If we can't determine visibility, allow the move
+    let item_vis = match item_visibility {
+        Some(vis) => vis,
+        None => return Ok(()),
+    };
+
+    // Get module visibilities
+    let source_vis = source_module.visibility(db);
+    let target_vis = target_module.visibility(db);
+
+    // Check if item is public
+    let is_item_public = item_vis == hir::Visibility::Public;
+
+    // Check if target module is less visible than source (simplified check)
+    let target_less_visible = matches!(
+        (source_vis, target_vis),
+        (hir::Visibility::Public, hir::Visibility::Module(..))
+    );
+
+    // Error if moving public item to less visible module
+    if is_item_public && target_less_visible {
+        let item_name = match def {
+            Definition::Module(m) => m.name(db).map(|n| n.as_str().to_string()),
+            Definition::Function(f) => Some(f.name(db).as_str().to_string()),
+            Definition::Adt(adt) => Some(adt.name(db).as_str().to_string()),
+            Definition::Const(c) => c.name(db).map(|n| n.as_str().to_string()),
+            Definition::Static(s) => Some(s.name(db).as_str().to_string()),
+            Definition::Trait(t) => Some(t.name(db).as_str().to_string()),
+            Definition::TypeAlias(ta) => Some(ta.name(db).as_str().to_string()),
+            _ => None,
+        };
+
+        let target_name = target_module.name(db)
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_else(|| "crate".to_string());
+
+        bail!(
+            "Cannot move public item '{}' to less visible module '{}'. \
+             This would break external code that depends on this item. \
+             Consider making the target module public.",
+            item_name.unwrap_or_else(|| "item".to_string()),
+            target_name
+        );
+    }
+
+    Ok(())
 }
 
 /// Finds all impl blocks for a given item in the source file
@@ -5189,5 +5264,76 @@ mod target {
         assert_eq!(source_change.source_file_edits.len(), 1, "Expected 1 file edit");
 
         // Both struct and impl should be moved into the inline module with proper indentation
+    }
+
+    #[test]
+    fn test_move_public_to_private_module_rejected() {
+        // Test that moving a public item to a private module is rejected
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+pub struct Config$0 {
+    value: String,
+}
+
+mod internal {
+}
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::internal::Config").unwrap();
+        assert!(result.is_err(), "Expected move of public item to private module to be rejected");
+
+        if let Err(err) = result {
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("Cannot move public item"), "Error should mention public item: {}", err_msg);
+            assert!(err_msg.contains("less visible"), "Error should mention visibility: {}", err_msg);
+        }
+    }
+
+    #[test]
+    fn test_move_public_to_public_module_allowed() {
+        // Test that moving a public item to another public module is allowed
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+pub struct Data$0 {
+    value: i32,
+}
+
+pub mod types;
+//- /types.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::types::Data").unwrap();
+        assert!(result.is_ok(), "Expected move of public item to public module to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_private_to_private_module_allowed() {
+        // Test that moving a private item to a private module is allowed
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Internal$0 {
+    secret: String,
+}
+
+mod hidden;
+//- /hidden.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::hidden::Internal").unwrap();
+        assert!(result.is_ok(), "Expected move of private item to private module to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
     }
 }
