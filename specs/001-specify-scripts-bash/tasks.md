@@ -7,6 +7,10 @@
 
 **Organization**: Tasks are grouped by user story to enable independent implementation and testing of each story.
 
+**Implementation Guides**:
+- 📚 **[IMPLEMENTATION_GUIDE.md](./IMPLEMENTATION_GUIDE.md)** - Detailed step-by-step guide with code examples for all 30 MVP tasks
+- 🚀 **[QUICK_START.md](./QUICK_START.md)** - Get started in 30 minutes with skeleton and first test
+
 ## Format: `[ID] [P?] [Story] Description`
 - **[P]**: Can run in parallel (different files, no dependencies)
 - **[Story]**: Which user story this task belongs to (e.g., US1, US2, US3)
