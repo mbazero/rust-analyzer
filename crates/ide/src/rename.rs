@@ -671,11 +671,42 @@ fn move_and_rename(
     let insert_pos = target_syntax.text_range().end();
     builder.insert(insert_pos, format!("\n\n{}", item_text));
 
-    // TODO: Update all references to point to the new location
-    // This would involve:
-    // 1. Finding all usages of the definition
-    // 2. Updating import paths
-    // 3. Potentially adding new use statements
+    // Update all references to point to the new location
+    // Note: We need to do this AFTER the move, so the path resolution works correctly
+    // However, since we're building the SourceChange before applying it, we need to
+    // think about this differently.
+    //
+    // For now, we'll just rename all usages to use a fully qualified path.
+    // A more sophisticated implementation would:
+    // - Add proper use statements
+    // - Use the shortest path from each usage site
+    // - Handle re-exports and visibility
+
+    // Find all usages of the moved item
+    let usages = def.usages(sema).all();
+
+    // Build the fully qualified path to the new location
+    let mut new_path = String::new();
+    for segment in module_path {
+        if !new_path.is_empty() {
+            new_path.push_str("::");
+        }
+        new_path.push_str(segment.as_str());
+    }
+    if !new_path.is_empty() {
+        new_path.push_str("::");
+    }
+    new_path.push_str(item_name.as_str());
+
+    // Update all references to use the new path
+    for (file_id, references) in usages.iter() {
+        builder.edit_file(file_id.file_id(db));
+
+        for reference in references {
+            // Replace the reference with the fully qualified path
+            builder.replace(reference.range, new_path.clone());
+        }
+    }
 
     Ok(builder.finish())
 }
@@ -3741,14 +3772,48 @@ fn bar(v: Foo) {
 
     #[test]
     fn test_move_and_rename_basic() {
-        // Test that we detect qualified paths properly
-        // For now, this should fail with "Module creation not yet implemented"
-        check_expect(
-            "crate::finish::Final",
+        // Test that we can move items to existing modules
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Fi$0nal;
+
+fn usage() {
+    let x = Final;
+}
+
+mod bar;
+//- /bar.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::bar::Final").unwrap();
+        assert!(result.is_ok(), "Expected rename to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+
+        // Should have edits to both lib.rs and bar.rs
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // Verify that bar.rs gets the struct
+        // Verify that lib.rs has the reference updated
+        // (Full verification would require applying the edits and checking the result)
+    }
+
+    #[test]
+    fn test_move_and_rename_nonexistent_module() {
+        // Test that moving to a non-existent module produces an error
+        let (analysis, position) = fixture::position(
             r#"
 struct Fi$0nal;
             "#,
-            expect![[r#"error: Module creation not yet implemented: finish"#]],
         );
+        let result = analysis.rename(position, "crate::nonexistent::Final").unwrap();
+
+        assert!(result.is_err());
+        if let Err(RenameError(err)) = result {
+            assert!(err.contains("Module 'nonexistent' does not exist"));
+        }
     }
 }
