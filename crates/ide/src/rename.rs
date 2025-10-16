@@ -643,8 +643,17 @@ fn move_and_rename(
     // Get the target module's file
     let module_source = target_module.definition_source(db);
 
+    // Phase 5.2.1: Find impl blocks before deleting anything
+    // (we need to find them while the source file is still intact)
+    let impl_blocks = find_impl_blocks_for_item(sema, position.file_id, item_name);
+
     // Delete the item from the original location first
     builder.delete(item_node.text_range());
+
+    // Also delete impl blocks
+    for impl_block in &impl_blocks {
+        builder.delete(impl_block.syntax().text_range());
+    }
 
     match module_source.value {
         ModuleSource::SourceFile(_source_file) => {
@@ -662,9 +671,17 @@ fn move_and_rename(
             let target_source = sema.parse_guess_edition(target_file_id);
             let target_syntax = target_source.syntax();
 
-            // Insert at the end of the file
+            // Insert at the end of the file (combine item + impl blocks)
             let insert_pos = target_syntax.text_range().end();
-            builder.insert(insert_pos, format!("\n\n{}", item_text));
+            let mut combined_text = format!("\n\n{}", item_text);
+
+            // Add impl blocks right after the main item
+            for impl_block in &impl_blocks {
+                let impl_text = impl_block.syntax().text().to_string();
+                combined_text.push_str(&format!("\n\n{}", impl_text));
+            }
+
+            builder.insert(insert_pos, combined_text);
         }
         ModuleSource::Module(module_ast) => {
             // Module is inline (mod foo { })
@@ -696,8 +713,17 @@ fn move_and_rename(
             // This prevents double-indentation when moving from nested contexts
             let indented_item = reindent_item(&item_text, &item_node, item_indent);
 
+            // Also re-indent and combine impl blocks
+            let mut combined_text = format!("\n{}\n{}", indented_item, base_indent);
+            for impl_block in &impl_blocks {
+                let impl_text = impl_block.syntax().text().to_string();
+                let impl_node = impl_block.syntax();
+                let indented_impl = reindent_item(&impl_text, impl_node, item_indent);
+                combined_text.push_str(&format!("\n{}\n{}", indented_impl, base_indent));
+            }
+
             // Insert with proper spacing
-            builder.insert(insert_pos, format!("\n{}\n{}", indented_item, base_indent));
+            builder.insert(insert_pos, combined_text);
         }
         ModuleSource::BlockExpr(_) => {
             bail!("Cannot move items into block modules");
@@ -725,13 +751,24 @@ fn move_and_rename(
         let file_id = file_id.file_id(db);
 
         // For the source file, we need to filter out the definition itself
-        // but still update other references (type aliases, const declarations, etc.)
+        // and any references inside moved impl blocks
         let refs_to_update: Vec<_> = if file_id == position.file_id {
-            // In source file: skip only references that overlap with the moved item definition
+            // In source file: skip references inside the item being moved and inside moved impl blocks
             references.iter()
                 .filter(|reference| {
                     // Skip if this reference is inside the item being moved
-                    !item_node.text_range().contains_range(reference.range)
+                    if item_node.text_range().contains_range(reference.range) {
+                        return false;
+                    }
+
+                    // Skip if this reference is inside any of the moved impl blocks
+                    for impl_block in &impl_blocks {
+                        if impl_block.syntax().text_range().contains_range(reference.range) {
+                            return false;
+                        }
+                    }
+
+                    true
                 })
                 .collect()
         } else {
@@ -884,6 +921,36 @@ fn reindent_item(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Finds all impl blocks for a given item in the source file
+/// Returns both inherent impls (impl Type) and trait impls (impl Trait for Type)
+fn find_impl_blocks_for_item(
+    sema: &Semantics<'_, RootDatabase>,
+    source_file_id: FileId,
+    item_name: &Name,
+) -> Vec<ast::Impl> {
+    let source_file = sema.parse_guess_edition(source_file_id);
+
+    source_file.syntax()
+        .descendants()
+        .filter_map(ast::Impl::cast)
+        .filter(|impl_block| {
+            // Check if this impl is for our moved type
+            impl_block.self_ty()
+                .map(|self_ty| {
+                    // Check if the self type contains our item name
+                    // This handles: impl Type, impl<T> Type<T>, impl Trait for Type
+                    let self_ty_text = self_ty.syntax().text().to_string();
+                    let item_name_str = item_name.as_str();
+
+                    // Simple text matching - matches "Data" in "Data", "Data<T>", etc.
+                    // This is conservative and will catch the right cases
+                    self_ty_text.contains(item_name_str)
+                })
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 /// Generates a unique alias by appending numbers (e.g., Final2, Final3)
@@ -4929,5 +4996,198 @@ mod target;
         // Should update all 10+ references to Data in source file
         // Should NOT update the struct definition (it's being moved)
         // Should NOT update the impl block self-reference (inside moved item)
+    }
+
+    #[test]
+    fn test_move_with_inherent_impl() {
+        // Test moving struct with inherent impl block (impl Type)
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Data$0 {
+    value: i32,
+}
+
+impl Data {
+    fn new(value: i32) -> Self {
+        Data { value }
+    }
+
+    fn get_value(&self) -> i32 {
+        self.value
+    }
+}
+
+fn usage() {
+    let d = Data::new(42);
+}
+
+mod target;
+//- /target.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::target::Data").unwrap();
+        assert!(result.is_ok(), "Expected move with inherent impl to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // The impl block should be moved along with the struct
+        // Source file should only have use statement and usage
+        // Target file should have both struct and impl block
+    }
+
+    #[test]
+    fn test_move_with_trait_impl() {
+        // Test moving struct with trait impl block (impl Trait for Type)
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+use std::fmt;
+
+struct Data$0 {
+    value: i32,
+}
+
+impl fmt::Debug for Data {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Data({})", self.value)
+    }
+}
+
+fn usage() {
+    let d = Data { value: 42 };
+    println!("{:?}", d);
+}
+
+mod target;
+//- /target.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::target::Data").unwrap();
+        assert!(result.is_ok(), "Expected move with trait impl to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // The trait impl should be moved along with the struct
+    }
+
+    #[test]
+    fn test_move_with_multiple_impls() {
+        // Test moving struct with both inherent and trait impls
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Data$0 {
+    value: i32,
+}
+
+impl Data {
+    fn new(value: i32) -> Self {
+        Data { value }
+    }
+}
+
+impl Clone for Data {
+    fn clone(&self) -> Self {
+        Data { value: self.value }
+    }
+}
+
+impl Default for Data {
+    fn default() -> Self {
+        Data { value: 0 }
+    }
+}
+
+mod target;
+//- /target.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::target::Data").unwrap();
+        assert!(result.is_ok(), "Expected move with multiple impls to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // All three impl blocks should be moved
+    }
+
+    #[test]
+    fn test_move_with_generic_impl() {
+        // Test moving struct with generic impl block
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Container$0<T> {
+    value: T,
+}
+
+impl<T> Container<T> {
+    fn new(value: T) -> Self {
+        Container { value }
+    }
+
+    fn get(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: Clone> Container<T> {
+    fn clone_value(&self) -> T {
+        self.value.clone()
+    }
+}
+
+mod target;
+//- /target.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::target::Container").unwrap();
+        assert!(result.is_ok(), "Expected move with generic impl to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // Both generic impl blocks should be moved
+    }
+
+    #[test]
+    fn test_move_with_impl_to_inline_module() {
+        // Test moving struct with impl to inline module
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Data$0 {
+    value: i32,
+}
+
+impl Data {
+    fn new(value: i32) -> Self {
+        Data { value }
+    }
+}
+
+mod target {
+}
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::target::Data").unwrap();
+        assert!(result.is_ok(), "Expected move with impl to inline module to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 1, "Expected 1 file edit");
+
+        // Both struct and impl should be moved into the inline module with proper indentation
     }
 }
