@@ -593,7 +593,7 @@ fn move_and_rename(
     module_path: &[Name],
     item_name: &Name,
 ) -> RenameResult<SourceChange> {
-    
+    use hir::ModuleSource;
 
     // Find the definition being renamed
     let defs = find_definitions(sema, syntax, position, item_name)?
@@ -620,41 +620,71 @@ fn move_and_rename(
         })
         .ok_or_else(|| format_err!("Could not find movable item at position"))?;
 
-    // Get the text of the item to move
-    let _item_text = item_node.text().to_string();
+    // Get the text of the item to move (preserve original text including attributes)
+    let item_text = item_node.text().to_string();
 
     // Get the current module
     let current_module = def.module(db)
         .ok_or_else(|| format_err!("Could not determine current module"))?;
 
-    // Build the target module path
-    let _target_module = resolve_or_create_module(
+    // Resolve the target module (for now, it must exist)
+    let target_module = resolve_target_module(
         db,
-        sema,
         current_module,
         module_path,
-        position.file_id,
     )?;
 
+    // Get the target module's file
+    let module_source = target_module.definition_source(db);
+    let target_editioned_file_id = match module_source.value {
+        ModuleSource::SourceFile(_source_file) => {
+            // Module is a file (e.g., foo.rs)
+            module_source.file_id.original_file(db)
+        }
+        ModuleSource::Module(_module_ast) => {
+            // Module is inline (mod foo { })
+            // For now, we don't support moving into inline modules
+            bail!("Cannot move items into inline modules (mod {{ ... }}). Target module must be in its own file.");
+        }
+        ModuleSource::BlockExpr(_) => {
+            bail!("Cannot move items into block modules");
+        }
+    };
+
+    // Convert EditionedFileId to FileId
+    let target_file_id = target_editioned_file_id.file_id(db);
+
     // Create the source change
-    let mut source_change = SourceChangeBuilder::new(position.file_id);
+    let mut builder = SourceChangeBuilder::new(position.file_id);
 
     // Delete the item from the original location
-    source_change.delete(item_node.text_range());
+    builder.delete(item_node.text_range());
 
-    // TODO: Add the item to the target module
+    // Add the item to the target module file
+    builder.edit_file(target_file_id);
+
+    // Get the target file content
+    let target_source = sema.parse_guess_edition(target_file_id);
+    let target_syntax = target_source.syntax();
+
+    // Insert at the end of the file (simple approach for now)
+    let insert_pos = target_syntax.text_range().end();
+    builder.insert(insert_pos, format!("\n\n{}", item_text));
+
     // TODO: Update all references to point to the new location
+    // This would involve:
+    // 1. Finding all usages of the definition
+    // 2. Updating import paths
+    // 3. Potentially adding new use statements
 
-    Ok(source_change.finish())
+    Ok(builder.finish())
 }
 
-/// Resolves or creates a module path, creating files as needed
-fn resolve_or_create_module(
+/// Resolves a target module from a path (module must already exist)
+fn resolve_target_module(
     db: &RootDatabase,
-    _sema: &Semantics<'_, RootDatabase>,
     from_module: hir::Module,
     path: &[Name],
-    _anchor_file: FileId,
 ) -> RenameResult<hir::Module> {
     if path.is_empty() {
         return Ok(from_module);
@@ -674,18 +704,21 @@ fn resolve_or_create_module(
         path
     };
 
-    // Traverse/create each segment
+    // Traverse the module hierarchy
     for segment_name in path_segments {
         // Try to find existing child module
         let children = current_module.children(db);
         let existing = children.into_iter()
             .find(|child| child.name(db).as_ref() == Some(segment_name));
 
-        if let Some(child) = existing {
-            current_module = child;
-        } else {
-            // Module doesn't exist, we need to create it
-            bail!("Module creation not yet implemented: {}", segment_name.as_str());
+        match existing {
+            Some(child) => current_module = child,
+            None => {
+                bail!(
+                    "Module '{}' does not exist. Please create the module first, then retry the move operation.",
+                    segment_name.as_str()
+                );
+            }
         }
     }
 
