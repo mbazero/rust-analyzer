@@ -642,37 +642,69 @@ fn move_and_rename(
 
     // Get the target module's file
     let module_source = target_module.definition_source(db);
-    let target_editioned_file_id = match module_source.value {
+
+    // Delete the item from the original location first
+    builder.delete(item_node.text_range());
+
+    match module_source.value {
         ModuleSource::SourceFile(_source_file) => {
             // Module is a file (e.g., foo.rs)
-            module_source.file_id.original_file(db)
+            let target_editioned_file_id = module_source.file_id.original_file(db);
+            let target_file_id = target_editioned_file_id.file_id(db);
+
+            // Add the item to the target module file
+            builder.edit_file(target_file_id);
+
+            // Get the target file content
+            let target_source = sema.parse_guess_edition(target_file_id);
+            let target_syntax = target_source.syntax();
+
+            // Insert at the end of the file
+            let insert_pos = target_syntax.text_range().end();
+            builder.insert(insert_pos, format!("\n\n{}", item_text));
         }
-        ModuleSource::Module(_module_ast) => {
+        ModuleSource::Module(module_ast) => {
             // Module is inline (mod foo { })
-            // For now, we don't support moving into inline modules
-            bail!("Cannot move items into inline modules (mod {{ ... }}). Target module must be in its own file.");
+            // Insert the item inside the inline module with proper indentation
+            let target_editioned_file_id = module_source.file_id.original_file(db);
+            let target_file_id = target_editioned_file_id.file_id(db);
+
+            builder.edit_file(target_file_id);
+
+            // Find the item list inside the inline module
+            let item_list = module_ast.item_list()
+                .ok_or_else(|| format_err!("Inline module has no item list"))?;
+
+            // Get insertion point (before closing brace, or at end if no brace)
+            let insert_pos = item_list.r_curly_token()
+                .map(|t| t.text_range().start())
+                .unwrap_or_else(|| item_list.syntax().text_range().end());
+
+            // Calculate indentation based on the module's indentation
+            use syntax::ast::edit::IndentLevel;
+            let base_indent = IndentLevel::from_node(module_ast.syntax());
+            let item_indent = base_indent + 1;
+
+            // Indent each line of the item
+            let indented_item = item_text
+                .lines()
+                .map(|line| {
+                    if line.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}{}", item_indent, line)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Insert with proper spacing
+            builder.insert(insert_pos, format!("\n{}\n{}", indented_item, base_indent));
         }
         ModuleSource::BlockExpr(_) => {
             bail!("Cannot move items into block modules");
         }
-    };
-
-    // Convert EditionedFileId to FileId
-    let target_file_id = target_editioned_file_id.file_id(db);
-
-    // Delete the item from the original location
-    builder.delete(item_node.text_range());
-
-    // Add the item to the target module file
-    builder.edit_file(target_file_id);
-
-    // Get the target file content
-    let target_source = sema.parse_guess_edition(target_file_id);
-    let target_syntax = target_source.syntax();
-
-    // Insert at the end of the file (simple approach for now)
-    let insert_pos = target_syntax.text_range().end();
-    builder.insert(insert_pos, format!("\n\n{}", item_text));
+    }
 
     // Update all references to point to the new location
     // We use smart import management to add use statements and short names
@@ -4274,9 +4306,33 @@ mod models;
     }
 
     #[test]
-    fn test_move_deep_nesting() {
-        // Test that moving to inline modules is properly rejected
-        // (inline module support is Phase 4, not yet implemented)
+    fn test_move_to_inline_module() {
+        // Test moving to inline modules (Phase 4 feature)
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Dat$0a;
+
+fn usage() {
+    let x = Data;
+}
+
+mod inner {
+}
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::inner::Data").unwrap();
+        assert!(result.is_ok(), "Expected inline module move to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        // Should have 1 file edit (lib.rs modified)
+        assert_eq!(source_change.source_file_edits.len(), 1, "Expected 1 file edit");
+    }
+
+    #[test]
+    fn test_move_to_nested_inline_modules() {
+        // Test moving to deeply nested inline modules
         let (analysis, position) = fixture::position(
             r#"
 //- /lib.rs
@@ -4287,15 +4343,8 @@ mod a { pub mod b { pub mod c { pub mod d {} } } }
         );
 
         let result = analysis.rename(position, "crate::a::b::c::d::Data").unwrap();
+        assert!(result.is_ok(), "Expected nested inline module move to succeed, got: {:?}", result);
 
-        // Should fail because target module 'd' is inline (not file-based)
-        assert!(result.is_err());
-        if let Err(err) = result {
-            let err_msg = err.to_string();
-            assert!(
-                err_msg.contains("Cannot move items into inline modules"),
-                "Expected inline module error, got: {}", err_msg
-            );
-        }
+        // Should successfully move into the deeply nested inline module 'd'
     }
 }
