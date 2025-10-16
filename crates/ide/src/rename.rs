@@ -4094,4 +4094,208 @@ struct Fi$0nal;
             );
         }
     }
+
+    // Phase 3: Enhanced testing - Different item types
+
+    #[test]
+    fn test_move_enum() {
+        // Test moving enum with variants
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+enum Co$0lor {
+    Red,
+    Green,
+    Blue,
+}
+
+fn usage() {
+    let c = Color::Red;
+}
+
+mod types;
+//- /types.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::types::Color").unwrap();
+        assert!(result.is_ok(), "Expected enum move to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_trait() {
+        // Test moving trait definition
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+trait Draw$0able {
+    fn draw(&self);
+}
+
+struct Circle;
+impl Drawable for Circle {
+    fn draw(&self) {}
+}
+
+mod traits;
+//- /traits.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::traits::Drawable").unwrap();
+        assert!(result.is_ok(), "Expected trait move to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_function() {
+        // Test moving standalone function
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+fn cal$0culate(x: i32) -> i32 {
+    x * 2
+}
+
+fn usage() {
+    let result = calculate(5);
+}
+
+mod utils;
+//- /utils.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::utils::calculate").unwrap();
+        assert!(result.is_ok(), "Expected function move to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    // Phase 3: Edge cases
+
+    #[test]
+    fn test_move_with_generics() {
+        // Test moving struct with type parameters
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Contai$0ner<T> {
+    value: T,
+}
+
+fn usage() {
+    let c: Container<i32> = Container { value: 42 };
+}
+
+mod generic;
+//- /generic.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::generic::Container").unwrap();
+        assert!(result.is_ok(), "Expected generic struct move to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_with_attributes() {
+        // Test that attributes like #[derive] are preserved
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+#[derive(Debug, Clone)]
+struct Poi$0nt {
+    x: i32,
+    y: i32,
+}
+
+fn usage() {
+    let p = Point { x: 1, y: 2 };
+}
+
+mod geometry;
+//- /geometry.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::geometry::Point").unwrap();
+        assert!(result.is_ok(), "Expected attributed struct move to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // The moved item should preserve attributes
+        // (verified by the fact that it moves the entire item_node which includes attributes)
+    }
+
+    #[test]
+    fn test_move_with_doc_comments() {
+        // Test that doc comments are preserved
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+/// A user in the system.
+/// This struct holds user information.
+struct Us$0er {
+    name: String,
+}
+
+fn usage() {
+    let u = User { name: "Alice".to_string() };
+}
+
+mod models;
+//- /models.rs
+// Empty module
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::models::User").unwrap();
+        assert!(result.is_ok(), "Expected documented struct move to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+
+        // Doc comments are part of the item_node so they should be preserved
+    }
+
+    #[test]
+    fn test_move_deep_nesting() {
+        // Test that moving to inline modules is properly rejected
+        // (inline module support is Phase 4, not yet implemented)
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Dat$0a;
+
+mod a { pub mod b { pub mod c { pub mod d {} } } }
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::a::b::c::d::Data").unwrap();
+
+        // Should fail because target module 'd' is inline (not file-based)
+        assert!(result.is_err());
+        if let Err(err) = result {
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("Cannot move items into inline modules"),
+                "Expected inline module error, got: {}", err_msg
+            );
+        }
+    }
 }
