@@ -746,10 +746,13 @@ fn move_and_rename(
     let full_path_str = if module_path.is_empty() {
         item_name.as_str().to_string()
     } else {
-        format!("{}::{}",
-            module_path.iter().map(|n| n.as_str()).collect::<Vec<_>>().join("::"),
-            item_name.as_str()
-        )
+        let mut path = module_path.iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        path.push_str("::");
+        path.push_str(item_name.as_str());
+        path
     };
 
     // Group references by file and update them
@@ -5493,6 +5496,392 @@ struct Product {
 
         let result = analysis.rename(position, "crate::models::User").unwrap();
         assert!(result.is_ok(), "Expected move without name conflict to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_from_inline_module() {
+        // Test moving an item FROM an inline module to a file module
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+mod inner {
+    pub struct Data$0 {
+        value: i32,
+    }
+}
+
+mod target;
+//- /target.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::target::Data").unwrap();
+        assert!(result.is_ok(), "Expected move from inline module to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_struct_with_where_clause() {
+        // Test moving a struct with a where clause
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+use std::fmt::Debug;
+
+struct Container$0<T>
+where
+    T: Debug,
+{
+    value: T,
+}
+
+mod types;
+//- /types.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::types::Container").unwrap();
+        assert!(result.is_ok(), "Expected move of struct with where clause to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_struct_with_lifetime_parameters() {
+        // Test moving a struct with lifetime parameters
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Borrowed$0<'a> {
+    data: &'a str,
+}
+
+mod types;
+//- /types.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::types::Borrowed").unwrap();
+        assert!(result.is_ok(), "Expected move of struct with lifetime to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_struct_with_derive_macros() {
+        // Test moving a struct with derive macros
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+#[derive(Debug, Clone, PartialEq)]
+struct Point$0 {
+    x: i32,
+    y: i32,
+}
+
+mod geometry;
+//- /geometry.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::geometry::Point").unwrap();
+        assert!(result.is_ok(), "Expected move of struct with derive macros to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_enum_with_doc_comments_and_attributes() {
+        // Test moving an enum with doc comments and attributes
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+/// Main status enum
+///
+/// Represents the status of an operation
+#[derive(Debug)]
+#[repr(u8)]
+enum Status$0 {
+    /// Operation pending
+    Pending,
+    /// Operation complete
+    Complete,
+}
+
+mod types;
+//- /types.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::types::Status").unwrap();
+        assert!(result.is_ok(), "Expected move of enum with docs and attributes to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_function_with_complex_signature() {
+        // Test moving a function with complex signature (generics, where clause, lifetimes)
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+use std::fmt::Debug;
+
+fn process$0<'a, T>(data: &'a T) -> &'a T
+where
+    T: Debug + Clone,
+{
+    data
+}
+
+mod utils;
+//- /utils.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::utils::process").unwrap();
+        assert!(result.is_ok(), "Expected move of function with complex signature to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_trait_with_associated_items() {
+        // Test moving a trait with associated types and constants
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+trait Container$0 {
+    type Item;
+    const MAX_SIZE: usize;
+
+    fn get(&self) -> Self::Item;
+}
+
+mod traits;
+//- /traits.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::traits::Container").unwrap();
+        assert!(result.is_ok(), "Expected move of trait with associated items to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_type_alias() {
+        // Test moving a type alias
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+type Result$0<T> = std::result::Result<T, String>;
+
+mod types;
+//- /types.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::types::Result").unwrap();
+        assert!(result.is_ok(), "Expected move of type alias to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_const_item() {
+        // Test moving a const item
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+const MAX_CONNECTIONS$0: usize = 100;
+
+mod config;
+//- /config.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::config::MAX_CONNECTIONS").unwrap();
+        assert!(result.is_ok(), "Expected move of const to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_static_item() {
+        // Test moving a static item
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+static GLOBAL_COUNTER$0: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+mod globals;
+//- /globals.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::globals::GLOBAL_COUNTER").unwrap();
+        assert!(result.is_ok(), "Expected move of static to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_with_multiple_attributes() {
+        // Test moving an item with multiple attributes
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+#[allow(dead_code)]
+#[derive(Debug)]
+#[doc = "Test data structure"]
+struct TestData$0 {
+    value: i32,
+}
+
+mod test_utils;
+//- /test_utils.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::test_utils::TestData").unwrap();
+        assert!(result.is_ok(), "Expected move with multiple attributes to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_generic_struct_with_bounds() {
+        // Test moving a generic struct with trait bounds
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+use std::fmt::Display;
+
+struct Wrapper$0<T: Display> {
+    inner: T,
+}
+
+mod wrappers;
+//- /wrappers.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::wrappers::Wrapper").unwrap();
+        assert!(result.is_ok(), "Expected move of generic struct with bounds to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_enum_with_complex_variants() {
+        // Test moving an enum with complex variant types
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+enum Message$0 {
+    Quit,
+    Move { x: i32, y: i32 },
+    Write(String),
+    ChangeColor(u8, u8, u8),
+}
+
+mod messages;
+//- /messages.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::messages::Message").unwrap();
+        assert!(result.is_ok(), "Expected move of enum with complex variants to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_struct_used_in_type_position() {
+        // Test moving a struct that's used in various type positions
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Point$0 {
+    x: i32,
+    y: i32,
+}
+
+fn distance(p: Point) -> f64 {
+    ((p.x * p.x + p.y * p.y) as f64).sqrt()
+}
+
+type PointPair = (Point, Point);
+
+mod geometry;
+//- /geometry.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::geometry::Point").unwrap();
+        assert!(result.is_ok(), "Expected move of struct used in type positions to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_preserves_multiline_doc_comments() {
+        // Test that multiline documentation is preserved
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+/// A configuration structure.
+///
+/// # Examples
+///
+/// ```
+/// let config = Config::new();
+/// ```
+struct Config$0 {
+    value: String,
+}
+
+mod config;
+//- /config.rs
+// Empty
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::config::Config").unwrap();
+        assert!(result.is_ok(), "Expected move preserving multiline docs to succeed, got: {:?}", result);
 
         let source_change = result.unwrap();
         assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
