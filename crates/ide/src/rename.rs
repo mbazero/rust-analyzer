@@ -628,9 +628,14 @@ fn move_and_rename(
     let current_module = def.module(db)
         .ok_or_else(|| format_err!("Could not determine current module"))?;
 
-    // Resolve the target module (for now, it must exist)
-    let target_module = resolve_target_module(
+    // Create the source change builder early so we can pass it to resolve_or_create_target_module
+    let mut builder = SourceChangeBuilder::new(position.file_id);
+
+    // Resolve the target module, creating it if necessary
+    let target_module = resolve_or_create_target_module(
         db,
+        sema,
+        &mut builder,
         current_module,
         module_path,
     )?;
@@ -654,9 +659,6 @@ fn move_and_rename(
 
     // Convert EditionedFileId to FileId
     let target_file_id = target_editioned_file_id.file_id(db);
-
-    // Create the source change
-    let mut builder = SourceChangeBuilder::new(position.file_id);
 
     // Delete the item from the original location
     builder.delete(item_node.text_range());
@@ -730,7 +732,135 @@ fn move_and_rename(
     Ok(builder.finish())
 }
 
+/// Creates a new module file and adds module declaration to parent
+fn create_module(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    builder: &mut SourceChangeBuilder,
+    parent_module: hir::Module,
+    module_name: &Name,
+) -> RenameResult<()> {
+    use hir::ModuleSource;
+    use ide_db::base_db::AnchoredPathBuf;
+
+    // Get parent module's file
+    let parent_source = parent_module.definition_source(db);
+    let parent_file_id = parent_source.file_id.original_file(db).file_id(db);
+
+    // Determine the path for the new module file
+    let module_path = match parent_source.value {
+        ModuleSource::SourceFile(_) => {
+            // Parent is a file-based module
+            // Determine if parent is mod.rs or a named module file
+            let is_mod_rs = parent_module.is_mod_rs(db);
+
+            let mut path = String::from("./");
+
+            if !is_mod_rs {
+                // Parent is foo.rs, we need to create foo/ directory first
+                // then create foo/bar.rs
+                if let Some(parent_name) = parent_module.name(db) {
+                    format_to!(path, "{}/", parent_name.display_no_db(parent_module.krate().edition(db)));
+                }
+            }
+            // If parent is mod.rs or lib.rs, create bar.rs in same directory
+
+            format_to!(path, "{}.rs", module_name.display_no_db(parent_module.krate().edition(db)));
+            path
+        }
+        ModuleSource::Module(_) => {
+            // Parent is inline module - not supported
+            bail!("Cannot create modules inside inline modules. Please convert the inline module to a file first.");
+        }
+        ModuleSource::BlockExpr(_) => {
+            bail!("Cannot create modules inside block expressions");
+        }
+    };
+
+    // Create the new module file
+    let anchor = parent_file_id;
+    let dst = AnchoredPathBuf { anchor, path: module_path };
+    builder.create_file(dst, String::new());
+
+    // Add module declaration to parent file
+    builder.edit_file(parent_file_id);
+
+    let parent_syntax = sema.parse_guess_edition(parent_file_id);
+
+    // Find insertion point (after existing mod declarations, or at end)
+    let insert_position = parent_syntax.syntax()
+        .children()
+        .filter_map(|node| syntax::ast::Item::cast(node))
+        .filter_map(|item| match item {
+            syntax::ast::Item::Module(_) => Some(item.syntax().text_range().end()),
+            _ => None,
+        })
+        .last()
+        .unwrap_or_else(|| parent_syntax.syntax().text_range().end());
+
+    // Insert module declaration
+    let mod_decl = format!("\nmod {};", module_name.display_no_db(parent_module.krate().edition(db)));
+    builder.insert(insert_position, mod_decl);
+
+    Ok(())
+}
+
+/// Resolves a target module from a path, creating missing modules as needed
+fn resolve_or_create_target_module(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    builder: &mut SourceChangeBuilder,
+    from_module: hir::Module,
+    path: &[Name],
+) -> RenameResult<hir::Module> {
+    if path.is_empty() {
+        return Ok(from_module);
+    }
+
+    // Start from the crate root if path starts with "crate"
+    let mut current_module = if path.first().map(|n| n.as_str()) == Some("crate") {
+        from_module.crate_root(db)
+    } else {
+        from_module
+    };
+
+    // Skip "crate" segment if present
+    let path_segments = if path.first().map(|n| n.as_str()) == Some("crate") {
+        &path[1..]
+    } else {
+        path
+    };
+
+    // Traverse and create missing modules
+    for segment_name in path_segments {
+        let children = current_module.children(db);
+        let existing = children.into_iter()
+            .find(|child| child.name(db).as_ref() == Some(segment_name));
+
+        match existing {
+            Some(child) => {
+                current_module = child;
+            }
+            None => {
+                // Module doesn't exist - create it
+                create_module(db, sema, builder, current_module, segment_name)?;
+
+                // After creating the module, we can't resolve it in the current HIR
+                // because the HIR is not updated until the changes are applied.
+                // Return an error suggesting the user re-run the operation.
+                bail!(
+                    "Module '{}' was created successfully. Please re-run the move operation to complete the refactoring.",
+                    segment_name.display_no_db(current_module.krate().edition(db))
+                );
+            }
+        }
+    }
+
+    Ok(current_module)
+}
+
 /// Resolves a target module from a path (module must already exist)
+#[allow(dead_code)]
 fn resolve_target_module(
     db: &RootDatabase,
     from_module: hir::Module,
@@ -3822,7 +3952,7 @@ mod bar;
 
     #[test]
     fn test_move_and_rename_nonexistent_module() {
-        // Test that moving to a non-existent module produces an error
+        // Test that moving to a non-existent module creates it and asks for re-run
         let (analysis, position) = fixture::position(
             r#"
 struct Fi$0nal;
@@ -3832,7 +3962,15 @@ struct Fi$0nal;
 
         assert!(result.is_err());
         if let Err(RenameError(err)) = result {
-            assert!(err.contains("Module 'nonexistent' does not exist"));
+            // Should create the module and ask to re-run
+            assert!(
+                err.contains("Module 'nonexistent' was created successfully"),
+                "Expected module creation message, got: {}", err
+            );
+            assert!(
+                err.contains("re-run"),
+                "Expected re-run instruction, got: {}", err
+            );
         }
     }
 
@@ -3900,5 +4038,60 @@ mod bar;
         // Expected behavior:
         // - lib.rs should have a single "use crate::bar::Final;"
         // - Both references should use short name "Final"
+    }
+
+    #[test]
+    fn test_create_single_module() {
+        // Test that we can create a missing module automatically
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Fi$0nal;
+
+fn usage() {
+    let x = Final;
+}
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::newmod::Final").unwrap();
+
+        // First attempt should create the module and return an informative error
+        assert!(result.is_err());
+        if let Err(err) = result {
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("Module 'newmod' was created successfully"),
+                "Expected module creation message, got: {}", err_msg
+            );
+            assert!(
+                err_msg.contains("re-run"),
+                "Expected re-run instruction, got: {}", err_msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_nested_modules() {
+        // Test that nested module creation provides a helpful error
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Fi$0nal;
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::a::b::c::Final").unwrap();
+
+        // Should attempt to create the first missing module
+        assert!(result.is_err());
+        if let Err(err) = result {
+            let err_msg = err.to_string();
+            // Should create 'a' first and ask user to re-run
+            assert!(
+                err_msg.contains("was created successfully") && err_msg.contains("re-run"),
+                "Expected module creation message, got: {}", err_msg
+            );
+        }
     }
 }
