@@ -4,7 +4,7 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, InFile, Name, Semantics, sym};
+use hir::{AsAssocItem, InFile, Name, ScopeDef, Semantics, sym};
 use ide_db::{
     FileId, FileRange, RootDatabase,
     defs::{Definition, NameClass, NameRefClass},
@@ -643,6 +643,9 @@ fn move_and_rename(
     // Phase 5.2.2: Validate visibility constraints before moving
     validate_visibility_move(db, &def, current_module, target_module)?;
 
+    // Phase 5.2.3: Check for name conflicts in target module
+    check_name_conflict(db, target_module, item_name, &def)?;
+
     // Get the target module's file
     let module_source = target_module.definition_source(db);
 
@@ -993,6 +996,81 @@ fn validate_visibility_move(
             item_name.unwrap_or_else(|| "item".to_string()),
             target_name
         );
+    }
+
+    Ok(())
+}
+
+/// Checks if the target module already contains an item with the same name
+/// Returns an error if a name conflict is detected
+fn check_name_conflict(
+    db: &RootDatabase,
+    target_module: hir::Module,
+    item_name: &Name,
+    moving_def: &Definition,
+) -> RenameResult<()> {
+    // Get all items in the target module
+    let scope = target_module.scope(db, None);
+
+    // Check each item in the scope for name conflicts
+    for (name, def) in scope {
+        if &name == item_name {
+            // Found an item with the same name - check if it's the same kind
+            let conflict_kind = match def {
+                ScopeDef::ModuleDef(module_def) => match module_def {
+                    hir::ModuleDef::Module(_) => "module",
+                    hir::ModuleDef::Function(_) => "function",
+                    hir::ModuleDef::Adt(adt) => match adt {
+                        hir::Adt::Struct(_) => "struct",
+                        hir::Adt::Union(_) => "union",
+                        hir::Adt::Enum(_) => "enum",
+                    },
+                    hir::ModuleDef::Variant(_) => "variant",
+                    hir::ModuleDef::Const(_) => "const",
+                    hir::ModuleDef::Static(_) => "static",
+                    hir::ModuleDef::Trait(_) => "trait",
+                    hir::ModuleDef::TypeAlias(_) => "type alias",
+                    hir::ModuleDef::Macro(_) => "macro",
+                    hir::ModuleDef::BuiltinType(_) => "builtin type",
+                },
+                ScopeDef::GenericParam(_) => "generic parameter",
+                ScopeDef::ImplSelfType(_) => "impl self type",
+                ScopeDef::AdtSelfType(_) => "adt self type",
+                ScopeDef::Local(_) => continue, // Local variables don't cause conflicts
+                ScopeDef::Label(_) => continue,  // Labels don't cause conflicts
+                ScopeDef::Unknown => "unknown item",
+            };
+
+            let moving_kind = match moving_def {
+                Definition::Module(_) => "module",
+                Definition::Function(_) => "function",
+                Definition::Adt(adt) => match adt {
+                    hir::Adt::Struct(_) => "struct",
+                    hir::Adt::Union(_) => "union",
+                    hir::Adt::Enum(_) => "enum",
+                },
+                Definition::Variant(_) => "variant",
+                Definition::Const(_) => "const",
+                Definition::Static(_) => "static",
+                Definition::Trait(_) => "trait",
+                Definition::TypeAlias(_) => "type alias",
+                Definition::Macro(_) => "macro",
+                _ => "item",
+            };
+
+            let target_name = target_module.name(db)
+                .map(|n| n.as_str().to_string())
+                .unwrap_or_else(|| "crate".to_string());
+
+            bail!(
+                "Cannot move {} '{}' to module '{}': a {} with the same name already exists in the target module. \
+                 Consider renaming one of the items to avoid the conflict.",
+                moving_kind,
+                item_name.as_str(),
+                target_name,
+                conflict_kind
+            );
+        }
     }
 
     Ok(())
@@ -5332,6 +5410,89 @@ mod hidden;
 
         let result = analysis.rename(position, "crate::hidden::Internal").unwrap();
         assert!(result.is_ok(), "Expected move of private item to private module to succeed, got: {:?}", result);
+
+        let source_change = result.unwrap();
+        assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
+    }
+
+    #[test]
+    fn test_move_struct_with_name_conflict_rejected() {
+        // Test that moving a struct to a module that already has a struct with the same name is rejected
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct Config$0 {
+    value: String,
+}
+
+mod settings;
+//- /settings.rs
+struct Config {
+    data: i32,
+}
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::settings::Config").unwrap();
+        assert!(result.is_err(), "Expected move with name conflict to be rejected");
+
+        if let Err(err) = result {
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("already exists"), "Error should mention existing item: {}", err_msg);
+            assert!(err_msg.contains("Config"), "Error should mention the conflicting name: {}", err_msg);
+            assert!(err_msg.contains("settings"), "Error should mention the target module: {}", err_msg);
+        }
+    }
+
+    #[test]
+    fn test_move_function_with_name_conflict_rejected() {
+        // Test that moving a function to a module with a function of the same name is rejected
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+fn process$0(x: i32) -> i32 {
+    x * 2
+}
+
+mod utils;
+//- /utils.rs
+pub fn process(y: i32) -> i32 {
+    y + 1
+}
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::utils::process").unwrap();
+        assert!(result.is_err(), "Expected move with name conflict to be rejected");
+
+        if let Err(err) = result {
+            let err_msg = err.to_string();
+            assert!(err_msg.contains("function"), "Error should mention function type: {}", err_msg);
+            assert!(err_msg.contains("process"), "Error should mention the conflicting name: {}", err_msg);
+            assert!(err_msg.contains("already exists"), "Error should mention existing item: {}", err_msg);
+        }
+    }
+
+    #[test]
+    fn test_move_to_module_without_conflict_allowed() {
+        // Test that moving an item to a module without name conflicts is allowed
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+struct User$0 {
+    name: String,
+}
+
+mod models;
+//- /models.rs
+struct Product {
+    price: f64,
+}
+            "#,
+        );
+
+        let result = analysis.rename(position, "crate::models::User").unwrap();
+        assert!(result.is_ok(), "Expected move without name conflict to succeed, got: {:?}", result);
 
         let source_change = result.unwrap();
         assert_eq!(source_change.source_file_edits.len(), 2, "Expected 2 file edits");
