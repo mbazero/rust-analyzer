@@ -27,6 +27,15 @@ pub use ide_db::rename::RenameError;
 
 type RenameResult<T> = Result<T, RenameError>;
 
+/// Detect if the input string represents a move operation (fully-qualified path).
+///
+/// T028: Integration point for move item refactoring
+/// A move operation is indicated by a fully-qualified path starting with `crate::`
+/// and containing at least one more `::` separator.
+fn is_move_operation(new_name: &str) -> bool {
+    new_name.starts_with("crate::") && new_name.matches("::").count() >= 2
+}
+
 /// This is similar to `collect::<Result<Vec<_>, _>>`, but unlike it, it succeeds if there is *any* `Ok` item.
 fn ok_if_any<T, E>(iter: impl Iterator<Item = Result<T, E>>) -> Result<Vec<T>, E> {
     let mut err = None;
@@ -101,6 +110,20 @@ pub(crate) fn rename(
     position: FilePosition,
     new_name: &str,
 ) -> RenameResult<SourceChange> {
+    // T028: Check if this is a move operation (fully-qualified path)
+    // If the new name starts with "crate::" and contains "::", it's a move operation
+    if is_move_operation(new_name) {
+        // For now, return an error suggesting the feature is in development
+        // TODO: Implement actual move_item integration once T025-T027 are complete
+        return Err(format_err!(
+            "Move item refactoring is currently in development. \
+             The new name '{}' appears to be a fully-qualified path. \
+             To move an item between modules, this feature will be available once \
+             tasks T025-T027 (reference finding and import rewriting) are implemented.",
+            new_name
+        ));
+    }
+
     let sema = Semantics::new(db);
     let file_id = sema
         .attach_first_edition(position.file_id)
@@ -3585,6 +3608,38 @@ impl Foo {
 
 fn bar(v: Foo) {
     v.foo(123);
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn test_move_operation_detection() {
+        // T028: Test that fully-qualified paths are detected as move operations
+        check(
+            "crate::models::entities::User",
+            r#"
+struct User$0 {
+    id: u64,
+}
+        "#,
+            r#"error: Move item refactoring is currently in development. The new name 'crate::models::entities::User' appears to be a fully-qualified path. To move an item between modules, this feature will be available once tasks T025-T027 (reference finding and import rewriting) are implemented."#,
+        );
+    }
+
+    #[test]
+    fn test_normal_rename_still_works() {
+        // T028: Verify that normal renames (without paths) still work
+        check(
+            "NewName",
+            r#"
+struct OldName$0 {
+    id: u64,
+}
+        "#,
+            r#"
+struct NewName {
+    id: u64,
 }
         "#,
         );

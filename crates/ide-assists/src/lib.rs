@@ -191,6 +191,7 @@ mod handlers {
     mod move_const_to_impl;
     mod move_from_mod_rs;
     mod move_guard;
+    mod move_item;
     mod move_module_to_file;
     mod move_to_mod_rs;
     mod normalize_import;

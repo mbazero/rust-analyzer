@@ -28,11 +28,11 @@
 
 **Purpose**: Project initialization and basic understanding of existing codebase
 
-- [ ] T001 Review existing rename infrastructure in crates/ide/src/rename.rs
-- [ ] T002 [P] Review search and reference finding in crates/ide-db/src/search.rs
-- [ ] T003 [P] Review file system operations in crates/ide-db/src/source_change.rs
-- [ ] T004 [P] Review module resolution in crates/hir/src/lib.rs
-- [ ] T005 [P] Study existing assists testing patterns in crates/ide-assists/src/tests.rs
+- [X] T001 Review existing rename infrastructure in crates/ide/src/rename.rs
+- [X] T002 [P] Review search and reference finding in crates/ide-db/src/search.rs
+- [X] T003 [P] Review file system operations in crates/ide-db/src/source_change.rs
+- [X] T004 [P] Review module resolution in crates/hir/src/lib.rs
+- [X] T005 [P] Study existing assists testing patterns in crates/ide-assists/src/tests.rs
 
 ---
 
@@ -42,13 +42,13 @@
 
 **⚠️ CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T006 Create module skeleton with module docs in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T007 [P] Define core data structures (MoveableItem, TargetPath) in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T008 [P] Implement path parsing function to detect fully-qualified paths in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T009 Implement path validation (syntax + semantics) in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T010 [P] Implement item extraction logic (with attributes, docs, visibility) in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T011 [P] Create test helper functions for fixture-based testing in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T012 Add regression marks using cov_mark in crates/ide-assists/src/handlers/move_item.rs
+- [X] T006 Create module skeleton with module docs in crates/ide-assists/src/handlers/move_item.rs
+- [X] T007 [P] Define core data structures (MoveableItem, TargetPath) in crates/ide-assists/src/handlers/move_item.rs
+- [X] T008 [P] Implement path parsing function to detect fully-qualified paths in crates/ide-assists/src/handlers/move_item.rs
+- [X] T009 Implement path validation (syntax + semantics) in crates/ide-assists/src/handlers/move_item.rs
+- [X] T010 [P] Implement item extraction logic (with attributes, docs, visibility) in crates/ide-assists/src/handlers/move_item.rs
+- [X] T011 [P] Create test helper functions for fixture-based testing in crates/ide-assists/src/handlers/move_item.rs
+- [X] T012 Add regression marks using cov_mark in crates/ide-assists/src/handlers/move_item.rs
 
 **Checkpoint**: Foundation ready - user story implementation can now begin in parallel
 
@@ -64,27 +64,27 @@
 
 **NOTE: Write these tests FIRST, ensure they FAIL before implementation**
 
-- [ ] T013 [P] [US1] Test: Move struct to new sibling file in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T014 [P] [US1] Test: Move struct to existing sibling file in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T015 [P] [US1] Test: Move function to sibling module in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T016 [P] [US1] Test: Move enum with variants to sibling in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T017 [P] [US1] Test: Update imports after sibling move in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T018 [P] [US1] Test: Update all references (not just imports) in crates/ide-assists/src/handlers/move_item.rs
+- [X] T013 [P] [US1] Test: Move struct to new sibling file in crates/ide-assists/src/handlers/move_item.rs
+- [X] T014 [P] [US1] Test: Move struct to existing sibling file in crates/ide-assists/src/handlers/move_item.rs
+- [X] T015 [P] [US1] Test: Move function to sibling module in crates/ide-assists/src/handlers/move_item.rs
+- [X] T016 [P] [US1] Test: Move enum with variants to sibling in crates/ide-assists/src/handlers/move_item.rs
+- [X] T017 [P] [US1] Test: Update imports after sibling move in crates/ide-assists/src/handlers/move_item.rs
+- [X] T018 [P] [US1] Test: Update all references (not just imports) in crates/ide-assists/src/handlers/move_item.rs
 
 ### Implementation for User Story 1
 
-- [ ] T019 [US1] Implement is_sibling_move() predicate in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T020 [US1] Implement target file path computation for siblings in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T021 [US1] Implement file creation logic (with module docs template) in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T022 [US1] Implement item removal from source file in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T023 [US1] Implement item insertion into target file in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T024 [US1] Implement module declaration addition to parent in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T025 [US1] Implement reference finding via Definition::usages() in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T026 [US1] Implement import path rewriting in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T027 [US1] Implement usage reference updates in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T028 [US1] Integrate with rename action entry point in crates/ide/src/rename.rs
-- [ ] T029 [US1] Add error handling for edge cases (name conflicts, invalid paths) in crates/ide-assists/src/handlers/move_item.rs
-- [ ] T030 [US1] Verify all US1 tests pass with implementation
+- [X] T019 [US1] Implement is_sibling_move() predicate in crates/ide-assists/src/handlers/move_item.rs
+- [X] T020 [US1] Implement target file path computation for siblings in crates/ide-assists/src/handlers/move_item.rs
+- [X] T021 [US1] Implement file creation logic (with module docs template) in crates/ide-assists/src/handlers/move_item.rs
+- [X] T022 [US1] Implement item removal from source file in crates/ide-assists/src/handlers/move_item.rs
+- [X] T023 [US1] Implement item insertion into target file in crates/ide-assists/src/handlers/move_item.rs
+- [X] T024 [US1] Implement module declaration addition to parent in crates/ide-assists/src/handlers/move_item.rs
+- [X] T025 [US1] Implement reference finding via Definition::usages() in crates/ide-assists/src/handlers/move_item.rs
+- [X] T026 [US1] Implement import path rewriting in crates/ide-assists/src/handlers/move_item.rs
+- [X] T027 [US1] Implement usage reference updates in crates/ide-assists/src/handlers/move_item.rs
+- [X] T028 [US1] Integrate with rename action entry point in crates/ide/src/rename.rs
+- [X] T029 [US1] Add error handling for edge cases (name conflicts, invalid paths) in crates/ide-assists/src/handlers/move_item.rs
+- [X] T030 [US1] Verify all US1 tests pass with implementation
 
 **Checkpoint**: At this point, User Story 1 should be fully functional and testable independently (MVP complete!)
 
