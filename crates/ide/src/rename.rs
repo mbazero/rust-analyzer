@@ -27,6 +27,73 @@ pub use ide_db::rename::RenameError;
 
 type RenameResult<T> = Result<T, RenameError>;
 
+fn is_path_like(new_name: &str) -> bool {
+    new_name.contains("::") && (new_name.starts_with("crate::") || new_name.starts_with("self::"))
+}
+
+fn split_path_segments(path: &str) -> Option<Vec<&str>> {
+    // Accept raw idents as-is (e.g., r#mod) and simple crate/self roots
+    if !(path.starts_with("crate::") || path.starts_with("self::")) {
+        return None;
+    }
+    Some(path.split("::").collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveKind {
+    Child,
+    Unsupported,
+}
+
+fn classify_move_to_child(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    segs: &[&str],
+) -> RenameResult<(MoveKind, hir::Module, String, String)> {
+    // segs like: [crate, m1, ..., mk, child, Item]
+    if segs.len() < 3 { // must have at least crate::child::Item
+        return Err(format_err!("Invalid path: expected crate::<child>::<Item>"));
+    }
+
+    // current containing module path
+    let module = match def {
+        Definition::Adt(adt) => adt.module(sema.db),
+        Definition::Function(it) => it.module(sema.db),
+        Definition::Const(it) => it.module(sema.db),
+        Definition::Static(it) => it.module(sema.db),
+        Definition::Trait(it) => it.module(sema.db),
+        Definition::TypeAlias(it) => it.module(sema.db),
+        _ => return Err(format_err!("Only top-level items can be moved to child modules for now")),
+    };
+
+    let mut curr_path = Vec::new();
+    // Build current module path starting at crate
+    for m in module.path_to_root(sema.db).into_iter().rev() {
+        if let Some(n) = m.name(sema.db) {
+            curr_path.push(n.as_str().to_string());
+        }
+    }
+    // segs[0] is crate/self; normalize self to current module path root
+    let head_ok = segs[0] == "crate" || segs[0] == "self";
+    if !head_ok { return Err(format_err!("Path must start with crate:: or self::")); }
+
+    // target module path segments (excluding final item leaf)
+    let target_mod_segs = &segs[1..segs.len()-1];
+
+    // child-only if target_mod_segs == curr_path + [child]
+    let prefix_ok = curr_path.len() <= target_mod_segs.len()
+        && curr_path.iter().enumerate().all(|(i, s)| s == target_mod_segs[i]);
+    if target_mod_segs.len() == curr_path.len() + 1 && prefix_ok {
+        let child = target_mod_segs.last().unwrap().to_string();
+        let leaf = segs.last().unwrap().to_string();
+        return Ok((MoveKind::Child, module, child, leaf));
+    }
+
+    Ok((MoveKind::Unsupported, module, String::new(), String::new()))
+}
+
+// path computation now delegated to ide_assists::core
+
 /// This is similar to `collect::<Result<Vec<_>, _>>`, but unlike it, it succeeds if there is *any* `Ok` item.
 fn ok_if_any<T, E>(iter: impl Iterator<Item = Result<T, E>>) -> Result<Vec<T>, E> {
     let mut err = None;
@@ -109,6 +176,11 @@ pub(crate) fn rename(
     let syntax = source_file.syntax();
 
     let edition = file_id.edition(db);
+    // Path-like rename triggers move workflow (child-only MVP)
+    if is_path_like(new_name) {
+        return rename_path_move_child(db, position, new_name);
+    }
+
     let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
 
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
@@ -174,6 +246,253 @@ pub(crate) fn rename(
         .reduce(|acc, elem| acc.merge(elem))
         .ok_or_else(|| format_err!("No references found at position"))
 }
+
+fn rename_path_move_child(
+    db: &RootDatabase,
+    position: FilePosition,
+    new_path: &str,
+) -> RenameResult<SourceChange> {
+    use ide_assists::{AssistConfig, AssistResolveStrategy};
+    use ide_db::assists::ExprFillDefaultMode;
+    use ide_db::imports::insert_use::{ImportGranularity, InsertUseConfig};
+    use hir::Semantics;
+
+    let sema = Semantics::new(db);
+    let file_id = sema
+        .attach_first_edition(position.file_id)
+        .ok_or_else(|| format_err!("No references found at position"))?;
+    let source_file = sema.parse(file_id);
+    let syntax = source_file.syntax();
+
+    let edition = file_id.edition(db);
+    let segs = split_path_segments(new_path).ok_or_else(|| format_err!("Invalid path for move"))?;
+
+    // Find the single definition at position
+    let defs = find_definitions(&sema, syntax, position, &Name::new_root("_dummy"))? // new name unused here
+        .collect::<Vec<_>>();
+    let (frange, _kind, def, _n, _rd) = defs.into_iter().next().ok_or_else(|| format_err!("No references found at position"))?;
+
+    // Validate and classify move; allow multi-segment child chains
+    let (mk, parent_module, child_seg, mut leaf_seg) = classify_move_to_child(&sema, &def, &segs)?;
+    // Resolve leaf and current path
+    let mut curr_path = Vec::new();
+    for m in parent_module.path_to_root(sema.db).into_iter().rev() {
+        if let Some(n) = m.name(sema.db) {
+            curr_path.push(n.as_str().to_string());
+        }
+    }
+    let target_mod_segs = &segs[1..segs.len()-1];
+    let prefix_ok = curr_path.len() <= target_mod_segs.len()
+        && curr_path.iter().enumerate().all(|(i, s)| s == target_mod_segs[i]);
+    if !prefix_ok {
+        return Err(format_err!("Only moves to a direct child module are supported for now"));
+    }
+    if leaf_seg.is_empty() {
+        leaf_seg = segs.last().unwrap().to_string();
+    }
+    // Validate leaf identifier
+    let (_leaf_name, _idkind) = IdentifierKind::classify(edition, &leaf_seg)?;
+    let chain: Vec<&str> = target_mod_segs[curr_path.len()..].to_vec();
+    if chain.is_empty() {
+        // Same module, fall back to normal rename
+        return def.rename(&sema, &leaf_seg, RenameDefinition::Yes);
+    }
+    let first_child = if mk == MoveKind::Child { child_seg.clone() } else { chain[0].to_string() };
+
+    // Resolve the AST item and its full range in the file
+    let (item_file, item_range, item_kind, old_name_text) = find_item_range_and_kind(&sema, &def)
+        .ok_or_else(|| format_err!("Unsupported definition kind for move to child module"))?;
+
+    // Build extract change for the item's range via core engine (non-inline)
+    let assist_cfg = AssistConfig {
+        snippet_cap: None,
+        allowed: None,
+        insert_use: InsertUseConfig {
+            granularity: ImportGranularity::Crate,
+            prefix_kind: hir::PrefixKind::Plain,
+            enforce_granularity: true,
+            group: true,
+            skip_glob_imports: true,
+        },
+        prefer_no_std: false,
+        prefer_prelude: true,
+        prefer_absolute: false,
+        assist_emit_must_use: false,
+        term_search_fuel: 400,
+        term_search_borrowck: true,
+        code_action_grouping: true,
+        expr_fill_default: ExprFillDefaultMode::Todo,
+        prefer_self_ty: false,
+    };
+    let frange_item = ide_db::FileRange { file_id: item_file, range: item_range };
+    let opts = ide_assists::core::extract_engine::ExtractOpts {
+        emit_inline: false,
+        renames: vec![ide_assists::core::extract_engine::RenameSpec {
+            keyword: match item_kind {
+                ItemKindSimple::Struct => "struct",
+                ItemKindSimple::Enum => "enum",
+                ItemKindSimple::Union => "union",
+                ItemKindSimple::Fn => "fn",
+                ItemKindSimple::Const => "const",
+                ItemKindSimple::Static => "static",
+                ItemKindSimple::TypeAlias => "type",
+                ItemKindSimple::Trait => "trait",
+            },
+            old: old_name_text.clone(),
+            new_name: leaf_seg.clone(),
+        }],
+    };
+    let (mut result, mut body) = ide_assists::core::extract_engine::extract_items_to_child_module_from_range(
+        db,
+        &assist_cfg,
+        frange_item,
+        &first_child,
+        &opts,
+    )
+    .map_err(|e| format_err!("{e}"))?;
+    // If multi-segment chain, adjust references to include full path
+    if chain.len() > 1 {
+        let full_mod_prefix = chain.join("::");
+        let from = format!("{}::{}", first_child, leaf_seg);
+        let to = format!("{}::{}", full_mod_prefix, leaf_seg);
+        let mut updated = SourceChange::default();
+        for (fid, (edit, snip)) in result.source_file_edits.into_iter() {
+            let mut b = TextEdit::builder();
+            for indel in edit.into_iter() {
+                let mut text = indel.insert;
+                if !text.is_empty() {
+                    text = text.replace(&from, &to);
+                }
+                b.replace(indel.delete, text);
+            }
+            updated.insert_source_and_snippet_edit(fid, b.finish(), snip);
+        }
+        result = updated;
+    }
+
+    // Compute destination child file path and create the file
+    let first_dst = ide_assists::core::module_path::compute_child_module_file_path(
+        db,
+        parent_module,
+        item_file,
+        &first_child,
+    );
+    // File-exist detection for a clean error
+    {
+        use ide_db::base_db::{AnchoredPath, SourceDatabase};
+        if db.resolve_path(AnchoredPath { anchor: item_file, path: &first_dst.path }).is_some() {
+            return Err(format_err!("Target module file already exists"));
+        }
+    }
+    // Create nested files for the full chain
+    let mut creates: Vec<(ide_db::base_db::AnchoredPathBuf, String)> = Vec::new();
+    if chain.len() == 1 {
+        creates.push((first_dst, body));
+    } else {
+        // Helper to sanitize raw identifiers for filenames
+        let sanitize = |s: &str| s.strip_prefix("r#").unwrap_or(s).to_string();
+        // Generate first file content declaring next
+        let mut base_dir = if first_dst.path.ends_with("/mod.rs") {
+            first_dst.path.trim_end_matches("/mod.rs").to_string() + "/mod"
+        } else {
+            first_dst.path.trim_end_matches(".rs").to_string()
+        };
+        let next_name = chain[1];
+        let mut first_content = format!("mod {}\n;", next_name).replace("\n;", ";");
+        first_content.push('\n');
+        creates.push((ide_db::base_db::AnchoredPathBuf { anchor: item_file, path: first_dst.path.clone() }, first_content));
+        let mut prev_path = first_dst.path.clone();
+        for (i, seg) in chain.iter().enumerate().skip(1) {
+            let seg_file = if *seg == "r#mod" { format!("{}/mod/mod.rs", base_dir) } else { format!("{}/{}.rs", base_dir, sanitize(seg)) };
+            let is_last = i == chain.len() - 1;
+            if is_last {
+                creates.push((ide_db::base_db::AnchoredPathBuf { anchor: item_file, path: seg_file.clone() }, body.clone()));
+            } else {
+                let next = chain[i + 1];
+                let mut content = format!("mod {}\n;", next).replace("\n;", ";");
+                content.push('\n');
+                creates.push((ide_db::base_db::AnchoredPathBuf { anchor: item_file, path: seg_file.clone() }, content));
+            }
+            base_dir = if *seg == "r#mod" { format!("{}/mod", base_dir) } else { format!("{}/{}", base_dir, sanitize(seg)) };
+            prev_path = seg_file;
+        }
+    }
+    for (dst, initial_contents) in creates {
+        result.push_file_system_edit(ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents });
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemKindSimple {
+    Struct,
+    Enum,
+    Union,
+    Fn,
+    Const,
+    Static,
+    TypeAlias,
+    Trait,
+}
+
+fn find_item_range_and_kind(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+) -> Option<(FileId, TextRange, ItemKindSimple, String)> {
+    match def {
+        Definition::Adt(hir::Adt::Struct(it)) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db).as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::Struct, name))
+        }
+        Definition::Adt(hir::Adt::Enum(it)) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db).as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::Enum, name))
+        }
+        Definition::Adt(hir::Adt::Union(it)) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db).as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::Union, name))
+        }
+        Definition::Function(it) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db).as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::Fn, name))
+        }
+        Definition::Const(it) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db)?.as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::Const, name))
+        }
+        Definition::Static(it) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db).as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::Static, name))
+        }
+        Definition::TypeAlias(it) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db).as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::TypeAlias, name))
+        }
+        Definition::Trait(it) => {
+            let src = sema.source(*it)?;
+            let name = it.name(sema.db).as_str().to_string();
+            let fid = src.file_id.original_file(sema.db).file_id(sema.db);
+            Some((fid, src.value.syntax().text_range(), ItemKindSimple::Trait, name))
+        }
+        _ => None,
+    }
+}
+
+// moved to ide_assists::core::extract_core
 
 /// Called by the client when it is about to rename a file.
 pub(crate) fn will_rename_file(
@@ -588,6 +907,226 @@ mod tests {
     use crate::fixture;
 
     use super::{RangeInfo, RenameError};
+
+    #[test]
+    fn rename_move_to_child_from_crate_root_creates_file_and_decl() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+struct ToMove$0;
+"#);
+        let sc = analysis
+            .rename(position, "crate::child::Final")
+            .unwrap()
+            .expect("expected SourceChange");
+
+        // ensure we create the child file with the moved item renamed
+        assert_eq!(sc.file_system_edits.len(), 1);
+        match &sc.file_system_edits[0] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "child.rs");
+                assert!(initial_contents.contains("struct Final"));
+            }
+            _ => panic!("expected CreateFile edit"),
+        }
+
+        // ensure we declare the new module at the original site
+        let has_mod_decl = sc.source_file_edits.iter().any(|(_, (edit, _))| {
+            edit.into_iter().any(|indel| indel.insert.contains("mod child;"))
+        });
+        assert!(has_mod_decl, "expected mod child; declaration in source edits");
+    }
+
+    #[test]
+    fn rename_move_to_child_from_mod_rs_creates_file_in_dir() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+mod m;
+
+//- /m/mod.rs
+struct ToMove$0;
+"#);
+        let sc = analysis
+            .rename(position, "crate::m::child::Final")
+            .unwrap()
+            .expect("expected SourceChange");
+
+        assert_eq!(sc.file_system_edits.len(), 1);
+        match &sc.file_system_edits[0] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "child.rs");
+                assert!(initial_contents.contains("struct Final"));
+            }
+            _ => panic!("expected CreateFile edit"),
+        }
+    }
+
+    #[test]
+    fn rename_move_to_multi_segment_child_from_mod_rs_works() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+mod m;
+
+//- /m/mod.rs
+struct ToMove$0;
+"#);
+        let sc = analysis
+            .rename(position, "crate::m::a::b::Final")
+            .unwrap()
+            .expect("expected SourceChange");
+
+        assert_eq!(sc.file_system_edits.len(), 2);
+        match &sc.file_system_edits[0] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "a.rs");
+                assert!(initial_contents.contains("mod b;"));
+            }
+            _ => panic!("expected first CreateFile for a.rs"),
+        }
+        match &sc.file_system_edits[1] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "a/b.rs");
+                assert!(initial_contents.contains("struct Final"));
+            }
+            _ => panic!("expected second CreateFile for a/b.rs"),
+        }
+    }
+
+    #[test]
+    fn rename_move_to_raw_mod_child_creates_mod_mod_rs() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+struct ToMove$0;
+"#);
+        let sc = analysis
+            .rename(position, "crate::r#mod::Final")
+            .unwrap()
+            .expect("expected SourceChange");
+
+        // ensure one create for mod/mod.rs with Final
+        assert_eq!(sc.file_system_edits.len(), 1);
+        match &sc.file_system_edits[0] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "mod/mod.rs");
+                assert!(initial_contents.contains("struct Final"));
+            }
+            _ => panic!("expected CreateFile edit for mod/mod.rs"),
+        }
+        // module declaration uses raw ident
+        let has_mod_decl = sc.source_file_edits.iter().any(|(_, (edit, _))| {
+            edit.into_iter().any(|indel| indel.insert.contains("mod r#mod;"))
+        });
+        assert!(has_mod_decl, "expected mod r#mod; declaration in source edits");
+    }
+
+    #[test]
+    fn rename_move_to_multi_segment_with_raw_mod_child_works() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+struct ToMove$0;
+"#);
+        let sc = analysis
+            .rename(position, "crate::a::r#mod::Final")
+            .unwrap()
+            .expect("expected SourceChange");
+
+        assert_eq!(sc.file_system_edits.len(), 2);
+        match &sc.file_system_edits[0] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "a.rs");
+                assert!(initial_contents.contains("mod r#mod;"));
+            }
+            _ => panic!("expected first CreateFile for a.rs"),
+        }
+        match &sc.file_system_edits[1] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "a/mod/mod.rs");
+                assert!(initial_contents.contains("struct Final"));
+            }
+            _ => panic!("expected second CreateFile for a/mod/mod.rs"),
+        }
+    }
+
+    #[test]
+    fn rename_move_to_child_rejects_sibling_move() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+mod m;
+mod n;
+
+//- /m.rs
+struct ToMove$0;
+"#);
+        let err = analysis
+            .rename(position, "crate::n::child::Final")
+            .unwrap()
+            .err()
+            .expect("expected error");
+        assert_eq!(
+            err.to_string(),
+            "Only moves to a direct child module are supported for now"
+        );
+    }
+
+    #[test]
+    fn rename_move_to_multi_segment_child_works() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+struct ToMove$0;
+"#);
+        let sc = analysis
+            .rename(position, "crate::a::b::Final")
+            .unwrap()
+            .expect("expected SourceChange");
+        // expect two file creations: a.rs and a/b.rs
+        assert_eq!(sc.file_system_edits.len(), 2);
+        match &sc.file_system_edits[0] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "a.rs");
+                assert!(initial_contents.contains("mod b;"));
+            }
+            _ => panic!("expected first CreateFile for a.rs"),
+        }
+        match &sc.file_system_edits[1] {
+            ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } => {
+                assert_eq!(dst.path, "a/b.rs");
+                assert!(initial_contents.contains("struct Final"));
+            }
+            _ => panic!("expected second CreateFile for a/b.rs"),
+        }
+    }
+
+    #[test]
+    fn rename_move_to_child_rejects_unsupported_def_kinds() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+fn main() { let to$0_move = 1; }
+"#);
+        let err = analysis
+            .rename(position, "crate::child::Final")
+            .unwrap()
+            .err()
+            .expect("expected error");
+        assert_eq!(
+            err.to_string(),
+            "Only top-level items can be moved to child modules for now"
+        );
+    }
+
+    #[test]
+    fn rename_move_to_child_errors_if_file_exists() {
+        let (analysis, position) = fixture::position(r#"
+//- /main.rs
+struct ToMove$0;
+//- /child.rs
+// pre-existing child module file
+"#);
+        let err = analysis
+            .rename(position, "crate::child::Final")
+            .unwrap()
+            .err()
+            .expect("expected error");
+        assert_eq!(err.to_string(), "Target module file already exists");
+    }
 
     #[track_caller]
     fn check(

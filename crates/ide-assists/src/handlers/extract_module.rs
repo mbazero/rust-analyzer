@@ -23,6 +23,8 @@ use syntax::{
 };
 
 use crate::{AssistContext, Assists};
+use crate::core::extract_engine::{Module, generate_module_def, make_use_stmt_of_node_with_super, build_extract_change};
+use ide_db::source_change::SourceChangeBuilder;
 
 use super::remove_unused_param::range_to_remove;
 
@@ -101,134 +103,33 @@ pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
         "Extract Module",
         module_text_range,
         |builder| {
-            //This takes place in three steps:
-            //
-            //- Firstly, we will update the references(usages) e.g. converting a
-            //  function call bar() to modname::bar(), and similarly for other items
-            //
-            //- Secondly, changing the visibility of each item inside the newly selected module
-            //  i.e. making a fn a() {} to pub(crate) fn a() {}
-            //
-            //- Thirdly, resolving all the imports this includes removing paths from imports
-            //  outside the module, shifting/cloning them inside new module, or shifting the imports, or making
-            //  new import statements
-
-            //We are getting item usages and record_fields together, record_fields
-            //for change_visibility and usages for first point mentioned above in the process
-
-            let (usages_to_be_processed, record_fields, use_stmts_to_be_inserted) =
-                module.get_usages_and_record_fields(ctx, module_text_range);
-
-            builder.edit_file(ctx.vfs_file_id());
-            use_stmts_to_be_inserted.into_iter().for_each(|(_, use_stmt)| {
-                builder.insert(ctx.selection_trimmed().end(), format!("\n{use_stmt}"));
-            });
-
-            let import_items = module.resolve_imports(curr_parent_module, ctx);
-            module.change_visibility(record_fields);
-
-            let module_def = generate_module_def(&impl_parent, module, old_item_indent).to_string();
-
-            let mut usages_to_be_processed_for_cur_file = vec![];
-            for (file_id, usages) in usages_to_be_processed {
-                if file_id == ctx.vfs_file_id() {
-                    usages_to_be_processed_for_cur_file = usages;
-                    continue;
-                }
-                builder.edit_file(file_id);
-                for (text_range, usage) in usages {
-                    builder.replace(text_range, usage)
+            let sc = build_extract_change(
+                ctx,
+                module,
+                module_text_range,
+                &impl_parent,
+                impl_child_count,
+                &node,
+                curr_parent_module,
+                old_item_indent,
+            );
+            // Replay the SourceChange into the assist builder
+            for (fid, (edit, _)) in sc.source_file_edits {
+                builder.edit_file(fid);
+                for indel in edit.into_iter() {
+                    builder.replace(indel.delete, indel.insert);
                 }
             }
-
-            builder.edit_file(ctx.vfs_file_id());
-            for (text_range, usage) in usages_to_be_processed_for_cur_file {
-                builder.replace(text_range, usage);
-            }
-
-            if let Some(impl_) = impl_parent {
-                // Remove complete impl block if it has only one child (as such it will be empty
-                // after deleting that child)
-                let node_to_be_removed = if impl_child_count == 1 {
-                    impl_.syntax()
-                } else {
-                    //Remove selected node
-                    &node
-                };
-
-                builder.delete(node_to_be_removed.text_range());
-                // Remove preceding indentation from node
-                if let Some(range) = indent_range_before_given_node(node_to_be_removed) {
-                    builder.delete(range);
+            for fse in sc.file_system_edits {
+                if let ide_db::source_change::FileSystemEdit::CreateFile { dst, initial_contents } = fse {
+                    builder.create_file(dst, initial_contents);
                 }
-
-                builder.insert(impl_.syntax().text_range().end(), format!("\n\n{module_def}"));
-            } else {
-                for import_item in import_items {
-                    if !module_text_range.contains_range(import_item) {
-                        builder.delete(import_item);
-                    }
-                }
-                builder.replace(module_text_range, module_def)
             }
         },
     )
 }
 
-fn generate_module_def(
-    parent_impl: &Option<ast::Impl>,
-    module: Module,
-    old_indent: IndentLevel,
-) -> ast::Module {
-    let Module { name, body_items, use_items } = module;
-    let items = if let Some(self_ty) = parent_impl.as_ref().and_then(|imp| imp.self_ty()) {
-        let assoc_items = body_items
-            .into_iter()
-            .map(|item| item.syntax().clone())
-            .filter_map(ast::AssocItem::cast)
-            .map(|it| it.indent(IndentLevel(1)))
-            .collect_vec();
-        let assoc_item_list = make::assoc_item_list(Some(assoc_items));
-        let impl_ = make::impl_(None, None, None, self_ty.clone(), None, Some(assoc_item_list));
-        // Add the import for enum/struct corresponding to given impl block
-        let use_impl = make_use_stmt_of_node_with_super(self_ty.syntax());
-        let mut module_body_items = use_items;
-        module_body_items.insert(0, use_impl);
-        module_body_items.push(ast::Item::Impl(impl_));
-        module_body_items
-    } else {
-        [use_items, body_items].concat()
-    };
-
-    let items = items.into_iter().map(|it| it.reset_indent().indent(IndentLevel(1))).collect_vec();
-    let module_body = make::item_list(Some(items));
-
-    let module_name = make::name(name);
-    make::mod_(module_name, Some(module_body)).indent(old_indent)
-}
-
-fn make_use_stmt_of_node_with_super(node_syntax: &SyntaxNode) -> ast::Item {
-    let super_path = make::ext::ident_path("super");
-    let node_path = make::ext::ident_path(&node_syntax.to_string());
-    let use_ = make::use_(
-        None,
-        None,
-        make::use_tree(make::join_paths(vec![super_path, node_path]), None, None, false),
-    );
-
-    ast::Item::from(use_)
-}
-
-#[derive(Debug)]
-struct Module {
-    name: &'static str,
-    /// All items except use items.
-    body_items: Vec<ast::Item>,
-    /// Use items are kept separately as they help when the selection is inside an impl block,
-    /// we can directly take these items and keep them outside generated impl block inside
-    /// generated module.
-    use_items: Vec<ast::Item>,
-}
+// generate_module_def, make_use_stmt_of_node_with_super and Module moved to core::extract_engine
 
 fn extract_single_target(node: &ast::Item) -> Module {
     let (body_items, use_items) = if matches!(node, ast::Item::Use(_)) {
@@ -257,7 +158,7 @@ fn extract_child_target(
 }
 
 impl Module {
-    fn get_usages_and_record_fields(
+    pub(crate) fn get_usages_and_record_fields(
         &self,
         ctx: &AssistContext<'_>,
         replace_range: TextRange,
@@ -399,7 +300,7 @@ impl Module {
         }
     }
 
-    fn change_visibility(&mut self, record_fields: Vec<SyntaxNode>) {
+    pub(crate) fn change_visibility(&mut self, record_fields: Vec<SyntaxNode>) {
         let (mut replacements, record_field_parents, impls) =
             get_replacements_for_visibility_change(&mut self.body_items, false);
 
@@ -438,7 +339,7 @@ impl Module {
         }
     }
 
-    fn resolve_imports(
+    pub(crate) fn resolve_imports(
         &mut self,
         module: Option<ast::Module>,
         ctx: &AssistContext<'_>,
@@ -478,7 +379,7 @@ impl Module {
         imports_to_remove
     }
 
-    fn process_def_in_sel(
+    pub(crate) fn process_def_in_sel(
         &mut self,
         def: Definition,
         use_node: &SyntaxNode,

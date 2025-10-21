@@ -65,6 +65,7 @@ mod assist_context;
 #[cfg(test)]
 mod tests;
 pub mod utils;
+pub mod core;
 
 use hir::Semantics;
 use ide_db::{EditionedFileId, RootDatabase};

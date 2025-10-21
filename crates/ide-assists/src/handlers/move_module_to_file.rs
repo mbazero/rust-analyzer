@@ -50,36 +50,15 @@ pub(crate) fn move_module_to_file(acc: &mut Assists, ctx: &AssistContext<'_>) ->
         target,
         |builder| {
             let path = {
-                let mut buf = String::from("./");
                 let db = ctx.db();
-                match parent_module.name(db) {
-                    Some(name)
-                        if !parent_module.is_mod_rs(db)
-                            && parent_module
-                                .attrs(db)
-                                .by_key(sym::path)
-                                .string_value_unescape()
-                                .is_none() =>
-                    {
-                        format_to!(buf, "{}/", name.as_str())
-                    }
-                    _ => (),
-                }
-                let segments = iter::successors(Some(module_ast.clone()), |module| module.parent())
-                    .filter_map(|it| it.name())
-                    .map(|name| SmolStr::from(name.text().trim_start_matches("r#")))
-                    .collect::<Vec<_>>();
-
-                format_to!(buf, "{}", segments.into_iter().rev().format("/"));
-
-                // We need to special case mod named `r#mod` and place the file in a
-                // subdirectory as "mod.rs" would be of its parent module otherwise.
-                if module_name.text() == "r#mod" {
-                    format_to!(buf, "/mod.rs");
-                } else {
-                    format_to!(buf, ".rs");
-                }
-                buf
+                let anchor = ctx.vfs_file_id();
+                let dst = crate::core::module_path::compute_move_module_file_path(
+                    db,
+                    parent_module,
+                    &module_ast,
+                    anchor,
+                );
+                dst.path
             };
             let contents = {
                 let items = module_items.dedent(IndentLevel(1)).to_string();
