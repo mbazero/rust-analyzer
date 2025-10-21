@@ -109,6 +109,27 @@ pub(crate) fn rename(
     let syntax = source_file.syntax();
 
     let edition = file_id.edition(db);
+
+    // Check if this is a move operation (fully-qualified path)
+    if let Some((target_module_path, target_name)) =
+        ide_db::rename_move::parse_move_target(new_name, edition) {
+        // This is a move and rename operation
+        let defs = find_definitions(&sema, syntax, position, &target_name)?;
+
+        // For now, we'll just handle the first definition
+        // In the future, we might want to handle multiple definitions
+        if let Some((.., def, _, _)) = defs.into_iter().next() {
+            return ide_db::rename_move::move_and_rename(
+                &sema,
+                def,
+                target_module_path,
+                target_name,
+            );
+        } else {
+            bail!("No definition found at position");
+        }
+    }
+
     let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
 
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
