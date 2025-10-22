@@ -159,34 +159,34 @@ pub(crate) fn prepare_rename(
 fn can_be_moved(_sema: &Semantics<'_, RootDatabase>, def: Definition) -> bool {
     match def {
         // Items that can be moved between modules
-        Definition::Function(_) |
-        Definition::Adt(_) |
-        Definition::Variant(_) |
-        Definition::Const(_) |
-        Definition::Static(_) |
-        Definition::Trait(_) |
-        Definition::TypeAlias(_) |
-        Definition::Macro(_) => true,
-        
+        Definition::Function(_)
+        | Definition::Adt(_)
+        | Definition::Variant(_)
+        | Definition::Const(_)
+        | Definition::Static(_)
+        | Definition::Trait(_)
+        | Definition::TypeAlias(_)
+        | Definition::Macro(_) => true,
+
         // Module moves are handled separately
         Definition::Module(_) => true,
-        
+
         // Items that cannot be moved
-        Definition::Local(_) |
-        Definition::GenericParam(_) |
-        Definition::Label(_) |
-        Definition::Field(_) |
-        Definition::SelfType(_) |
-        Definition::BuiltinType(_) |
-        Definition::BuiltinLifetime(_) |
-        Definition::BuiltinAttr(_) |
-        Definition::ToolModule(_) |
-        Definition::TupleField(_) |
-        Definition::DeriveHelper(_) |
-        Definition::ExternCrateDecl(_) |
-        Definition::InlineAsmOperand(_) |
-        Definition::InlineAsmRegOrRegClass(_) |
-        Definition::Crate(_) => false,
+        Definition::Local(_)
+        | Definition::GenericParam(_)
+        | Definition::Label(_)
+        | Definition::Field(_)
+        | Definition::SelfType(_)
+        | Definition::BuiltinType(_)
+        | Definition::BuiltinLifetime(_)
+        | Definition::BuiltinAttr(_)
+        | Definition::ToolModule(_)
+        | Definition::TupleField(_)
+        | Definition::DeriveHelper(_)
+        | Definition::ExternCrateDecl(_)
+        | Definition::InlineAsmOperand(_)
+        | Definition::InlineAsmRegOrRegClass(_)
+        | Definition::Crate(_) => false,
     }
 }
 
@@ -199,7 +199,7 @@ fn supports_move_operation(sema: &Semantics<'_, RootDatabase>, def: Definition) 
             return false;
         }
     }
-    
+
     // Check if the definition type supports moving
     can_be_moved(sema, def)
 }
@@ -302,24 +302,48 @@ pub(crate) fn rename(
         match ide_db::rename::parse_fully_qualified_path(new_name, db) {
             Ok((target_module_path, new_item_name)) => {
                 // Find the definition at the current position
-                let defs: Vec<_> = find_definitions(&sema, syntax, position, &new_item_name)?.collect();
+                let defs: Vec<_> =
+                    find_definitions(&sema, syntax, position, &new_item_name)?.collect();
                 if let Some((_, _, def, _, _)) = defs.first() {
                     // Determine operation type (Requirement 1.2)
-                    match ide_db::rename::determine_operation_type(&sema, *def, &target_module_path, &new_item_name) {
+                    match ide_db::rename::determine_operation_type(
+                        &sema,
+                        *def,
+                        &target_module_path,
+                        &new_item_name,
+                    ) {
                         Ok(operation_type) => {
                             match operation_type {
                                 ide_db::rename::RenameOperationType::SimpleRename => {
                                     // Same module - use existing rename logic (Requirement 5.4, 5.5)
-                                    return execute_standard_rename(db, &sema, file_id, syntax, position, &new_item_name.display(db, edition).to_string(), edition);
+                                    return execute_standard_rename(
+                                        db,
+                                        &sema,
+                                        file_id,
+                                        syntax,
+                                        position,
+                                        &new_item_name.display(db, edition).to_string(),
+                                        edition,
+                                    );
                                 }
-                                ide_db::rename::RenameOperationType::MoveOnly | 
-                                ide_db::rename::RenameOperationType::MoveAndRename => {
+                                ide_db::rename::RenameOperationType::MoveOnly
+                                | ide_db::rename::RenameOperationType::MoveAndRename => {
                                     // Different module - execute move operation (Requirement 1.2)
-                                    return execute_move_operation(&sema, *def, target_module_path, new_item_name);
+                                    return execute_move_operation(
+                                        &sema,
+                                        *def,
+                                        target_module_path,
+                                        new_item_name,
+                                    );
                                 }
                                 ide_db::rename::RenameOperationType::RelativeMove => {
                                     // Relative move within same module (Requirement 5.2, 5.3)
-                                    return execute_move_operation(&sema, *def, target_module_path, new_item_name);
+                                    return execute_move_operation(
+                                        &sema,
+                                        *def,
+                                        target_module_path,
+                                        new_item_name,
+                                    );
                                 }
                             }
                         }
@@ -456,15 +480,22 @@ fn execute_move_operation(
     new_item_name: hir::Name,
 ) -> RenameResult<SourceChange> {
     // Find the target module
-    let current_module = def.module(sema.db)
+    let current_module = def
+        .module(sema.db)
         .ok_or_else(|| format_err!("Cannot determine current module for definition"))?;
-    
+
     let target_module = resolve_target_module(sema, current_module, &target_module_path)
         .map_err(|e| format_err!("Cannot resolve target module: {}", e))?;
 
     // Validate the move operation (Requirements 4.1, 4.2, 4.3, 4.4, 4.5)
-    ide_db::rename::validate_move_operation(sema, def, &target_module_path, &new_item_name, target_module)
-        .map_err(|e| RenameError(e.to_string()))?;
+    ide_db::rename::validate_move_operation(
+        sema,
+        def,
+        &target_module_path,
+        &new_item_name,
+        target_module,
+    )
+    .map_err(|e| RenameError(e.to_string()))?;
 
     // Execute the move operation
     ide_db::rename::move_item_to_module(sema, def, target_module, &new_item_name)
@@ -482,8 +513,9 @@ fn resolve_target_module(
         hir::PathKind::Super(n) => {
             let mut module = current_module;
             for _ in 0..n {
-                module = module.parent(sema.db)
-                    .ok_or_else(|| "Cannot resolve super:: path - not enough parent modules".to_string())?;
+                module = module.parent(sema.db).ok_or_else(|| {
+                    "Cannot resolve super:: path - not enough parent modules".to_string()
+                })?;
             }
             module
         }
@@ -493,9 +525,12 @@ fn resolve_target_module(
 
     // Traverse each segment in the target path
     for segment in target_path.segments() {
-        current = current.children(sema.db)
+        current = current
+            .children(sema.db)
             .find(|child| child.name(sema.db) == Some(segment.clone()))
-            .ok_or_else(|| format!("Module '{}' not found", segment.display(sema.db, Edition::CURRENT)))?;
+            .ok_or_else(|| {
+                format!("Module '{}' not found", segment.display(sema.db, Edition::CURRENT))
+            })?;
     }
 
     Ok(current)

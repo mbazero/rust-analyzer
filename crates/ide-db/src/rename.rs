@@ -24,19 +24,19 @@
 //!
 //! ```ignore
 //! // Move a struct to a new module (creates models module if needed)
-//! struct MyStruct { 
-//!     name: String 
+//! struct MyStruct {
+//!     name: String
 //! } // <- rename to "crate::models::MyStruct"
 //!
 //! // Move and rename simultaneously
-//! fn old_function() -> i32 { 
-//!     42 
+//! fn old_function() -> i32 {
+//!     42
 //! } // <- rename to "crate::utils::new_function"
 //!
 //! // Move within the same crate using relative paths
-//! enum Status { 
-//!     Active, 
-//!     Inactive 
+//! enum Status {
+//!     Active,
+//!     Inactive
 //! } // <- rename to "super::types::Status"
 //!
 //! // Move to sibling module
@@ -1223,7 +1223,7 @@ pub struct ModuleStructure {
 ///
 /// ```ignore
 /// let plan = create_module_creation_plan(&module_structure, &preferences)?;
-/// 
+///
 /// // Execute the plan
 /// for dir in &plan.directories_to_create {
 ///     create_directory(dir)?;
@@ -1425,7 +1425,9 @@ pub fn analyze_module_structure(
         }
         PathKind::Plain => current_module, // Relative to current module
         PathKind::Abs => {
-            return Err(RenameError("Absolute paths not supported for module creation".to_string()));
+            return Err(RenameError(
+                "Absolute paths not supported for module creation".to_string(),
+            ));
         }
         PathKind::DollarCrate(_) => current_module.crate_root(sema.db),
     };
@@ -1732,12 +1734,24 @@ pub fn handle_move_operation_with_recovery(
     match validate_move_operation_comprehensive(sema, def, target_module_path, new_item_name) {
         Ok(()) => {}
         Err(e) => {
-            return Err(enhance_error_with_suggestions(e, sema, def, target_module_path, new_item_name));
+            return Err(enhance_error_with_suggestions(
+                e,
+                sema,
+                def,
+                target_module_path,
+                new_item_name,
+            ));
         }
     }
 
     // Execute move operation with rollback tracking
-    match execute_move_operation_with_tracking(sema, def, target_module_path, new_item_name, &mut rollback_context) {
+    match execute_move_operation_with_tracking(
+        sema,
+        def,
+        target_module_path,
+        new_item_name,
+        &mut rollback_context,
+    ) {
         Ok(source_change) => Ok(source_change),
         Err(e) => {
             // Attempt rollback on failure
@@ -1787,21 +1801,22 @@ fn validate_no_name_conflicts_enhanced(
     new_item_name: &Name,
 ) -> Result<(), MoveRenameError> {
     if let Some(existing_item) = find_existing_item_in_module(sema, &target_module, new_item_name) {
-        let existing_name = existing_item.name(sema.db)
+        let existing_name = existing_item
+            .name(sema.db)
             .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
             .unwrap_or_else(|| "unnamed item".to_string());
-        
+
         let item_type = get_item_type_description(&existing_item);
         let module_path = module_to_mod_path(sema, target_module)
             .map(|path| format_mod_path(&path))
             .unwrap_or_else(|_| "unknown module".to_string());
-        
+
         return Err(MoveRenameError::NameConflict {
             existing_item: format!("{} '{}' in module '{}'", item_type, existing_name, module_path),
             target_name: new_item_name.display(sema.db, Edition::CURRENT).to_string(),
         });
     }
-    
+
     Ok(())
 }
 
@@ -1811,32 +1826,32 @@ fn validate_no_circular_dependencies_enhanced(
     def: Definition,
     target_module: Module,
 ) -> Result<(), MoveRenameError> {
-    let current_module = def.module(sema.db)
-        .ok_or_else(|| MoveRenameError::DependencyError("Cannot determine current module".to_string()))?;
+    let current_module = def.module(sema.db).ok_or_else(|| {
+        MoveRenameError::DependencyError("Cannot determine current module".to_string())
+    })?;
 
     if would_create_circular_dependency(sema, def, current_module, target_module)? {
-        let item_name = def.name(sema.db)
+        let item_name = def
+            .name(sema.db)
             .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
             .unwrap_or_else(|| "unnamed item".to_string());
-        
+
         let current_module_path = module_to_mod_path(sema, current_module)
             .map(|path| format_mod_path(&path))
             .unwrap_or_else(|_| "unknown module".to_string());
-        
+
         let target_module_path = module_to_mod_path(sema, target_module)
             .map(|path| format_mod_path(&path))
             .unwrap_or_else(|_| "unknown module".to_string());
-        
-        return Err(MoveRenameError::CircularDependency(
-            format!(
-                "Moving '{}' from '{}' to '{}' would create a circular dependency. \
+
+        return Err(MoveRenameError::CircularDependency(format!(
+            "Moving '{}' from '{}' to '{}' would create a circular dependency. \
                 The target module already depends on the current module, and moving this item \
                 would make the current module depend on the target module.",
-                item_name, current_module_path, target_module_path
-            )
-        ));
+            item_name, current_module_path, target_module_path
+        )));
     }
-    
+
     Ok(())
 }
 
@@ -1848,26 +1863,25 @@ fn validate_visibility_constraints_enhanced(
 ) -> Result<(), MoveRenameError> {
     let current_visibility = get_item_visibility(sema, def)?;
     let target_module_context = get_module_visibility_context(sema, target_module)?;
-    
+
     if !is_visibility_compatible(current_visibility.clone(), &target_module_context) {
-        let item_name = def.name(sema.db)
+        let item_name = def
+            .name(sema.db)
             .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
             .unwrap_or_else(|| "unnamed item".to_string());
-        
+
         let visibility_desc = describe_visibility(&current_visibility);
         let suggestion = suggest_visibility_fix(&current_visibility, &target_module_context);
-        
-        return Err(MoveRenameError::VisibilityViolation(
-            format!(
-                "Item '{}' has {} visibility which is incompatible with the target module. {}",
-                item_name, visibility_desc, suggestion
-            )
-        ));
+
+        return Err(MoveRenameError::VisibilityViolation(format!(
+            "Item '{}' has {} visibility which is incompatible with the target module. {}",
+            item_name, visibility_desc, suggestion
+        )));
     }
-    
+
     // Validate that existing references will remain accessible
     validate_references_remain_accessible_enhanced(sema, def, target_module)?;
-    
+
     Ok(())
 }
 
@@ -1879,13 +1893,14 @@ fn validate_dependency_accessibility_enhanced(
 ) -> Result<(), MoveRenameError> {
     let dependencies = find_item_dependencies(sema, def)?;
     let mut inaccessible_deps = Vec::new();
-    
+
     for dependency in dependencies {
         if !will_dependency_be_accessible(sema, dependency, target_module)? {
-            let dep_name = dependency.name(sema.db)
+            let dep_name = dependency
+                .name(sema.db)
                 .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
                 .unwrap_or_else(|| "unnamed dependency".to_string());
-            
+
             let dep_module = dependency.module(sema.db);
             let dep_location = if let Some(module) = dep_module {
                 module_to_mod_path(sema, module)
@@ -1894,21 +1909,19 @@ fn validate_dependency_accessibility_enhanced(
             } else {
                 "built-in".to_string()
             };
-            
+
             inaccessible_deps.push(format!("'{}' in '{}'", dep_name, dep_location));
         }
     }
-    
+
     if !inaccessible_deps.is_empty() {
-        return Err(MoveRenameError::DependencyError(
-            format!(
-                "The following dependencies would become inaccessible after the move: {}. \
+        return Err(MoveRenameError::DependencyError(format!(
+            "The following dependencies would become inaccessible after the move: {}. \
                 Consider making these dependencies public or moving them to a common parent module.",
-                inaccessible_deps.join(", ")
-            )
-        ));
+            inaccessible_deps.join(", ")
+        )));
     }
-    
+
     Ok(())
 }
 
@@ -1927,60 +1940,90 @@ fn execute_move_operation_with_tracking(
         Ok(module) => module,
         Err(_) => {
             // Module doesn't exist, create it
-            let current_module = def.module(sema.db)
-                .ok_or_else(|| MoveRenameError::ModuleCreationFailed("Cannot determine current module".to_string()))?;
-            
-            let module_structure = analyze_module_structure(sema, current_module, target_module_path)
-                .map_err(|e| MoveRenameError::ModuleCreationFailed(format!("Failed to analyze module structure: {}", e.0)))?;
-            
+            let current_module = def.module(sema.db).ok_or_else(|| {
+                MoveRenameError::ModuleCreationFailed("Cannot determine current module".to_string())
+            })?;
+
+            let module_structure =
+                analyze_module_structure(sema, current_module, target_module_path).map_err(
+                    |e| {
+                        MoveRenameError::ModuleCreationFailed(format!(
+                            "Failed to analyze module structure: {}",
+                            e.0
+                        ))
+                    },
+                )?;
+
             let user_preferences = get_user_module_preferences();
-            let creation_plan = create_module_creation_plan(sema, &module_structure, &user_preferences)
-                .map_err(|e| MoveRenameError::ModuleCreationFailed(format!("Failed to create module plan: {}", e.0)))?;
-            
+            let creation_plan =
+                create_module_creation_plan(sema, &module_structure, &user_preferences).map_err(
+                    |e| {
+                        MoveRenameError::ModuleCreationFailed(format!(
+                            "Failed to create module plan: {}",
+                            e.0
+                        ))
+                    },
+                )?;
+
             // Track module creation for rollback
             for file_spec in &creation_plan.files_to_create {
                 // We don't have the FileId yet, but we can track the path
                 rollback_context.record_directory_creation(file_spec.path.clone());
             }
-            
+
             let module_creation_change = execute_module_creation_plan(&creation_plan, sema)
-                .map_err(|e| MoveRenameError::ModuleCreationFailed(format!("Failed to execute module creation: {}", e.0)))?;
-            
+                .map_err(|e| {
+                    MoveRenameError::ModuleCreationFailed(format!(
+                        "Failed to execute module creation: {}",
+                        e.0
+                    ))
+                })?;
+
             source_change.extend(module_creation_change.source_file_edits);
             source_change.file_system_edits.extend(module_creation_change.file_system_edits);
-            
+
             // Try to resolve the module again after creation
-            resolve_target_module(sema, target_module_path)
-                .map_err(|e| MoveRenameError::ModuleCreationFailed(format!("Failed to resolve created module: {}", e)))?
+            resolve_target_module(sema, target_module_path).map_err(|e| {
+                MoveRenameError::ModuleCreationFailed(format!(
+                    "Failed to resolve created module: {}",
+                    e
+                ))
+            })?
         }
     };
 
     // Step 2: Move the item
-    let current_module = def.module(sema.db)
-        .ok_or_else(|| MoveRenameError::DependencyError("Cannot determine current module".to_string()))?;
-    
+    let current_module = def.module(sema.db).ok_or_else(|| {
+        MoveRenameError::DependencyError("Cannot determine current module".to_string())
+    })?;
+
     // Record original file content for rollback
     if let Some(file_range) = def.range_for_rename(sema) {
-        let original_content = sema.db.file_text(file_range.file_id.file_id(sema.db)).text(sema.db).to_string();
-        rollback_context.record_file_modification(file_range.file_id.file_id(sema.db), original_content);
+        let original_content =
+            sema.db.file_text(file_range.file_id.file_id(sema.db)).text(sema.db).to_string();
+        rollback_context
+            .record_file_modification(file_range.file_id.file_id(sema.db), original_content);
     }
-    
-    let move_change = move_item_to_module(sema, def, target_module, new_item_name)
-        .map_err(|e| MoveRenameError::ReferenceUpdateFailed {
-            file: "item move".to_string(),
-            error: format!("Failed to move item: {}", e),
+
+    let move_change =
+        move_item_to_module(sema, def, target_module, new_item_name).map_err(|e| {
+            MoveRenameError::ReferenceUpdateFailed {
+                file: "item move".to_string(),
+                error: format!("Failed to move item: {}", e),
+            }
         })?;
-    
+
     source_change.extend(move_change.source_file_edits);
     source_change.file_system_edits.extend(move_change.file_system_edits);
 
     // Step 3: Update references
-    let reference_change = update_external_references(sema, def, current_module, target_module, new_item_name)
-        .map_err(|e| MoveRenameError::ReferenceUpdateFailed {
-            file: "reference updates".to_string(),
-            error: format!("Failed to update references: {}", e.0),
-        })?;
-    
+    let reference_change =
+        update_external_references(sema, def, current_module, target_module, new_item_name)
+            .map_err(|e| MoveRenameError::ReferenceUpdateFailed {
+                file: "reference updates".to_string(),
+                error: format!("Failed to update references: {}", e.0),
+            })?;
+
     source_change.extend(reference_change.source_file_edits);
     source_change.file_system_edits.extend(reference_change.file_system_edits);
 
@@ -2003,7 +2046,7 @@ fn enhance_error_with_suggestions(
             } else {
                 format!("Consider using one of these alternative names: {}", suggestions.join(", "))
             };
-            
+
             MoveRenameError::NameConflict {
                 existing_item: format!("{}. {}", existing_item, suggestion_text),
                 target_name,
@@ -2029,11 +2072,12 @@ fn generate_alternative_names(
 ) -> Vec<String> {
     let mut alternatives = Vec::new();
     let base_str = base_name.as_str();
-    
+
     // Try common suffixes
     for suffix in &["_new", "_moved", "_v2", "_alt"] {
         let candidate = format!("{}{}", base_str, suffix);
-        let candidate_name = Name::new(&candidate, span::SyntaxContext::root(span::Edition::CURRENT));
+        let candidate_name =
+            Name::new(&candidate, span::SyntaxContext::root(span::Edition::CURRENT));
         // Check if this name would be available
         if let Ok(target_module) = resolve_target_module(sema, target_module_path) {
             if find_existing_item_in_module(sema, &target_module, &candidate_name).is_none() {
@@ -2041,18 +2085,19 @@ fn generate_alternative_names(
             }
         }
     }
-    
+
     // Try numbered suffixes
     for i in 1..=5 {
         let candidate = format!("{}_{}", base_str, i);
-        let candidate_name = Name::new(&candidate, span::SyntaxContext::root(span::Edition::CURRENT));
+        let candidate_name =
+            Name::new(&candidate, span::SyntaxContext::root(span::Edition::CURRENT));
         if let Ok(target_module) = resolve_target_module(sema, target_module_path) {
             if find_existing_item_in_module(sema, &target_module, &candidate_name).is_none() {
                 alternatives.push(candidate);
             }
         }
     }
-    
+
     alternatives.truncate(3); // Limit to 3 suggestions
     alternatives
 }
@@ -2064,12 +2109,12 @@ fn generate_path_suggestions(
     _target_module_path: &ModPath,
 ) -> String {
     let current_module = def.module(sema.db);
-    
+
     if let Some(module) = current_module {
         let current_path = module_to_mod_path(sema, module)
             .map(|path| format_mod_path(&path))
             .unwrap_or_else(|_| "crate".to_string());
-        
+
         format!(
             "Valid path formats: 'crate::module::item', '{}::item', or 'super::item'. \
             Current module is '{}'.",
@@ -2087,7 +2132,8 @@ fn generate_visibility_suggestions(
     _target_module_path: &ModPath,
 ) -> String {
     "Consider making the item public with 'pub', or use 'pub(crate)' for crate-wide visibility, \
-    or 'pub(super)' for parent module visibility.".to_string()
+    or 'pub(super)' for parent module visibility."
+        .to_string()
 }
 
 /// Get a human-readable description of an item type
@@ -2151,10 +2197,10 @@ fn resolve_target_module(
 ) -> Result<Module, MoveRenameError> {
     // This is a simplified resolution - a full implementation would use proper path resolution
     // For now, we'll try to find the module by traversing the path
-    
+
     // Start from crate root - simplified approach
     // In a full implementation, this would use proper HIR path resolution
-    
+
     // For now, return an error indicating the module needs to be created
     Err(MoveRenameError::ModuleCreationFailed("Target module does not exist".to_string()))
 }
@@ -2167,36 +2213,38 @@ fn validate_references_remain_accessible_enhanced(
 ) -> Result<(), MoveRenameError> {
     let usages = def.usages(sema).all();
     let mut inaccessible_refs = Vec::new();
-    
+
     for (file_id, references) in usages {
         for reference in references {
             if !will_reference_remain_accessible(sema, &reference, def, target_module, file_id)? {
                 let file_path = sema.db.file_source_root(file_id.file_id(sema.db));
                 let source_root_data = sema.db.source_root(file_path.source_root_id(sema.db));
                 let source_root_ref = source_root_data.source_root(sema.db);
-                
+
                 let file_name = source_root_ref
                     .path_for_file(&file_id.file_id(sema.db))
                     .and_then(|path| path.as_path())
                     .and_then(|path| path.file_name())
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| "unknown file".to_string());
-                
-                inaccessible_refs.push(format!("{}:{}", file_name, u32::from(reference.range.start())));
+
+                inaccessible_refs.push(format!(
+                    "{}:{}",
+                    file_name,
+                    u32::from(reference.range.start())
+                ));
             }
         }
     }
-    
+
     if !inaccessible_refs.is_empty() {
-        return Err(MoveRenameError::VisibilityViolation(
-            format!(
-                "The following references would become inaccessible after the move: {}. \
+        return Err(MoveRenameError::VisibilityViolation(format!(
+            "The following references would become inaccessible after the move: {}. \
                 Consider making the item public or adjusting visibility.",
-                inaccessible_refs.join(", ")
-            )
-        ));
+            inaccessible_refs.join(", ")
+        )));
     }
-    
+
     Ok(())
 }
 
@@ -2298,15 +2346,23 @@ impl fmt::Display for MoveRenameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MoveRenameError::InvalidPath(msg) => write!(f, "Invalid path: {}", msg),
-            MoveRenameError::ModuleCreationFailed(msg) => write!(f, "Module creation failed: {}", msg),
+            MoveRenameError::ModuleCreationFailed(msg) => {
+                write!(f, "Module creation failed: {}", msg)
+            }
             MoveRenameError::NameConflict { existing_item, target_name } => {
-                write!(f, "Name conflict: '{}' already exists, cannot rename to '{}'", existing_item, target_name)
+                write!(
+                    f,
+                    "Name conflict: '{}' already exists, cannot rename to '{}'",
+                    existing_item, target_name
+                )
             }
             MoveRenameError::CircularDependency(msg) => write!(f, "Circular dependency: {}", msg),
             MoveRenameError::VisibilityViolation(msg) => write!(f, "Visibility violation: {}", msg),
             MoveRenameError::FileSystemError(msg) => write!(f, "File system error: {}", msg),
             MoveRenameError::DependencyError(msg) => write!(f, "Dependency error: {}", msg),
-            MoveRenameError::ModuleIntegrationFailed(msg) => write!(f, "Module integration failed: {}", msg),
+            MoveRenameError::ModuleIntegrationFailed(msg) => {
+                write!(f, "Module integration failed: {}", msg)
+            }
             MoveRenameError::ReferenceUpdateFailed { file, error } => {
                 write!(f, "Reference update failed in {}: {}", file, error)
             }
@@ -2413,10 +2469,7 @@ pub fn execute_rollback(
                 // Mark directory for removal (actual removal would be handled by the file system)
                 // For now, we'll create a marker file to indicate the directory should be removed
                 let marker_path = format!("{}/.to_remove", relative_path);
-                let anchored_path = AnchoredPathBuf {
-                    anchor: anchor_file,
-                    path: marker_path,
-                };
+                let anchored_path = AnchoredPathBuf { anchor: anchor_file, path: marker_path };
                 source_change.push_file_system_edit(FileSystemEdit::CreateFile {
                     dst: anchored_path,
                     initial_contents: "This directory was created during a failed operation and should be removed.".to_string(),
@@ -2440,10 +2493,7 @@ fn find_anchored_path_for_file(
     if let Some(vfs_path) = source_root_ref.path_for_file(&file_id) {
         if let Some(path) = vfs_path.as_path() {
             // Use the file itself as anchor with empty relative path
-            return Ok(Some(AnchoredPathBuf {
-                anchor: file_id,
-                path: String::new(),
-            }));
+            return Ok(Some(AnchoredPathBuf { anchor: file_id, path: String::new() }));
         }
     }
 
@@ -2459,7 +2509,7 @@ pub fn check_name_conflicts(
 ) -> Result<(), MoveRenameError> {
     // Get all items in the target module
     let module_scope = target_module.scope(sema.db, None);
-    
+
     // Check for conflicts with existing definitions
     for (name, def) in module_scope {
         if name == *new_item_name {
@@ -2474,26 +2524,29 @@ pub fn check_name_conflicts(
                 hir::ScopeDef::Local(_) => "local variable".to_string(),
                 hir::ScopeDef::Label(_) => "label".to_string(),
             };
-            
+
             return Err(MoveRenameError::NameConflict {
                 existing_item: existing_item_name,
                 target_name: new_item_name.display(sema.db, Edition::CURRENT).to_string(),
             });
         }
     }
-    
+
     // Check for conflicts with child modules
     for child_module in target_module.children(sema.db) {
         if let Some(child_name) = child_module.name(sema.db) {
             if child_name == *new_item_name {
                 return Err(MoveRenameError::NameConflict {
-                    existing_item: format!("module {}", child_name.display(sema.db, Edition::CURRENT)),
+                    existing_item: format!(
+                        "module {}",
+                        child_name.display(sema.db, Edition::CURRENT)
+                    ),
                     target_name: new_item_name.display(sema.db, Edition::CURRENT).to_string(),
                 });
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -2505,7 +2558,7 @@ pub fn find_existing_item_in_module(
     item_name: &Name,
 ) -> Option<Definition> {
     let module_scope = target_module.scope(sema.db, None);
-    
+
     // Look for existing definitions with the same name
     for (name, scope_def) in module_scope {
         if name == *item_name {
@@ -2531,7 +2584,7 @@ pub fn find_existing_item_in_module(
             }
         }
     }
-    
+
     // Check child modules
     for child_module in target_module.children(sema.db) {
         if let Some(child_name) = child_module.name(sema.db) {
@@ -2540,7 +2593,7 @@ pub fn find_existing_item_in_module(
             }
         }
     }
-    
+
     None
 }
 
@@ -2552,16 +2605,17 @@ pub fn validate_no_name_conflicts(
     new_item_name: &Name,
 ) -> Result<(), MoveRenameError> {
     if let Some(existing_item) = find_existing_item_in_module(sema, &target_module, new_item_name) {
-        let existing_name = existing_item.name(sema.db)
+        let existing_name = existing_item
+            .name(sema.db)
             .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
             .unwrap_or_else(|| "unnamed item".to_string());
-        
+
         let item_type = match existing_item {
             Definition::Module(_) => "module",
-            Definition::Function(_) => "function", 
+            Definition::Function(_) => "function",
             Definition::Adt(adt) => match adt {
                 hir::Adt::Struct(_) => "struct",
-                hir::Adt::Union(_) => "union", 
+                hir::Adt::Union(_) => "union",
                 hir::Adt::Enum(_) => "enum",
             },
             Definition::Variant(_) => "enum variant",
@@ -2576,13 +2630,13 @@ pub fn validate_no_name_conflicts(
             Definition::GenericParam(_) => "generic parameter",
             _ => "item",
         };
-        
+
         return Err(MoveRenameError::NameConflict {
             existing_item: format!("{} '{}'", item_type, existing_name),
             target_name: new_item_name.display(sema.db, Edition::CURRENT).to_string(),
         });
     }
-    
+
     Ok(())
 }
 
@@ -2618,7 +2672,7 @@ pub fn validate_no_name_conflicts(
 /// ```ignore
 /// // Validate before moving
 /// validate_move_operation(sema, def, &target_path, &new_name, target_module)?;
-/// 
+///
 /// // If validation passes, proceed with the move
 /// let change = execute_move_operation(sema, def, target_module, &new_name)?;
 /// ```
@@ -2642,16 +2696,16 @@ pub fn validate_move_operation(
 ) -> Result<(), MoveRenameError> {
     // Check for name conflicts (Requirement 4.1)
     validate_no_name_conflicts(sema, target_module, new_item_name)?;
-    
+
     // Validate circular dependency prevention (Requirement 4.3)
     validate_no_circular_dependencies(sema, def, target_module)?;
-    
+
     // Check visibility constraints (Requirement 4.4, 4.5)
     validate_visibility_constraints(sema, def, target_module)?;
-    
+
     // Validate dependencies can be maintained (Requirement 4.2)
     validate_dependency_accessibility(sema, def, target_module)?;
-    
+
     Ok(())
 }
 
@@ -2667,22 +2721,24 @@ pub fn validate_no_circular_dependencies(
         Some(module) => module,
         None => return Ok(()), // Built-in items can't create circular dependencies
     };
-    
+
     // Check if moving this item would create a circular dependency
     if would_create_circular_dependency(sema, def, current_module, target_module)? {
-        let item_name = def.name(sema.db)
+        let item_name = def
+            .name(sema.db)
             .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
             .unwrap_or_else(|| "unnamed item".to_string());
-        
-        return Err(MoveRenameError::CircularDependency(
-            format!("Moving '{}' to module '{}' would create a circular dependency", 
-                   item_name, 
-                   target_module.name(sema.db)
-                       .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
-                       .unwrap_or_else(|| "crate root".to_string()))
-        ));
+
+        return Err(MoveRenameError::CircularDependency(format!(
+            "Moving '{}' to module '{}' would create a circular dependency",
+            item_name,
+            target_module
+                .name(sema.db)
+                .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
+                .unwrap_or_else(|| "crate root".to_string())
+        )));
     }
-    
+
     Ok(())
 }
 
@@ -2697,7 +2753,7 @@ fn would_create_circular_dependency(
     if current_module == target_module {
         return Ok(false);
     }
-    
+
     // Check if target module depends on the current module
     if module_depends_on_module(sema, target_module, current_module)? {
         // Check if the item being moved is used by the target module
@@ -2705,16 +2761,21 @@ fn would_create_circular_dependency(
             return Ok(true);
         }
     }
-    
+
     // Check if moving this item would make the current module depend on target module
     // when target module already depends on current module
     if module_depends_on_module(sema, target_module, current_module)? {
         // If current module would need to import from target module after the move
-        if current_module_would_depend_on_target_after_move(sema, def, current_module, target_module)? {
+        if current_module_would_depend_on_target_after_move(
+            sema,
+            def,
+            current_module,
+            target_module,
+        )? {
             return Ok(true);
         }
     }
-    
+
     Ok(false)
 }
 
@@ -2726,7 +2787,7 @@ fn module_depends_on_module(
 ) -> Result<bool, MoveRenameError> {
     // Get all imports in the dependent module
     let dependent_source = dependent.definition_source(sema.db);
-    
+
     match &dependent_source.value {
         hir::ModuleSource::SourceFile(source_file) => {
             // Check all use statements in the source file
@@ -2755,7 +2816,7 @@ fn module_depends_on_module(
             return Ok(false);
         }
     }
-    
+
     Ok(false)
 }
 
@@ -2773,7 +2834,7 @@ fn use_statement_imports_from_module(
             }
         }
     }
-    
+
     Ok(false)
 }
 
@@ -2785,23 +2846,24 @@ fn path_refers_to_module(
 ) -> Result<bool, MoveRenameError> {
     // This is a simplified check - a full implementation would use
     // rust-analyzer's path resolution to determine if the path refers to the target module
-    
+
     let path_text = path.syntax().text().to_string();
-    
+
     // Get the target module path for comparison
-    let target_module_path = module_to_mod_path(sema, target_module)
-        .map_err(|e| MoveRenameError::DependencyError(format!("Failed to get module path: {}", e.0)))?;
-    
+    let target_module_path = module_to_mod_path(sema, target_module).map_err(|e| {
+        MoveRenameError::DependencyError(format!("Failed to get module path: {}", e.0))
+    })?;
+
     // Simple check: see if the path starts with the target module path
     let target_path_text = format_mod_path(&target_module_path);
-    
+
     Ok(path_text.starts_with(&target_path_text))
 }
 
 /// Format a ModPath as a string for comparison
 fn format_mod_path(mod_path: &ModPath) -> String {
     let mut parts = Vec::new();
-    
+
     match mod_path.kind {
         PathKind::Crate => parts.push("crate".to_string()),
         PathKind::Super(n) => {
@@ -2818,11 +2880,11 @@ fn format_mod_path(mod_path: &ModPath) -> String {
         }
         PathKind::DollarCrate(_) => parts.push("$crate".to_string()),
     }
-    
+
     for segment in mod_path.segments() {
         parts.push(segment.as_str().to_string());
     }
-    
+
     parts.join("::")
 }
 
@@ -2834,7 +2896,7 @@ fn item_is_used_by_module(
 ) -> Result<bool, MoveRenameError> {
     // Get all usages of the item
     let usages = def.usages(sema).all();
-    
+
     // Check if any usage is in the specified module
     for (file_id, _references) in usages {
         // Get the module for this file
@@ -2844,7 +2906,7 @@ fn item_is_used_by_module(
             }
         }
     }
-    
+
     Ok(false)
 }
 
@@ -2857,7 +2919,7 @@ fn current_module_would_depend_on_target_after_move(
 ) -> Result<bool, MoveRenameError> {
     // Check if there are any remaining references to the moved item in the current module
     let usages = def.usages(sema).all();
-    
+
     for (file_id, references) in usages {
         if let Some(file_module) = sema.file_to_module_def(file_id.file_id(sema.db)) {
             if file_module == current_module && !references.is_empty() {
@@ -2866,7 +2928,7 @@ fn current_module_would_depend_on_target_after_move(
             }
         }
     }
-    
+
     Ok(false)
 }
 
@@ -2879,20 +2941,20 @@ pub fn validate_visibility_constraints(
 ) -> Result<(), MoveRenameError> {
     // Get current visibility of the item
     let current_visibility = get_item_visibility(sema, def)?;
-    
+
     // Get target module visibility context
     let target_module_visibility = get_module_visibility_context(sema, target_module)?;
-    
+
     // Check if move would violate Rust's module privacy rules (Requirement 4.5)
     if !is_visibility_compatible(current_visibility, &target_module_visibility) {
         return Err(MoveRenameError::VisibilityViolation(
-            "Moving item would violate visibility constraints".to_string()
+            "Moving item would violate visibility constraints".to_string(),
         ));
     }
-    
+
     // Validate that existing references will remain accessible (Requirement 4.4)
     validate_references_remain_accessible(sema, def, target_module)?;
-    
+
     Ok(())
 }
 
@@ -2903,47 +2965,53 @@ fn get_item_visibility(
 ) -> Result<ItemVisibility, MoveRenameError> {
     match def {
         Definition::Function(func) => {
-            let source = sema.source(func)
-                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get function source".to_string()))?;
+            let source = sema.source(func).ok_or_else(|| {
+                MoveRenameError::VisibilityViolation("Cannot get function source".to_string())
+            })?;
             Ok(extract_visibility_from_ast(source.value.visibility()))
         }
-        Definition::Adt(adt) => {
-            match adt {
-                hir::Adt::Struct(struct_) => {
-                    let source = sema.source(struct_)
-                        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get struct source".to_string()))?;
-                    Ok(extract_visibility_from_ast(source.value.visibility()))
-                }
-                hir::Adt::Enum(enum_) => {
-                    let source = sema.source(enum_)
-                        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get enum source".to_string()))?;
-                    Ok(extract_visibility_from_ast(source.value.visibility()))
-                }
-                hir::Adt::Union(union_) => {
-                    let source = sema.source(union_)
-                        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get union source".to_string()))?;
-                    Ok(extract_visibility_from_ast(source.value.visibility()))
-                }
+        Definition::Adt(adt) => match adt {
+            hir::Adt::Struct(struct_) => {
+                let source = sema.source(struct_).ok_or_else(|| {
+                    MoveRenameError::VisibilityViolation("Cannot get struct source".to_string())
+                })?;
+                Ok(extract_visibility_from_ast(source.value.visibility()))
             }
-        }
+            hir::Adt::Enum(enum_) => {
+                let source = sema.source(enum_).ok_or_else(|| {
+                    MoveRenameError::VisibilityViolation("Cannot get enum source".to_string())
+                })?;
+                Ok(extract_visibility_from_ast(source.value.visibility()))
+            }
+            hir::Adt::Union(union_) => {
+                let source = sema.source(union_).ok_or_else(|| {
+                    MoveRenameError::VisibilityViolation("Cannot get union source".to_string())
+                })?;
+                Ok(extract_visibility_from_ast(source.value.visibility()))
+            }
+        },
         Definition::Const(const_) => {
-            let source = sema.source(const_)
-                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get const source".to_string()))?;
+            let source = sema.source(const_).ok_or_else(|| {
+                MoveRenameError::VisibilityViolation("Cannot get const source".to_string())
+            })?;
             Ok(extract_visibility_from_ast(source.value.visibility()))
         }
         Definition::Static(static_) => {
-            let source = sema.source(static_)
-                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get static source".to_string()))?;
+            let source = sema.source(static_).ok_or_else(|| {
+                MoveRenameError::VisibilityViolation("Cannot get static source".to_string())
+            })?;
             Ok(extract_visibility_from_ast(source.value.visibility()))
         }
         Definition::Trait(trait_) => {
-            let source = sema.source(trait_)
-                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get trait source".to_string()))?;
+            let source = sema.source(trait_).ok_or_else(|| {
+                MoveRenameError::VisibilityViolation("Cannot get trait source".to_string())
+            })?;
             Ok(extract_visibility_from_ast(source.value.visibility()))
         }
         Definition::TypeAlias(type_alias) => {
-            let source = sema.source(type_alias)
-                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get type alias source".to_string()))?;
+            let source = sema.source(type_alias).ok_or_else(|| {
+                MoveRenameError::VisibilityViolation("Cannot get type alias source".to_string())
+            })?;
             Ok(extract_visibility_from_ast(source.value.visibility()))
         }
         Definition::Module(module) => {
@@ -2982,9 +3050,7 @@ fn extract_visibility_from_ast(visibility: Option<syntax::ast::Visibility>) -> I
                 "pub(crate)" => ItemVisibility::PubCrate,
                 "pub(super)" => ItemVisibility::PubSuper,
                 "pub(self)" => ItemVisibility::PubSelf,
-                _ if vis_text.starts_with("pub(in ") => {
-                    ItemVisibility::PubIn(vis_text)
-                }
+                _ if vis_text.starts_with("pub(in ") => ItemVisibility::PubIn(vis_text),
                 _ => ItemVisibility::Private,
             }
         }
@@ -2999,12 +3065,13 @@ fn get_module_visibility_context(
 ) -> Result<ModuleVisibilityContext, MoveRenameError> {
     let is_crate_root = module.is_crate_root();
     let parent = module.parent(sema.db);
-    
+
     Ok(ModuleVisibilityContext {
         is_crate_root,
         has_parent: parent.is_some(),
-        module_path: module_to_mod_path(sema, module)
-            .map_err(|e| MoveRenameError::VisibilityViolation(format!("Cannot get module path: {}", e.0)))?,
+        module_path: module_to_mod_path(sema, module).map_err(|e| {
+            MoveRenameError::VisibilityViolation(format!("Cannot get module path: {}", e.0))
+        })?,
     })
 }
 
@@ -3025,7 +3092,7 @@ fn is_visibility_compatible(
     // if the visibility makes sense in the new module context
     match item_visibility {
         ItemVisibility::Private => true, // Private items can be moved anywhere within the same crate
-        ItemVisibility::Public => true, // Public items can be moved anywhere
+        ItemVisibility::Public => true,  // Public items can be moved anywhere
         ItemVisibility::PubCrate => true, // pub(crate) items can be moved anywhere within the crate
         ItemVisibility::PubSuper => true, // pub(super) items need parent module validation
         ItemVisibility::PubSelf => true, // pub(self) is equivalent to private
@@ -3040,18 +3107,19 @@ fn validate_references_remain_accessible(
     target_module: Module,
 ) -> Result<(), MoveRenameError> {
     let usages = def.usages(sema).all();
-    
+
     for (file_id, references) in usages {
         for reference in references {
             if !will_reference_remain_accessible(sema, &reference, def, target_module, file_id)? {
-                return Err(MoveRenameError::VisibilityViolation(
-                    format!("Reference at file {}:{} would become inaccessible after move", 
-                           file_id.file_id(sema.db).index(), u32::from(reference.range.start()))
-                ));
+                return Err(MoveRenameError::VisibilityViolation(format!(
+                    "Reference at file {}:{} would become inaccessible after move",
+                    file_id.file_id(sema.db).index(),
+                    u32::from(reference.range.start())
+                )));
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -3064,16 +3132,21 @@ fn will_reference_remain_accessible(
     file_id: base_db::EditionedFileId,
 ) -> Result<bool, MoveRenameError> {
     // Get the module containing the reference
-    let reference_module = sema.file_to_module_def(file_id.file_id(sema.db))
-        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot determine reference module".to_string()))?;
-    
+    let reference_module = sema.file_to_module_def(file_id.file_id(sema.db)).ok_or_else(|| {
+        MoveRenameError::VisibilityViolation("Cannot determine reference module".to_string())
+    })?;
+
     // Check if the reference module can access the target module
     if can_module_access_module(sema, reference_module, target_module)? {
         // Check if the item will be visible from the reference location
         let item_visibility = get_item_visibility(sema, def)?;
-        return Ok(is_item_accessible_from_module(item_visibility, reference_module, target_module));
+        return Ok(is_item_accessible_from_module(
+            item_visibility,
+            reference_module,
+            target_module,
+        ));
     }
-    
+
     Ok(false)
 }
 
@@ -3087,14 +3160,14 @@ fn can_module_access_module(
     if accessor == target {
         return Ok(true);
     }
-    
+
     // Same crate - check module hierarchy
     if accessor.krate() == target.krate() {
         // Within the same crate, modules can generally access each other
         // unless there are specific visibility restrictions
         return Ok(true);
     }
-    
+
     // Different crates - need to check if target is public
     Ok(false)
 }
@@ -3132,19 +3205,21 @@ pub fn validate_dependency_accessibility(
 ) -> Result<(), MoveRenameError> {
     // Check if the item has dependencies that might become inaccessible
     let dependencies = find_item_dependencies(sema, def)?;
-    
+
     for dependency in dependencies {
         if !will_dependency_be_accessible(sema, dependency, target_module)? {
-            let dep_name = dependency.name(sema.db)
+            let dep_name = dependency
+                .name(sema.db)
                 .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
                 .unwrap_or_else(|| "unnamed dependency".to_string());
-            
-            return Err(MoveRenameError::DependencyError(
-                format!("Dependency '{}' would become inaccessible after move", dep_name)
-            ));
+
+            return Err(MoveRenameError::DependencyError(format!(
+                "Dependency '{}' would become inaccessible after move",
+                dep_name
+            )));
         }
     }
-    
+
     Ok(())
 }
 
@@ -3154,7 +3229,7 @@ fn find_item_dependencies(
     def: Definition,
 ) -> Result<Vec<Definition>, MoveRenameError> {
     let mut dependencies = Vec::new();
-    
+
     // Get the source code of the item
     if let Some(source_node) = get_item_source_node(_sema, def) {
         // Find all references within the item's source
@@ -3162,14 +3237,15 @@ fn find_item_dependencies(
             if let Some(name_ref) = syntax::ast::NameRef::cast(node) {
                 // Try to resolve this name reference
                 if let Some(resolved_def) = resolve_name_ref_to_definition(_sema, &name_ref) {
-                    if resolved_def != def { // Don't include self-references
+                    if resolved_def != def {
+                        // Don't include self-references
                         dependencies.push(resolved_def);
                     }
                 }
             }
         }
     }
-    
+
     Ok(dependencies)
 }
 
@@ -3182,19 +3258,17 @@ fn get_item_source_node(
         Definition::Function(func) => {
             _sema.source(func).map(|source| source.value.syntax().clone())
         }
-        Definition::Adt(adt) => {
-            match adt {
-                hir::Adt::Struct(struct_) => {
-                    _sema.source(struct_).map(|source| source.value.syntax().clone())
-                }
-                hir::Adt::Enum(enum_) => {
-                    _sema.source(enum_).map(|source| source.value.syntax().clone())
-                }
-                hir::Adt::Union(union_) => {
-                    _sema.source(union_).map(|source| source.value.syntax().clone())
-                }
+        Definition::Adt(adt) => match adt {
+            hir::Adt::Struct(struct_) => {
+                _sema.source(struct_).map(|source| source.value.syntax().clone())
             }
-        }
+            hir::Adt::Enum(enum_) => {
+                _sema.source(enum_).map(|source| source.value.syntax().clone())
+            }
+            hir::Adt::Union(union_) => {
+                _sema.source(union_).map(|source| source.value.syntax().clone())
+            }
+        },
         Definition::Const(const_) => {
             _sema.source(const_).map(|source| source.value.syntax().clone())
         }
@@ -3233,12 +3307,12 @@ fn will_dependency_be_accessible(
         Some(module) => module,
         None => return Ok(true), // Built-in items are always accessible
     };
-    
+
     // Check if target module can access the dependency module
     if !can_module_access_module(sema, target_module, dependency_module)? {
         return Ok(false);
     }
-    
+
     // Check if the dependency item is visible from the target module
     let dependency_visibility = get_item_visibility(sema, dependency)?;
     Ok(is_item_accessible_from_module(dependency_visibility, target_module, dependency_module))
@@ -4128,7 +4202,7 @@ pub fn handle_module_creation_failure(
     rollback_context: &RollbackContext,
 ) -> MoveRenameError {
     let module_path_str = format_mod_path(module_path);
-    
+
     let detailed_message = if rollback_context.needs_rollback() {
         format!(
             "Failed to create module '{}': {}. Partial changes have been rolled back. \
@@ -4139,13 +4213,9 @@ pub fn handle_module_creation_failure(
             rollback_context.modified_files.len()
         )
     } else {
-        format!(
-            "Failed to create module '{}': {}. No changes were made.",
-            module_path_str,
-            error.0
-        )
+        format!("Failed to create module '{}': {}. No changes were made.", module_path_str, error.0)
     };
-    
+
     MoveRenameError::ModuleCreationFailed(detailed_message)
 }
 
@@ -4167,18 +4237,10 @@ pub fn handle_reference_update_failure(
             rollback_context.modified_files.len() + rollback_context.created_files.len()
         )
     } else {
-        format!(
-            "Failed to update {} in '{}': {}",
-            operation_type,
-            file_path,
-            error.0
-        )
+        format!("Failed to update {} in '{}': {}", operation_type, file_path, error.0)
     };
-    
-    MoveRenameError::ReferenceUpdateFailed {
-        file: file_path.to_string(),
-        error: detailed_message,
-    }
+
+    MoveRenameError::ReferenceUpdateFailed { file: file_path.to_string(), error: detailed_message }
 }
 
 /// Provide detailed error context for debugging and user feedback
@@ -4188,18 +4250,20 @@ pub fn create_error_context(
     target_module_path: &ModPath,
     new_item_name: &Name,
 ) -> String {
-    let item_name = def.name(sema.db)
+    let item_name = def
+        .name(sema.db)
         .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
         .unwrap_or_else(|| "unnamed item".to_string());
-    
-    let current_module = def.module(sema.db)
+
+    let current_module = def
+        .module(sema.db)
         .and_then(|module| module_to_mod_path(sema, module).ok())
         .map(|path| format_mod_path(&path))
         .unwrap_or_else(|| "unknown module".to_string());
-    
+
     let target_module_str = format_mod_path(target_module_path);
     let new_name_str = new_item_name.display(sema.db, Edition::CURRENT).to_string();
-    
+
     format!(
         "Move operation context:\n\
         - Item: '{}' ({})\n\
@@ -4219,11 +4283,11 @@ pub fn can_retry_operation(error: &MoveRenameError) -> bool {
     match error {
         MoveRenameError::NameConflict { .. } => true, // User can choose different name
         MoveRenameError::VisibilityViolation(_) => true, // User can adjust visibility
-        MoveRenameError::InvalidPath(_) => true, // User can provide valid path
+        MoveRenameError::InvalidPath(_) => true,      // User can provide valid path
         MoveRenameError::CircularDependency(_) => false, // Structural issue, needs different approach
-        MoveRenameError::DependencyError(_) => false, // May need code restructuring
+        MoveRenameError::DependencyError(_) => false,    // May need code restructuring
         MoveRenameError::ModuleCreationFailed(_) => true, // May be temporary file system issue
-        MoveRenameError::FileSystemError(_) => true, // May be temporary
+        MoveRenameError::FileSystemError(_) => true,     // May be temporary
         MoveRenameError::ModuleIntegrationFailed(_) => false, // Structural issue
         MoveRenameError::ReferenceUpdateFailed { .. } => true, // May be temporary parsing issue
     }
@@ -4351,7 +4415,7 @@ pub fn update_external_references(
     // Create reference update context
     let old_module_path = module_to_mod_path(sema, old_module)?;
     let new_module_path = module_to_mod_path(sema, new_module)?;
-    
+
     let context = ReferenceUpdateContext {
         old_module_path,
         new_module_path,
@@ -4361,15 +4425,10 @@ pub fn update_external_references(
 
     // Find all references to the moved item (Requirement 3.1)
     let usages = def.usages(sema).all();
-    
+
     for (file_id, references) in usages {
-        let updated_references = update_references_in_file(
-            sema,
-            &references,
-            def,
-            &context,
-        )?;
-        
+        let updated_references = update_references_in_file(sema, &references, def, &context)?;
+
         if !updated_references.is_empty() {
             source_change.insert_source_edit(file_id.file_id(sema.db), updated_references);
         }
@@ -4377,7 +4436,7 @@ pub fn update_external_references(
 
     // Handle re-exports (Requirement 3.4)
     let reexport_updates = update_reexports_for_moved_item(sema, def, &context)?;
-    
+
     // Merge the reexport updates into the main source change
     for (file_id, edit) in reexport_updates.source_file_edits {
         source_change.insert_source_edit(file_id, edit.0);
@@ -4412,7 +4471,9 @@ fn update_references_in_file(
                 edit_builder.replace(reference.range, new_import);
                 edited_ranges.insert(reference.range.start());
             }
-        } else if reference.category.contains(ReferenceCategory::WRITE) || reference.category.contains(ReferenceCategory::READ) {
+        } else if reference.category.contains(ReferenceCategory::WRITE)
+            || reference.category.contains(ReferenceCategory::READ)
+        {
             // Update fully-qualified references (Requirement 3.3)
             if is_fully_qualified_reference(sema, reference, def)? {
                 if let Some(new_path) = update_qualified_path_reference(sema, reference, context)? {
@@ -4452,7 +4513,7 @@ fn find_use_statement_at_range(
             }
         }
     }
-    
+
     Ok(None)
 }
 
@@ -4462,22 +4523,20 @@ fn update_use_tree_path(
     use_tree: &syntax::ast::UseTree,
     context: &ReferenceUpdateContext,
 ) -> Result<String> {
-    let path = use_tree.path().ok_or_else(|| {
-        RenameError("Use tree has no path".to_string())
-    })?;
+    let path = use_tree.path().ok_or_else(|| RenameError("Use tree has no path".to_string()))?;
 
     // Check if this use statement imports the moved item
     if path_references_moved_item(&path, &context.old_module_path, &context.item_name)? {
         // Build new import path
         let new_path = build_new_import_path(context)?;
-        
+
         // Preserve alias if present (Requirement 3.5)
         if let Some(rename) = use_tree.rename() {
             if context.preserve_aliases {
                 return Ok(format!("{} as {}", new_path, rename.name().unwrap().text()));
             }
         }
-        
+
         // Handle use tree structure (single import vs group imports)
         if let Some(use_tree_list) = use_tree.use_tree_list() {
             // This is a group import like `use module::{Item1, Item2}`
@@ -4501,7 +4560,7 @@ fn path_references_moved_item(
 ) -> Result<bool> {
     // Convert AST path to ModPath for comparison
     let path_text = path.syntax().text().to_string();
-    
+
     // Simple check: see if the path ends with our item name
     // A more sophisticated implementation would parse the full path
     Ok(path_text.ends_with(item_name.as_str()))
@@ -4510,7 +4569,7 @@ fn path_references_moved_item(
 /// Build new import path from context
 fn build_new_import_path(context: &ReferenceUpdateContext) -> Result<String> {
     let mut path_parts = Vec::new();
-    
+
     // Add path kind prefix
     match context.new_module_path.kind {
         PathKind::Crate => path_parts.push("crate".to_string()),
@@ -4525,15 +4584,15 @@ fn build_new_import_path(context: &ReferenceUpdateContext) -> Result<String> {
         PathKind::Abs => path_parts.push("".to_string()), // Absolute path
         PathKind::DollarCrate(_) => path_parts.push("$crate".to_string()),
     }
-    
+
     // Add module segments
     for segment in context.new_module_path.segments() {
         path_parts.push(segment.as_str().to_string());
     }
-    
+
     // Add item name
     path_parts.push(context.item_name.as_str().to_string());
-    
+
     Ok(path_parts.join("::"))
 }
 
@@ -4560,7 +4619,7 @@ fn is_fully_qualified_reference(
         FileReferenceNode::Name(name) => name.text().to_string(),
         _ => return Ok(false),
     };
-    
+
     Ok(reference_text.contains("::"))
 }
 
@@ -4602,14 +4661,14 @@ fn update_qualified_path_reference(
         FileReferenceNode::Lifetime(lifetime) => lifetime.text().to_string(),
         FileReferenceNode::FormatStringEntry(string, _) => string.text().to_string(),
     };
-    
+
     // If this references our moved item, update it
     if current_text == context.item_name.as_str() {
         // Build the new fully-qualified path
         let new_path = build_new_import_path(context)?;
         return Ok(Some(new_path));
     }
-    
+
     Ok(None)
 }
 
@@ -4621,17 +4680,17 @@ fn update_reexports_for_moved_item(
     context: &ReferenceUpdateContext,
 ) -> Result<SourceChange> {
     let mut source_change = SourceChange::default();
-    
+
     // Find all re-exports of this item
     let reexports = find_reexports_of_item(sema, def)?;
-    
+
     for reexport in reexports {
         let updated_reexport = update_reexport_statement(sema, &reexport, context)?;
         if let Some((file_id, edit)) = updated_reexport {
             source_change.insert_source_edit(file_id, edit);
         }
     }
-    
+
     Ok(source_change)
 }
 
@@ -4649,13 +4708,13 @@ fn find_reexports_of_item(
     def: Definition,
 ) -> Result<Vec<ReexportInfo>> {
     let mut reexports = Vec::new();
-    
+
     // Get all usages of the item
     let usages = def.usages(sema).all();
-    
+
     for (file_id, references) in usages {
         let source_file = sema.parse(file_id);
-        
+
         for reference in &references {
             // Check if this reference is part of a pub use statement
             if let Some(reexport) = find_reexport_at_reference(&source_file, reference)? {
@@ -4667,7 +4726,7 @@ fn find_reexports_of_item(
             }
         }
     }
-    
+
     Ok(reexports)
 }
 
@@ -4680,13 +4739,14 @@ fn find_reexport_at_reference(
     for item in source_file.items() {
         if let syntax::ast::Item::Use(use_stmt) = item {
             // Check if this is a pub use statement
-            if use_stmt.visibility().is_some() && 
-               use_stmt.syntax().text_range().contains_range(reference.range) {
+            if use_stmt.visibility().is_some()
+                && use_stmt.syntax().text_range().contains_range(reference.range)
+            {
                 return Ok(Some(use_stmt));
             }
         }
     }
-    
+
     Ok(None)
 }
 
@@ -4700,13 +4760,13 @@ fn update_reexport_statement(
     if let Some(use_tree) = reexport.use_stmt.use_tree() {
         // Update the path in the use tree
         let updated_use = update_use_tree_path(&use_tree, context)?;
-        
+
         // Create edit to replace the entire use statement
         let edit = TextEdit::replace(reexport.use_stmt.syntax().text_range(), updated_use);
-        
+
         return Ok(Some((reexport.file_id, edit)));
     }
-    
+
     Ok(None)
 }
 
@@ -4766,23 +4826,17 @@ pub fn update_internal_references(
         match reference.reference_type {
             InternalReferenceType::SuperReference => {
                 // Update super:: references (Requirement 6.3)
-                if let Some(new_path) = calculate_new_super_path(
-                    &reference,
-                    &old_module_path,
-                    &new_module_path,
-                    sema,
-                )? {
+                if let Some(new_path) =
+                    calculate_new_super_path(&reference, &old_module_path, &new_module_path, sema)?
+                {
                     edit_builder.replace(reference.range, new_path);
                 }
             }
             InternalReferenceType::CrateReference => {
                 // Update crate:: references (Requirement 6.3)
-                if let Some(new_path) = calculate_new_crate_path(
-                    &reference,
-                    &old_module_path,
-                    &new_module_path,
-                    sema,
-                )? {
+                if let Some(new_path) =
+                    calculate_new_crate_path(&reference, &old_module_path, &new_module_path, sema)?
+                {
                     edit_builder.replace(reference.range, new_path);
                 }
             }
@@ -4799,12 +4853,9 @@ pub fn update_internal_references(
             }
             InternalReferenceType::SelfReference => {
                 // Update self-referential paths (Requirement 6.4)
-                if let Some(new_path) = calculate_new_self_path(
-                    &reference,
-                    &old_module_path,
-                    &new_module_path,
-                    sema,
-                )? {
+                if let Some(new_path) =
+                    calculate_new_self_path(&reference, &old_module_path, &new_module_path, sema)?
+                {
                     edit_builder.replace(reference.range, new_path);
                 }
             }
@@ -4835,7 +4886,9 @@ fn find_internal_module_references(
     // Walk through all path expressions in the item source
     for node in item_source.descendants() {
         if let Some(path) = syntax::ast::Path::cast(node) {
-            if let Some(internal_ref) = analyze_path_for_internal_reference(sema, &path, current_module)? {
+            if let Some(internal_ref) =
+                analyze_path_for_internal_reference(sema, &path, current_module)?
+            {
                 references.push(internal_ref);
             }
         }
@@ -4873,12 +4926,7 @@ fn analyze_path_for_internal_reference(
     // Try to resolve the module this path refers to
     let resolved_module = resolve_path_to_module(sema, path, current_module)?;
 
-    Ok(Some(InternalReference {
-        range,
-        reference_type,
-        original_path: path_text,
-        resolved_module,
-    }))
+    Ok(Some(InternalReference { range, reference_type, original_path: path_text, resolved_module }))
 }
 
 /// Check if a path is a sibling module reference
@@ -4900,7 +4948,7 @@ fn is_sibling_module_reference(
             }
         }
     }
-    
+
     Ok(false)
 }
 
@@ -4912,9 +4960,9 @@ fn resolve_path_to_module(
 ) -> Result<Option<Module>> {
     // This is a simplified resolution - a full implementation would use
     // rust-analyzer's path resolution infrastructure
-    
+
     let path_text = path.syntax().text().to_string();
-    
+
     if path_text.starts_with("super::") {
         // Super reference - get parent module
         Ok(current_module.parent(sema.db))
@@ -4951,15 +4999,14 @@ fn calculate_new_super_path(
 ) -> Result<Option<String>> {
     // Parse the original super:: path
     let original_path = &reference.original_path;
-    
+
     if !original_path.starts_with("super::") {
         return Ok(None);
     }
 
     // Count the number of super:: segments
     let super_count = original_path.matches("super::").count();
-    let remaining_path = original_path.strip_prefix(&"super::".repeat(super_count))
-        .unwrap_or("");
+    let remaining_path = original_path.strip_prefix(&"super::".repeat(super_count)).unwrap_or("");
 
     // Calculate the new path based on the new module hierarchy
     let old_depth = old_module_path.segments().len();
@@ -5000,7 +5047,7 @@ fn calculate_new_crate_path(
     // Crate:: paths are absolute and don't need to change
     // unless the target module itself has moved, which would be handled
     // by external reference updates
-    
+
     // For now, we keep crate:: paths unchanged
     Ok(None)
 }
@@ -5014,19 +5061,16 @@ fn calculate_new_sibling_path(
     _sema: &Semantics<'_, RootDatabase>,
 ) -> Result<Option<String>> {
     let original_path = &reference.original_path;
-    
+
     // Parse the original path to get the sibling module name
     let path_parts: Vec<&str> = original_path.split("::").collect();
     if path_parts.is_empty() {
         return Ok(None);
     }
-    
+
     let sibling_name = path_parts[0];
-    let remaining_path = if path_parts.len() > 1 {
-        path_parts[1..].join("::")
-    } else {
-        String::new()
-    };
+    let remaining_path =
+        if path_parts.len() > 1 { path_parts[1..].join("::") } else { String::new() };
 
     // Check if the sibling relationship changes in the new module context
     let old_parent_depth = if old_module_path.segments().is_empty() {
@@ -5034,7 +5078,7 @@ fn calculate_new_sibling_path(
     } else {
         old_module_path.segments().len() - 1
     };
-    
+
     let new_parent_depth = if new_module_path.segments().is_empty() {
         0
     } else {
@@ -5060,24 +5104,24 @@ fn calculate_new_sibling_path(
     } else {
         // Moved down in hierarchy - may need to use absolute path
         let mut absolute_path = vec!["crate".to_string()];
-        
+
         // Add the old parent path segments
         if old_parent_depth > 0 {
             absolute_path.extend(
                 old_module_path.segments()[..old_parent_depth]
                     .iter()
-                    .map(|s| s.as_str().to_string())
+                    .map(|s| s.as_str().to_string()),
             );
         }
-        
+
         // Add the sibling name
         absolute_path.push(sibling_name.to_string());
-        
+
         // Add remaining path
         if !remaining_path.is_empty() {
             absolute_path.push(remaining_path);
         }
-        
+
         Ok(Some(absolute_path.join("::")))
     }
 }
@@ -5093,7 +5137,7 @@ fn calculate_new_self_path(
     // Self:: paths refer to the current module and don't need to change
     // when the item moves, as they still refer to the same logical module
     // (the module the item is now in)
-    
+
     Ok(None)
 }
 
@@ -5104,7 +5148,7 @@ fn find_file_id_for_syntax_node(
 ) -> Option<FileId> {
     // Try to find the source file for this syntax node
     let _source_file = node.ancestors().find_map(syntax::ast::SourceFile::cast)?;
-    
+
     // For now, return None - a full implementation would need to properly
     // resolve the file ID from the syntax node
     // This is a complex operation that requires access to the source mapping
@@ -5484,7 +5528,7 @@ mod tests {
     }
 
     // Additional edge case tests for path parsing and validation (Requirements 1.1, 1.3)
-    
+
     #[test]
     fn test_parse_path_with_keywords() {
         let db = RootDatabase::with_files("");
@@ -5492,7 +5536,7 @@ mod tests {
         // Test paths containing Rust keywords (should be valid as module names in paths)
         let result = parse_rename_target("crate::r#mod::Item", &db);
         assert!(result.is_ok());
-        
+
         // Test invalid keyword usage
         let result = parse_rename_target("crate::struct::Item", &db);
         assert!(result.is_err());
@@ -5505,15 +5549,15 @@ mod tests {
         // Test paths with underscores (valid)
         let result = parse_rename_target("crate::my_module::my_item", &db);
         assert!(result.is_ok());
-        
+
         // Test paths with numbers (valid)
         let result = parse_rename_target("crate::module2::item3", &db);
         assert!(result.is_ok());
-        
+
         // Test paths with invalid characters
         let result = parse_rename_target("crate::my-module::item", &db);
         assert!(result.is_err());
-        
+
         let result = parse_rename_target("crate::my module::item", &db);
         assert!(result.is_err());
     }
@@ -5611,10 +5655,10 @@ mod tests {
         // Test creating preferences with different settings
         let mut prefs = ModuleOrganizationPreferences::default();
         assert!(!prefs.prefer_mod_rs);
-        
+
         prefs.prefer_mod_rs = true;
         assert!(prefs.prefer_mod_rs);
-        
+
         prefs.directory_structure = DirectoryStructurePreference::Flat;
         assert!(matches!(prefs.directory_structure, DirectoryStructurePreference::Flat));
     }
@@ -5624,7 +5668,7 @@ mod tests {
         // Test that module file type variants exist and can be matched
         let mod_rs = ModuleFileType::ModRs;
         let module_file = ModuleFileType::ModuleFile;
-        
+
         assert!(matches!(mod_rs, ModuleFileType::ModRs));
         assert!(matches!(module_file, ModuleFileType::ModuleFile));
     }
@@ -5634,7 +5678,7 @@ mod tests {
         // Test that ModuleCreationPlan can be created and has expected fields
         let prefs = ModuleOrganizationPreferences::default();
         let plan = ModuleCreationPlan::new(prefs.clone());
-        
+
         assert!(plan.directories_to_create.is_empty());
         assert!(plan.files_to_create.is_empty());
         assert!(plan.module_declarations_to_add.is_empty());
