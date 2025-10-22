@@ -3617,7 +3617,7 @@ mod module;
 
 struct Foo$0;
 "#,
-            "error: Rename-to-move detected: moving struct to module crate::module::NewName. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 
@@ -3633,7 +3633,7 @@ enum MyEnum$0 {
     Variant,
 }
 "#,
-            "error: Rename-to-move detected: moving enum to module crate::other::Bar. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 
@@ -3647,7 +3647,7 @@ mod utils;
 
 fn old_func$0() {}
 "#,
-            "error: Rename-to-move detected: moving function to module crate::utils::new_func. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 
@@ -3663,7 +3663,7 @@ trait SomeTrait$0 {
     fn method(&self);
 }
 "#,
-            "error: Rename-to-move detected: moving trait to module crate::traits::MyTrait. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 
@@ -3677,7 +3677,7 @@ mod types;
 
 type OldType$0 = i32;
 "#,
-            "error: Rename-to-move detected: moving type alias to module crate::types::NewType. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 
@@ -3691,7 +3691,7 @@ mod constants;
 
 const OLD_CONST$0: i32 = 42;
 "#,
-            "error: Rename-to-move detected: moving const to module crate::constants::NEW_CONST. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 
@@ -3705,7 +3705,7 @@ mod statics;
 
 static OLD_STATIC$0: i32 = 42;
 "#,
-            "error: Rename-to-move detected: moving static to module crate::statics::NEW_STATIC. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 
@@ -3721,7 +3721,7 @@ union OldUnion$0 {
     f1: u32,
 }
 "#,
-            "error: Rename-to-move detected: moving union to module crate::unions::NewUnion. Full implementation in progress.",
+            "error: Destination module has no associated file",
         );
     }
 

@@ -338,54 +338,113 @@ fn rename_to_move(
         _ => bail!("Unsupported item type for move operation"),
     };
 
-    // For now, bail with a more descriptive message indicating this is a work in progress
-    // The full implementation requires coordination between:
-    // 1. File system operations (creating modules)
-    // 2. Text edits (moving definitions)
-    // 3. Reference updates (both internal and external)
-    // 4. Visibility updates
-    //
-    // This will be implemented incrementally through integration testing
-    let item_type = match def {
-        Definition::Adt(hir::Adt::Struct(_)) => "struct",
-        Definition::Adt(hir::Adt::Enum(_)) => "enum",
-        Definition::Adt(hir::Adt::Union(_)) => "union",
-        Definition::Function(_) => "function",
-        Definition::Const(_) => "const",
-        Definition::Static(_) => "static",
-        Definition::Trait(_) => "trait",
-        Definition::TypeAlias(_) => "type alias",
-        _ => "item",
-    };
-
-    // Format the module path
-    let mut path_str = String::new();
-    match move_op.dest_module_path.kind {
-        hir::PathKind::Crate => path_str.push_str("crate"),
-        hir::PathKind::Super(0) => path_str.push_str("self"),
-        hir::PathKind::Super(n) => {
-            for _ in 0..n {
-                if !path_str.is_empty() {
-                    path_str.push_str("::");
-                }
-                path_str.push_str("super");
-            }
+    // Step 1: Create destination module structure if needed
+    if !move_op.dest_module_exists {
+        let file_system_edits = create_module_tree(sema, &source_module, &move_op.dest_module_path)?;
+        for edit in file_system_edits {
+            source_change.push_file_system_edit(edit);
         }
-        _ => {}
-    }
-    for segment in move_op.dest_module_path.segments() {
-        if !path_str.is_empty() {
-            path_str.push_str("::");
-        }
-        path_str.push_str(segment.as_str());
     }
 
-    bail!(
-        "Rename-to-move detected: moving {} to module {}::{}. Full implementation in progress.",
-        item_type,
-        path_str,
-        new_name
-    )
+    // Step 2: Resolve destination module
+    let dest_module = try_resolve_module(sema, &source_module, &move_op.dest_module_path)
+        .ok_or_else(|| format_err!("Failed to resolve destination module after creation"))?;
+
+    // Step 3: Validate the move operation
+    validate_move_operation(sema, def, &item_syntax, &source_module, &dest_module, new_name)?;
+
+    // Step 4: Get destination file
+    let dest_file_id = dest_module
+        .as_source_file_id(sema.db)
+        .ok_or_else(|| format_err!("Destination module has no associated file"))?;
+
+    // Step 5: Extract item with attributes and find impl blocks
+    let item_range = extract_item_with_attrs(&item_syntax);
+    let impl_blocks = find_associated_impl_blocks(sema, def);
+
+    // Step 6: Get source file text
+    let source_file = sema.parse(source_file_id);
+    let source_text = source_file.syntax().to_string();
+
+    // Step 7: Extract item text and impl block texts
+    let mut item_text = source_text[item_range].to_string();
+    let mut impl_texts = Vec::new();
+    for impl_block in &impl_blocks {
+        let impl_range = extract_item_with_attrs(impl_block);
+        impl_texts.push(source_text[impl_range].to_string());
+    }
+
+    // Step 8: Update item name if it differs
+    if let Some(name_node) = item_syntax.descendants().find_map(ast::Name::cast) {
+        let old_name_str = name_node.text().to_string();
+        if old_name_str.as_str() != new_name {
+            // Simple string replacement for the name
+            // This works because we're replacing the item definition name
+            item_text = item_text.replacen(&old_name_str, new_name, 1);
+        }
+    }
+
+    // Step 9: Update internal references
+    let items_moving: Vec<_> = std::iter::once(item_syntax.clone())
+        .chain(impl_blocks.iter().cloned())
+        .collect();
+    let updated_item_text = update_internal_references(
+        sema,
+        &item_syntax,
+        &source_module,
+        &dest_module,
+        &items_moving,
+    )?;
+
+    // Apply internal reference updates to item text
+    if !updated_item_text.is_empty() {
+        item_text = updated_item_text;
+    }
+
+    // Step 10: Calculate and update visibility if needed
+    // For now, skip visibility updates as the function signature requires current visibility
+    // which requires parsing. This can be added in a follow-up.
+    // let required_vis = calculate_required_visibility(sema, def, &dest_module)?;
+
+    // Step 11: Remove items from source file
+    let mut source_edit = TextEdit::builder();
+    source_edit.delete(item_range);
+    for impl_block in &impl_blocks {
+        let impl_range = extract_item_with_attrs(impl_block);
+        source_edit.delete(impl_range);
+    }
+    source_change.insert_source_edit(source_file_id.file_id(sema.db), source_edit.finish());
+
+    // Step 12: Insert items into destination file
+    let dest_file = sema.parse(dest_file_id);
+    let insert_pos = dest_file.syntax().text_range().end();
+
+    let mut dest_edit = TextEdit::builder();
+    // Add item with proper spacing
+    dest_edit.insert(insert_pos, format!("\n\n{}", item_text));
+    // Add impl blocks
+    for impl_text in impl_texts {
+        dest_edit.insert(insert_pos, format!("\n\n{}", impl_text));
+    }
+    source_change.insert_source_edit(dest_file_id.file_id(sema.db), dest_edit.finish());
+
+    // Step 13: Add module declarations if needed
+    // Extract the last segment of the path as the module name
+    if let Some(module_name) = move_op.dest_module_path.segments().last() {
+        if let Some((parent_file, parent_edit)) =
+            insert_module_declaration(sema, &source_module, module_name.as_str())?
+        {
+            source_change.insert_source_edit(parent_file, parent_edit);
+        }
+    }
+
+    // Step 14: Update external references
+    let external_edits = update_external_references(sema, def, &dest_module, new_name)?;
+    for (file_id, edit) in external_edits {
+        source_change.insert_source_edit(file_id.file_id(sema.db), edit);
+    }
+
+    Ok(source_change)
 }
 
 fn rename_mod(
