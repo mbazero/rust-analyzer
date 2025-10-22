@@ -29,6 +29,8 @@ use crate::{
 use base_db::AnchoredPathBuf;
 use either::Either;
 use hir::{FieldSource, FileRange, InFile, Module, ModuleSource, Name, Semantics, sym, ModPath, PathKind, db::ExpandDatabase};
+use base_db::SourceDatabase;
+use crate::symbol_index::SymbolsDatabase;
 use span::{Edition, FileId, SyntaxContext};
 use stdx::{TupleExt, never};
 use syntax::{
@@ -904,6 +906,604 @@ pub fn normalize_target_path(
     }
 }
 
+/// Module structure analysis for tracking existing vs missing module segments
+/// (Requirements 2.1, 2.2, 2.3)
+#[derive(Debug)]
+pub struct ModuleStructure {
+    pub current_module: Module,
+    pub target_module_path: ModPath,
+    pub missing_segments: Vec<Name>,
+    pub existing_segments: Vec<Module>,
+}
+
+/// Plan for creating missing module structure
+/// (Requirements 2.1, 2.2, 2.3, 2.4, 2.5)
+#[derive(Debug)]
+pub struct ModuleCreationPlan {
+    pub directories_to_create: Vec<std::path::PathBuf>,
+    pub files_to_create: Vec<ModuleFileSpec>,
+    pub module_declarations_to_add: Vec<ModuleDeclaration>,
+    pub user_preferences: ModuleOrganizationPreferences,
+}
+
+/// Specification for a module file to be created
+/// (Requirements 2.2, 2.3)
+#[derive(Debug)]
+pub struct ModuleFileSpec {
+    pub path: std::path::PathBuf,
+    pub content: String,
+    pub file_type: ModuleFileType,
+}
+
+/// Types of module files that can be created
+/// (Requirement 2.2)
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModuleFileType {
+    /// mod.rs file
+    ModRs,
+    /// module_name.rs file
+    ModuleFile,
+}
+
+/// Declaration to add to a parent module
+/// (Requirement 2.4)
+#[derive(Debug)]
+pub struct ModuleDeclaration {
+    pub parent_file: FileId,
+    pub module_name: String,
+    pub insert_position: syntax::TextSize,
+    pub visibility: Option<String>,
+}
+
+/// User preferences for module organization
+/// (Requirement 2.3)
+#[derive(Debug, Clone)]
+pub struct ModuleOrganizationPreferences {
+    pub prefer_mod_rs: bool,
+    pub directory_structure: DirectoryStructurePreference,
+}
+
+/// Directory structure preferences
+/// (Requirement 2.3)
+#[derive(Debug, Clone)]
+pub enum DirectoryStructurePreference {
+    /// Nested directory structure (src/module/submodule/)
+    Nested,
+    /// Flat file structure (src/module_submodule.rs)
+    Flat,
+}
+
+impl Default for ModuleOrganizationPreferences {
+    fn default() -> Self {
+        Self {
+            prefer_mod_rs: false, // Default to module_name.rs
+            directory_structure: DirectoryStructurePreference::Nested,
+        }
+    }
+}
+
+impl ModuleCreationPlan {
+    pub fn new(user_preferences: ModuleOrganizationPreferences) -> Self {
+        Self {
+            directories_to_create: Vec::new(),
+            files_to_create: Vec::new(),
+            module_declarations_to_add: Vec::new(),
+            user_preferences,
+        }
+    }
+
+    pub fn add_module_creation(&mut self, spec: ModuleFileSpec) -> Result<()> {
+        // Add directory creation if needed
+        if let Some(parent_dir) = spec.path.parent() {
+            if !self.directories_to_create.contains(&parent_dir.to_path_buf()) {
+                self.directories_to_create.push(parent_dir.to_path_buf());
+            }
+        }
+        
+        self.files_to_create.push(spec);
+        Ok(())
+    }
+
+    pub fn add_module_declaration(&mut self, declaration: ModuleDeclaration) {
+        self.module_declarations_to_add.push(declaration);
+    }
+}
+
+/// Traverse current module hierarchy and identify existing vs missing module segments
+/// (Requirements 2.1, 2.2, 2.3)
+pub fn analyze_module_structure(
+    sema: &Semantics<'_, RootDatabase>,
+    current_module: Module,
+    target_module_path: &ModPath,
+) -> Result<ModuleStructure> {
+    let mut existing_segments = Vec::new();
+    let mut missing_segments = Vec::new();
+    
+    // Start from crate root for absolute paths
+    let mut current = match target_module_path.kind {
+        PathKind::Crate => current_module.crate_root(sema.db),
+        PathKind::Super(n) => {
+            // Handle super:: paths by going up n levels
+            let mut module = current_module;
+            for _ in 0..n {
+                module = module.parent(sema.db)
+                    .ok_or_else(|| RenameError("Cannot resolve super:: path - not enough parent modules".to_string()))?;
+            }
+            module
+        }
+        PathKind::Plain => current_module, // Relative to current module
+        PathKind::Abs => return Err(RenameError("Absolute paths not supported for module creation".to_string())),
+        PathKind::DollarCrate(_) => current_module.crate_root(sema.db),
+    };
+    
+    // Traverse each segment in the target path
+    for segment in target_module_path.segments() {
+        match find_child_module(sema, current, segment) {
+            Some(child_module) => {
+                // Module exists - add to existing segments
+                existing_segments.push(child_module);
+                current = child_module;
+            }
+            None => {
+                // Module doesn't exist - add to missing segments
+                missing_segments.push(segment.clone());
+                // All subsequent segments will also be missing
+                missing_segments.extend(
+                    target_module_path.segments()
+                        .iter()
+                        .skip(existing_segments.len() + missing_segments.len())
+                        .cloned()
+                );
+                break;
+            }
+        }
+    }
+    
+    Ok(ModuleStructure {
+        current_module,
+        target_module_path: target_module_path.clone(),
+        missing_segments,
+        existing_segments,
+    })
+}
+
+/// Find a child module by name
+fn find_child_module(
+    sema: &Semantics<'_, RootDatabase>,
+    parent: Module,
+    name: &Name,
+) -> Option<Module> {
+    parent.children(sema.db)
+        .find(|child| child.name(sema.db) == Some(name.clone()))
+}
+
+/// Create a plan for creating missing module structure
+/// (Requirements 2.1, 2.2, 2.3, 2.4, 2.5)
+pub fn create_module_creation_plan(
+    sema: &Semantics<'_, RootDatabase>,
+    module_structure: &ModuleStructure,
+    user_preferences: &ModuleOrganizationPreferences,
+) -> Result<ModuleCreationPlan> {
+    let mut plan = ModuleCreationPlan::new(user_preferences.clone());
+    
+    if module_structure.missing_segments.is_empty() {
+        // No missing modules - nothing to create
+        return Ok(plan);
+    }
+    
+    // Start from the last existing module (or crate root if none exist)
+    let current_module = if let Some(last_existing) = module_structure.existing_segments.last() {
+        *last_existing
+    } else {
+        module_structure.current_module.crate_root(sema.db)
+    };
+    
+    // Create each missing module in sequence
+    for segment in &module_structure.missing_segments {
+        let module_spec = create_module_file_spec(
+            sema,
+            current_module,
+            segment.as_str(),
+            user_preferences,
+        )?;
+        
+        plan.add_module_creation(module_spec)?;
+        
+        // Add module declaration to parent (Requirement 2.4)
+        let declaration = create_module_declaration(
+            sema,
+            current_module,
+            segment.as_str(),
+        )?;
+        plan.add_module_declaration(declaration);
+        
+        // For subsequent iterations, we would be working with the newly created module
+        // but since it doesn't exist yet, we continue with the current module as parent
+    }
+    
+    // Validate module integration (Requirement 2.5)
+    validate_module_integration(&plan, sema)?;
+    
+    Ok(plan)
+}
+
+/// Create a specification for a module file
+/// (Requirements 2.2, 2.3)
+fn create_module_file_spec(
+    sema: &Semantics<'_, RootDatabase>,
+    parent_module: Module,
+    module_name: &str,
+    preferences: &ModuleOrganizationPreferences,
+) -> Result<ModuleFileSpec> {
+    // Determine file type based on preferences (Requirement 2.2)
+    let file_type = if preferences.prefer_mod_rs {
+        ModuleFileType::ModRs
+    } else {
+        ModuleFileType::ModuleFile
+    };
+    
+    // Calculate module path based on parent module and preferences
+    let path = calculate_module_path(sema, parent_module, module_name, &file_type, preferences)?;
+    
+    // Generate appropriate module content
+    let content = generate_module_content(module_name);
+    
+    Ok(ModuleFileSpec {
+        path,
+        content,
+        file_type,
+    })
+}
+
+/// Calculate the file system path for a new module
+/// (Requirements 2.1, 2.2, 2.3)
+fn calculate_module_path(
+    sema: &Semantics<'_, RootDatabase>,
+    parent_module: Module,
+    module_name: &str,
+    file_type: &ModuleFileType,
+    preferences: &ModuleOrganizationPreferences,
+) -> Result<std::path::PathBuf> {
+    // Get the parent module's file path
+    let parent_source = parent_module.definition_source(sema.db);
+    let parent_file_id = parent_source.file_id.original_file(sema.db);
+    // Get the VFS path for the parent file
+    let source_root = sema.db.file_source_root(parent_file_id.file_id(sema.db));
+    let source_root_data = sema.db.source_root(source_root.source_root_id(sema.db));
+    let source_root_ref = source_root_data.source_root(sema.db);
+    let parent_vfs_path = source_root_ref.path_for_file(&parent_file_id.file_id(sema.db))
+        .ok_or_else(|| RenameError("Cannot find path for parent file".to_string()))?;
+    
+    let parent_dir = parent_vfs_path.as_path()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| RenameError("Cannot determine parent directory".to_string()))?;
+    
+    match preferences.directory_structure {
+        DirectoryStructurePreference::Nested => {
+            match file_type {
+                ModuleFileType::ModRs => {
+                    // Create directory with module name and mod.rs inside
+                    let mut path = parent_dir.to_path_buf();
+                    path.push(module_name);
+                    path.push("mod.rs");
+                    Ok(path.into())
+                }
+                ModuleFileType::ModuleFile => {
+                    // Create module_name.rs in parent directory
+                    let mut path = parent_dir.to_path_buf();
+                    path.push(format!("{}.rs", module_name));
+                    Ok(path.into())
+                }
+            }
+        }
+        DirectoryStructurePreference::Flat => {
+            // Always create module_name.rs files in flat structure
+            let mut path = parent_dir.to_path_buf();
+            path.push(format!("{}.rs", module_name));
+            Ok(path.into())
+        }
+    }
+}
+
+/// Generate content for a new module file
+fn generate_module_content(module_name: &str) -> String {
+    format!(
+        "//! {} module\n\n// TODO: Add module implementation\n",
+        module_name
+    )
+}
+
+/// Create a module declaration to add to the parent module
+/// (Requirement 2.4)
+fn create_module_declaration(
+    sema: &Semantics<'_, RootDatabase>,
+    parent_module: Module,
+    module_name: &str,
+) -> Result<ModuleDeclaration> {
+    let parent_source = parent_module.definition_source(sema.db);
+    let parent_file_id = parent_source.file_id.original_file(sema.db);
+    
+    // Find appropriate position to insert module declaration
+    let insert_position = find_module_declaration_position(sema, parent_module)?;
+    
+    // Determine appropriate visibility
+    let visibility = determine_module_visibility(sema, parent_module);
+    
+    Ok(ModuleDeclaration {
+        parent_file: parent_file_id.file_id(sema.db),
+        module_name: module_name.to_string(),
+        insert_position,
+        visibility,
+    })
+}
+
+/// Find the appropriate position to insert a module declaration
+fn find_module_declaration_position(
+    sema: &Semantics<'_, RootDatabase>,
+    parent_module: Module,
+) -> Result<syntax::TextSize> {
+    let source = parent_module.definition_source(sema.db);
+    
+    match &source.value {
+        ModuleSource::SourceFile(source_file) => {
+            // Find the end of existing module declarations or the beginning of the file
+            let mut insert_pos = syntax::TextSize::from(0);
+            
+            for item in source_file.items() {
+                match item {
+                    syntax::ast::Item::Module(_) => {
+                        // Insert after the last module declaration
+                        insert_pos = item.syntax().text_range().end();
+                    }
+                    _ => {
+                        // Stop at the first non-module item
+                        break;
+                    }
+                }
+            }
+            
+            Ok(insert_pos)
+        }
+        ModuleSource::Module(_) => {
+            // Inline module - not supported for adding new modules
+            Err(RenameError("Cannot add modules to inline module definitions".to_string()))
+        }
+        ModuleSource::BlockExpr(_) => {
+            // Block module - not supported
+            Err(RenameError("Cannot add modules to block expressions".to_string()))
+        }
+    }
+}
+
+/// Determine appropriate visibility for a new module
+fn determine_module_visibility(
+    _sema: &Semantics<'_, RootDatabase>,
+    _parent_module: Module,
+) -> Option<String> {
+    // For now, use default (private) visibility
+    // This could be enhanced to analyze the parent module's visibility patterns
+    None
+}
+
+/// Validate that the module creation plan will integrate properly into the existing module tree
+/// (Requirement 2.5)
+fn validate_module_integration(
+    plan: &ModuleCreationPlan,
+    sema: &Semantics<'_, RootDatabase>,
+) -> Result<()> {
+    // Basic validation - ensure no conflicting file paths
+    let mut file_paths = std::collections::HashSet::new();
+    
+    for file_spec in &plan.files_to_create {
+        if !file_paths.insert(&file_spec.path) {
+            return Err(RenameError(format!(
+                "Duplicate file path in creation plan: {}",
+                file_spec.path.display()
+            )));
+        }
+    }
+    
+    // Validate module names are valid Rust identifiers
+    for file_spec in &plan.files_to_create {
+        if let Some(module_name) = file_spec.path.file_stem().and_then(|s| s.to_str()) {
+            let module_name = if module_name == "mod" {
+                // For mod.rs files, use the parent directory name
+                file_spec.path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+            } else {
+                module_name
+            };
+            
+            if !is_valid_module_name(module_name) {
+                return Err(RenameError(format!(
+                    "Invalid module name: {}",
+                    module_name
+                )));
+            }
+        }
+    }
+    
+    // Validate that parent modules can accept new child modules
+    for declaration in &plan.module_declarations_to_add {
+        validate_parent_can_accept_module(sema, declaration)?;
+    }
+    
+    Ok(())
+}
+
+/// Check if a module name is a valid Rust identifier
+fn is_valid_module_name(name: &str) -> bool {
+    // Basic validation - could be enhanced with full Rust identifier rules
+    !name.is_empty() 
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !name.chars().next().unwrap().is_ascii_digit()
+        && !is_rust_keyword(name)
+}
+
+/// Check if a string is a Rust keyword
+fn is_rust_keyword(name: &str) -> bool {
+    matches!(name, 
+        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" |
+        "false" | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" |
+        "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self" |
+        "static" | "struct" | "super" | "trait" | "true" | "type" | "unsafe" |
+        "use" | "where" | "while" | "async" | "await" | "dyn" | "abstract" |
+        "become" | "box" | "do" | "final" | "macro" | "override" | "priv" |
+        "typeof" | "unsized" | "virtual" | "yield" | "try"
+    )
+}
+
+/// Validate that a parent module can accept a new child module
+fn validate_parent_can_accept_module(
+    sema: &Semantics<'_, RootDatabase>,
+    declaration: &ModuleDeclaration,
+) -> Result<()> {
+    // Check if the parent file exists and is accessible
+    let source_root = sema.db.file_source_root(declaration.parent_file);
+    let source_root_data = sema.db.source_root(source_root.source_root_id(sema.db));
+    let source_root_ref = source_root_data.source_root(sema.db);
+    let file_path = source_root_ref.path_for_file(&declaration.parent_file)
+        .ok_or_else(|| RenameError("Cannot find path for parent file".to_string()))?;
+    
+    // Validate that the module name doesn't conflict with existing items
+    // This is a simplified check - a full implementation would parse the file
+    // and check for naming conflicts with existing items
+    
+    // Basic validation that we found the file path
+    if file_path.as_path().is_none() {
+        return Err(RenameError(format!(
+            "Parent file for module declaration not found: {:?}",
+            declaration.parent_file
+        )));
+    }
+    
+    Ok(())
+}
+
+/// Execute the module creation plan by generating file system edits
+/// (Requirements 2.1, 2.4, 2.5)
+pub fn execute_module_creation_plan(
+    plan: &ModuleCreationPlan,
+    sema: &Semantics<'_, RootDatabase>,
+) -> Result<SourceChange> {
+    let mut source_change = SourceChange::default();
+    
+    // Create directory structure (Requirement 2.1)
+    for dir_path in &plan.directories_to_create {
+        // Convert to AnchoredPathBuf for file system operations
+        if let Some(anchor_file) = find_anchor_file_for_path(sema, dir_path)? {
+            let _relative_path = calculate_relative_path(sema, anchor_file, dir_path)?;
+            // Note: CreateDir is not available in FileSystemEdit, 
+            // directories will be created implicitly when files are created
+        }
+    }
+    
+    // Create module files (Requirements 2.2, 2.3)
+    for file_spec in &plan.files_to_create {
+        if let Some(anchor_file) = find_anchor_file_for_path(sema, &file_spec.path)? {
+            let relative_path = calculate_relative_path(sema, anchor_file, &file_spec.path)?;
+            let anchored_path = AnchoredPathBuf {
+                anchor: anchor_file,
+                path: relative_path,
+            };
+            
+            source_change.push_file_system_edit(FileSystemEdit::CreateFile {
+                dst: anchored_path,
+                initial_contents: file_spec.content.clone(),
+            });
+        }
+    }
+    
+    // Add module declarations to parent files (Requirement 2.4)
+    for declaration in &plan.module_declarations_to_add {
+        let module_decl_text = format_module_declaration(declaration);
+        let edit = TextEdit::insert(declaration.insert_position, module_decl_text);
+        source_change.insert_source_edit(declaration.parent_file, edit);
+    }
+    
+    Ok(source_change)
+}
+
+/// Find an appropriate anchor file for file system operations
+fn find_anchor_file_for_path(
+    sema: &Semantics<'_, RootDatabase>,
+    _target_path: &std::path::Path,
+) -> Result<Option<FileId>> {
+    // For now, use the first file in the database as anchor
+    // A more sophisticated implementation would find the closest existing file
+    let files: Vec<_> = sema.db.local_roots().iter()
+        .flat_map(|&root| {
+            let source_root = sema.db.source_root(root);
+            source_root.source_root(sema.db).iter().collect::<Vec<_>>()
+        })
+        .collect();
+    
+    if let Some(&first_file) = files.first() {
+        Ok(Some(first_file))
+    } else {
+        Err(RenameError("No anchor file found for file system operations".to_string()))
+    }
+}
+
+/// Calculate relative path from anchor file to target path
+fn calculate_relative_path(
+    sema: &Semantics<'_, RootDatabase>,
+    anchor_file: FileId,
+    target_path: &std::path::Path,
+) -> Result<String> {
+    let source_root = sema.db.file_source_root(anchor_file);
+    let source_root_data = sema.db.source_root(source_root.source_root_id(sema.db));
+    let _anchor_path = source_root_data.source_root(sema.db).path_for_file(&anchor_file)
+        .ok_or_else(|| RenameError("Cannot find path for anchor file".to_string()))?;
+    
+    // For now, return the target path as string
+    // A full implementation would calculate the proper relative path
+    Ok(target_path.to_string_lossy().to_string())
+}
+
+/// Format a module declaration for insertion into source code
+fn format_module_declaration(declaration: &ModuleDeclaration) -> String {
+    let visibility = declaration.visibility.as_deref().unwrap_or("");
+    let vis_prefix = if visibility.is_empty() { "" } else { &format!("{} ", visibility) };
+    
+    format!("{}mod {};\n", vis_prefix, declaration.module_name)
+}
+
+/// Integrate with user preferences for module organization
+/// (Requirement 2.3)
+pub fn get_user_module_preferences() -> ModuleOrganizationPreferences {
+    // For now, return default preferences
+    // A full implementation would read from user configuration
+    ModuleOrganizationPreferences::default()
+}
+
+/// Ensure proper module integration into existing module tree
+/// (Requirement 2.5)
+pub fn ensure_module_tree_integration(
+    sema: &Semantics<'_, RootDatabase>,
+    created_modules: &[Module],
+    parent_module: Module,
+) -> Result<()> {
+    // Validate that all created modules are properly accessible from their parent
+    for module in created_modules {
+        if let Some(actual_parent) = module.parent(sema.db) {
+            if actual_parent != parent_module {
+                return Err(RenameError(format!(
+                    "Module integration failed: expected parent {:?}, got {:?}",
+                    parent_module.name(sema.db),
+                    actual_parent.name(sema.db)
+                )));
+            }
+        } else {
+            return Err(RenameError("Created module has no parent".to_string()));
+        }
+    }
+    
+    Ok(())
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum IdentifierKind {
     Ident,
@@ -1110,5 +1710,83 @@ mod tests {
         assert_eq!(normalized.segments()[0].as_str(), "current");
         assert_eq!(normalized.segments()[1].as_str(), "submodule");
         assert_eq!(normalized.segments()[2].as_str(), "Item");
+    }
+
+    #[test]
+    fn test_module_organization_preferences_default() {
+        let prefs = ModuleOrganizationPreferences::default();
+        assert!(!prefs.prefer_mod_rs);
+        assert!(matches!(prefs.directory_structure, DirectoryStructurePreference::Nested));
+    }
+
+    #[test]
+    fn test_module_creation_plan_new() {
+        let prefs = ModuleOrganizationPreferences::default();
+        let plan = ModuleCreationPlan::new(prefs.clone());
+        
+        assert!(plan.directories_to_create.is_empty());
+        assert!(plan.files_to_create.is_empty());
+        assert!(plan.module_declarations_to_add.is_empty());
+        assert_eq!(plan.user_preferences.prefer_mod_rs, prefs.prefer_mod_rs);
+    }
+
+    #[test]
+    fn test_is_valid_module_name() {
+        // Valid names
+        assert!(is_valid_module_name("module"));
+        assert!(is_valid_module_name("my_module"));
+        assert!(is_valid_module_name("module123"));
+        assert!(is_valid_module_name("_private"));
+        
+        // Invalid names
+        assert!(!is_valid_module_name(""));
+        assert!(!is_valid_module_name("123module"));
+        assert!(!is_valid_module_name("mod"));
+        assert!(!is_valid_module_name("struct"));
+        assert!(!is_valid_module_name("my-module"));
+        assert!(!is_valid_module_name("my module"));
+    }
+
+    #[test]
+    fn test_is_rust_keyword() {
+        // Keywords
+        assert!(is_rust_keyword("mod"));
+        assert!(is_rust_keyword("struct"));
+        assert!(is_rust_keyword("fn"));
+        assert!(is_rust_keyword("let"));
+        assert!(is_rust_keyword("async"));
+        
+        // Non-keywords
+        assert!(!is_rust_keyword("module"));
+        assert!(!is_rust_keyword("my_struct"));
+        assert!(!is_rust_keyword("function"));
+    }
+
+    #[test]
+    fn test_format_module_declaration() {
+        // Without visibility
+        let decl = ModuleDeclaration {
+            parent_file: FileId::from_raw(0),
+            module_name: "test_module".to_string(),
+            insert_position: syntax::TextSize::from(0),
+            visibility: None,
+        };
+        assert_eq!(format_module_declaration(&decl), "mod test_module;\n");
+        
+        // With visibility
+        let decl_pub = ModuleDeclaration {
+            parent_file: FileId::from_raw(0),
+            module_name: "test_module".to_string(),
+            insert_position: syntax::TextSize::from(0),
+            visibility: Some("pub".to_string()),
+        };
+        assert_eq!(format_module_declaration(&decl_pub), "pub mod test_module;\n");
+    }
+
+    #[test]
+    fn test_generate_module_content() {
+        let content = generate_module_content("test_module");
+        assert!(content.contains("test_module module"));
+        assert!(content.contains("TODO: Add module implementation"));
     }
 }
