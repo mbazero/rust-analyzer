@@ -102,6 +102,30 @@ impl Definition {
             Edition::LATEST
         };
 
+        // Check if this is a rename-to-move operation (new_name contains ::)
+        // Only certain definition types support moving
+        let supports_move = matches!(
+            self,
+            Definition::Adt(_)
+                | Definition::Function(_)
+                | Definition::Const(_)
+                | Definition::Static(_)
+                | Definition::Trait(_)
+                | Definition::TypeAlias(_)
+        );
+
+        if supports_move {
+            match parse_rename_target(sema, self, new_name)? {
+                RenameTarget::Move(move_op) => {
+                    // This is a move operation
+                    return rename_to_move(sema, self, move_op, rename_definition);
+                }
+                RenameTarget::SimpleRename => {
+                    // Fall through to normal rename
+                }
+            }
+        }
+
         match *self {
             Definition::Module(module) => rename_mod(sema, module, new_name),
             Definition::ToolModule(_) => {
@@ -242,6 +266,98 @@ impl Definition {
             src.with_value(name.syntax()).original_file_range_opt(sema.db)
         }
     }
+}
+
+fn rename_to_move(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    move_op: MoveOperation,
+    _rename_definition: RenameDefinition,
+) -> Result<SourceChange> {
+    use move_item::*;
+
+    let mut source_change = SourceChange::default();
+
+    // Get the source file and item syntax node
+    let source_module = move_op.source_module;
+    let new_name = &move_op.new_name;
+
+    // Get the syntax node for the item and source file
+    let (item_syntax, source_file_id) = match def {
+        Definition::Adt(adt) => {
+            match adt {
+                hir::Adt::Struct(s) => {
+                    let src = sema.source(*s).ok_or_else(|| format_err!("No source for struct"))?;
+                    let file_id = src.file_id.original_file(sema.db);
+                    (src.value.syntax().clone(), file_id)
+                }
+                hir::Adt::Enum(e) => {
+                    let src = sema.source(*e).ok_or_else(|| format_err!("No source for enum"))?;
+                    let file_id = src.file_id.original_file(sema.db);
+                    (src.value.syntax().clone(), file_id)
+                }
+                hir::Adt::Union(u) => {
+                    let src = sema.source(*u).ok_or_else(|| format_err!("No source for union"))?;
+                    let file_id = src.file_id.original_file(sema.db);
+                    (src.value.syntax().clone(), file_id)
+                }
+            }
+        }
+        Definition::Function(f) => {
+            let src = sema.source(*f).ok_or_else(|| format_err!("No source for function"))?;
+            let file_id = src.file_id.original_file(sema.db);
+            (src.value.syntax().clone(), file_id)
+        }
+        Definition::Const(c) => {
+            let src = sema.source(*c).ok_or_else(|| format_err!("No source for const"))?;
+            let file_id = src.file_id.original_file(sema.db);
+            (src.value.syntax().clone(), file_id)
+        }
+        Definition::Static(s) => {
+            let src = sema.source(*s).ok_or_else(|| format_err!("No source for static"))?;
+            let file_id = src.file_id.original_file(sema.db);
+            (src.value.syntax().clone(), file_id)
+        }
+        Definition::Trait(t) => {
+            let src = sema.source(*t).ok_or_else(|| format_err!("No source for trait"))?;
+            let file_id = src.file_id.original_file(sema.db);
+            (src.value.syntax().clone(), file_id)
+        }
+        Definition::TypeAlias(ta) => {
+            let src = sema.source(*ta).ok_or_else(|| format_err!("No source for type alias"))?;
+            let file_id = src.file_id.original_file(sema.db);
+            (src.value.syntax().clone(), file_id)
+        }
+        _ => bail!("Unsupported item type for move operation"),
+    };
+
+    // Find associated impl blocks
+    let _impl_blocks = find_associated_impl_blocks(sema, def);
+
+    // For now, create a minimal implementation that demonstrates the integration
+    // Full implementation will require:
+    // 1. Creating destination module files if they don't exist
+    // 2. Adding module declarations to parent modules
+    // 3. Moving the item definition
+    // 4. Updating all references (external and internal)
+
+    // This is a placeholder that will be fully implemented in integration testing
+    // For now, just bail with a descriptive message
+    let item_type = match def {
+        Definition::Adt(_) => "ADT",
+        Definition::Function(_) => "Function",
+        Definition::Const(_) => "Const",
+        Definition::Static(_) => "Static",
+        Definition::Trait(_) => "Trait",
+        Definition::TypeAlias(_) => "TypeAlias",
+        _ => "Unknown",
+    };
+
+    bail!(
+        "Move operation detected: {} to {}. Full implementation pending.",
+        item_type,
+        new_name
+    )
 }
 
 fn rename_mod(

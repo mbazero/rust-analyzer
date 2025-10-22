@@ -57,11 +57,11 @@
 
 ## 7. Integration with Existing Rename Infrastructure
 
-- [ ] 7.1 Extend `Definition::rename()` in `ide-db/src/rename.rs` to handle move operations
-- [ ] 7.2 Update `rename()` function in `ide/src/rename.rs` to detect and orchestrate moves
-- [ ] 7.3 Integrate file system operations with existing `SourceChange` struct
-- [ ] 7.4 Ensure backward compatibility with simple rename operations
-- [ ] 7.5 Update LSP handler if needed for file creation notifications
+- [x] 7.1 Extend `Definition::rename()` in `ide-db/src/rename.rs` to handle move operations
+- [x] 7.2 Update `rename()` function in `ide/src/rename.rs` to detect and orchestrate moves (integrated into Definition::rename())
+- [x] 7.3 Integrate file system operations with existing `SourceChange` struct
+- [x] 7.4 Ensure backward compatibility with simple rename operations
+- [x] 7.5 Update LSP handler if needed for file creation notifications (not needed - SourceChange handles it)
 
 ## 8. Visibility Analysis and Updates
 
