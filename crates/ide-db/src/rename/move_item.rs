@@ -4,10 +4,10 @@
 //! rename target is a fully-qualified path (e.g., `crate::other::module::NewName`).
 
 use hir::{Module, Semantics, ModPath, PathKind};
-use syntax::{AstNode, ast};
+use syntax::{AstNode, ast::{self, HasName}};
 use base_db::AnchoredPathBuf;
 
-use crate::{RootDatabase, defs::Definition, source_change::FileSystemEdit};
+use crate::{RootDatabase, defs::Definition, source_change::FileSystemEdit, text_edit::TextEdit};
 
 use super::{IdentifierKind, RenameError, Result, bail, format_err};
 
@@ -378,6 +378,101 @@ pub fn create_module_tree(
     Ok(edits)
 }
 
+/// Insert a module declaration in the parent module file.
+/// Returns a TextEdit to add `pub mod module_name;` in the appropriate location.
+pub fn insert_module_declaration(
+    sema: &Semantics<'_, RootDatabase>,
+    parent_module: &Module,
+    module_name: &str,
+) -> Result<Option<(span::FileId, TextEdit)>> {
+    // Get the parent module's source file
+    let parent_file_id = parent_module
+        .as_source_file_id(sema.db)
+        .ok_or_else(|| format_err!("Parent module has no associated file"))?;
+
+    // Parse the parent file
+    let parent_source = sema.parse(parent_file_id);
+    let parent_syntax = parent_source.syntax();
+
+    // Check if the module declaration already exists
+    if module_declaration_exists(parent_syntax, module_name) {
+        // Module already declared, no edit needed
+        return Ok(None);
+    }
+
+    // Create the module declaration
+    let module_decl = create_module_declaration(module_name);
+
+    // Find the best position to insert the declaration
+    let insert_position = find_module_insert_position(parent_syntax);
+
+    // Create the text edit
+    let text_edit = match insert_position {
+        Some(position) => {
+            // Insert after the found position with proper spacing
+            let insert_offset = position.text_range().end();
+            let insert_text = format!("\n{}", module_decl);
+            TextEdit::insert(insert_offset, insert_text)
+        }
+        None => {
+            // No existing modules, insert at the beginning after any attributes/comments
+            let insert_offset = find_first_item_position(parent_syntax);
+            let insert_text = format!("{}\n\n", module_decl);
+            TextEdit::insert(insert_offset, insert_text)
+        }
+    };
+
+    Ok(Some((parent_file_id.file_id(sema.db), text_edit)))
+}
+
+/// Check if a module declaration already exists in the file.
+fn module_declaration_exists(syntax: &syntax::SyntaxNode, module_name: &str) -> bool {
+    syntax
+        .descendants()
+        .filter_map(ast::Module::cast)
+        .any(|module| {
+            module.name().map(|name| name.text() == module_name).unwrap_or(false)
+                && module.semicolon_token().is_some() // Only match declarations, not inline modules
+        })
+}
+
+/// Create a `pub mod module_name;` declaration.
+fn create_module_declaration(module_name: &str) -> String {
+    format!("pub mod {};", module_name)
+}
+
+/// Find the best position to insert a new module declaration.
+/// Returns the syntax node after which to insert (typically the last existing module declaration).
+fn find_module_insert_position(syntax: &syntax::SyntaxNode) -> Option<syntax::SyntaxNode> {
+    // Find all module declarations (mod foo;) at the top level
+    let mut last_module_decl = None;
+
+    for item in syntax.descendants().filter_map(ast::Item::cast) {
+        if let ast::Item::Module(module) = item {
+            // Only consider module declarations (with semicolon), not inline modules (with body)
+            if module.semicolon_token().is_some() {
+                last_module_decl = Some(module.syntax().clone());
+            }
+        }
+    }
+
+    last_module_decl
+}
+
+/// Find the position to insert the first module declaration.
+/// This should be after file-level attributes and use statements, but before other items.
+fn find_first_item_position(syntax: &syntax::SyntaxNode) -> syntax::TextSize {
+    // Look for the first non-use item
+    for item in syntax.descendants().filter_map(ast::Item::cast) {
+        if !matches!(item, ast::Item::Use(_)) {
+            return item.syntax().text_range().start();
+        }
+    }
+
+    // If no items found, insert at the start
+    syntax::TextSize::from(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +729,95 @@ mod tests {
             let module_path = extract_module_path(&path).unwrap();
             assert_eq!(module_path.kind, kind);
         }
+    }
+
+    // Tests for module declaration insertion
+
+    #[test]
+    fn test_module_declaration_exists_simple() {
+        let source = "pub mod foo;\npub mod bar;\n";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let syntax = parsed.syntax_node();
+
+        assert!(module_declaration_exists(&syntax, "foo"));
+        assert!(module_declaration_exists(&syntax, "bar"));
+        assert!(!module_declaration_exists(&syntax, "baz"));
+    }
+
+    #[test]
+    fn test_module_declaration_exists_inline_vs_file() {
+        // Inline modules (with {}) should not be detected as existing declarations
+        let source = "mod inline { fn foo() {} }\npub mod file_mod;\n";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let syntax = parsed.syntax_node();
+
+        assert!(!module_declaration_exists(&syntax, "inline")); // Inline module
+        assert!(module_declaration_exists(&syntax, "file_mod")); // File module
+    }
+
+    #[test]
+    fn test_create_module_declaration() {
+        let decl = create_module_declaration("new_module");
+        assert_eq!(decl, "pub mod new_module;");
+    }
+
+    #[test]
+    fn test_find_module_insert_position_with_existing() {
+        let source = "pub mod first;\npub mod second;\n\nfn main() {}";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let syntax = parsed.syntax_node();
+
+        let position = find_module_insert_position(&syntax);
+        assert!(position.is_some());
+
+        // The position should be after "pub mod second;"
+        let pos_text = position.unwrap().to_string();
+        assert!(pos_text.contains("second"));
+    }
+
+    #[test]
+    fn test_find_module_insert_position_no_existing() {
+        let source = "fn main() {}\nstruct Foo;";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let syntax = parsed.syntax_node();
+
+        let position = find_module_insert_position(&syntax);
+        assert!(position.is_none());
+    }
+
+    #[test]
+    fn test_find_first_item_position_with_uses() {
+        let source = "use std::collections::HashMap;\nuse std::vec::Vec;\n\nfn main() {}";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let syntax = parsed.syntax_node();
+
+        let position = find_first_item_position(&syntax);
+
+        // Should point to the first non-use item (fn main)
+        let text_at_position = &source[position.into()..];
+        assert!(text_at_position.starts_with("fn main"));
+    }
+
+    #[test]
+    fn test_find_first_item_position_no_uses() {
+        let source = "fn main() {}";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let syntax = parsed.syntax_node();
+
+        let position = find_first_item_position(&syntax);
+
+        // Should point to the first item
+        let text_at_position = &source[position.into()..];
+        assert!(text_at_position.starts_with("fn main"));
+    }
+
+    #[test]
+    fn test_find_first_item_position_empty() {
+        let source = "";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let syntax = parsed.syntax_node();
+
+        let position = find_first_item_position(&syntax);
+        assert_eq!(position, syntax::TextSize::from(0));
     }
 }
