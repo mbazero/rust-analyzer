@@ -14,7 +14,7 @@ use ide_db::{
     source_change::{FileSystemEdit, SourceChangeBuilder},
 };
 use itertools::Itertools;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use stdx::{always, format_to, never};
 use syntax::{
@@ -76,6 +76,7 @@ struct PlannedItem {
     editioned_file_id: ide_db::EditionedFileId,
     range: TextRange,
     text: String,
+    syntax: SyntaxNode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +95,24 @@ struct ExternalReferenceUpdatePlan {
 struct ExternalReferenceEditPlan {
     file_id: FileId,
     edit: TextEdit,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InternalReferenceUpdatePlan {
+    required_imports: Vec<RequiredImportPlan>,
+    path_rewrites: Vec<InternalPathRewrite>,
+}
+
+#[derive(Clone, Debug)]
+struct RequiredImportPlan {
+    path: String,
+}
+
+#[derive(Clone, Debug)]
+struct InternalPathRewrite {
+    file_id: ide_db::EditionedFileId,
+    range: TextRange,
+    replacement: String,
 }
 
 impl ExternalReferenceUpdatePlan {
@@ -122,6 +141,57 @@ impl ExternalReferenceEditPlan {
     #[allow(dead_code)]
     fn text_edit(&self) -> &TextEdit {
         &self.edit
+    }
+}
+
+impl InternalReferenceUpdatePlan {
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.required_imports.is_empty() && self.path_rewrites.is_empty()
+    }
+
+    #[allow(dead_code)]
+    fn required_imports(&self) -> &[RequiredImportPlan] {
+        &self.required_imports
+    }
+
+    #[allow(dead_code)]
+    fn path_rewrites(&self) -> &[InternalPathRewrite] {
+        &self.path_rewrites
+    }
+
+    #[cfg(test)]
+    fn import_paths(&self) -> Vec<&str> {
+        self.required_imports.iter().map(|import| import.path.as_str()).collect()
+    }
+
+    #[cfg(test)]
+    fn rewrites(&self) -> &[InternalPathRewrite] {
+        &self.path_rewrites
+    }
+}
+
+impl RequiredImportPlan {
+    #[allow(dead_code)]
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl InternalPathRewrite {
+    #[allow(dead_code)]
+    fn file_id(&self) -> ide_db::EditionedFileId {
+        self.file_id
+    }
+
+    #[allow(dead_code)]
+    fn range(&self) -> TextRange {
+        self.range
+    }
+
+    #[allow(dead_code)]
+    fn replacement(&self) -> &str {
+        &self.replacement
     }
 }
 
@@ -593,7 +663,7 @@ fn extract_definition_item(
     let end: usize = range.end().into();
     let text = text_slice[start..end].to_string();
 
-    Ok(PlannedItem { file_id: vfs_file_id, editioned_file_id, range, text })
+    Ok(PlannedItem { file_id: vfs_file_id, editioned_file_id, range, text, syntax })
 }
 
 fn collect_associated_impls(
@@ -624,7 +694,13 @@ fn collect_associated_impls(
             let start: usize = range.start().into();
             let end: usize = range.end().into();
             let text = text_slice[start..end].to_string();
-            PlannedItem { file_id: primary.file_id, editioned_file_id, range, text }
+            PlannedItem {
+                file_id: primary.file_id,
+                editioned_file_id,
+                range,
+                text,
+                syntax: impl_block.syntax().clone(),
+            }
         })
         .collect()
 }
@@ -744,6 +820,141 @@ fn plan_external_reference_updates(
     }
 
     Ok(ExternalReferenceUpdatePlan { edits })
+}
+
+#[allow(dead_code)]
+fn plan_internal_reference_updates(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    relocation_plan: &ItemRelocationPlan,
+) -> RenameResult<InternalReferenceUpdatePlan> {
+    let Some(source_module) = def.module(sema.db) else {
+        return Ok(InternalReferenceUpdatePlan::default());
+    };
+    let edition = def
+        .krate(sema.db)
+        .map(|krate| krate.edition(sema.db))
+        .unwrap_or(Edition::LATEST);
+
+    let moved_ranges: Vec<_> = relocation_plan
+        .moved_items
+        .iter()
+        .map(|item| (item.editioned_file_id, item.range))
+        .collect();
+
+    let mut import_paths = BTreeSet::new();
+    let mut plan = InternalReferenceUpdatePlan::default();
+
+    for moved_item in &relocation_plan.moved_items {
+        for path in moved_item.syntax.descendants().filter_map(ast::Path::cast) {
+            if path.syntax().parent().and_then(ast::Path::cast).is_some() {
+                continue;
+            }
+            let path_text = path.syntax().text();
+            if path_text.is_empty() {
+                continue;
+            }
+
+            let Some(resolution) = sema.resolve_path(&path) else { continue; };
+            let definition = Definition::from(resolution);
+            if definition == *def {
+                continue;
+            }
+            if definition_is_within_moved_items(&definition, &moved_ranges, sema) {
+                continue;
+            }
+
+            let Some(def_module) = definition.module(sema.db) else { continue; };
+            if !module_within_source_tree(def_module, source_module, sema.db) {
+                continue;
+            }
+
+            if path_text.to_string().starts_with("crate::") {
+                continue;
+            }
+
+            let in_use_tree = path_in_use_tree(&path);
+            let qualifier = path.qualifier();
+            if qualifier.is_none() && !in_use_tree {
+                let Some(def_name) = definition.name(sema.db) else { continue; };
+                let module_path = module_path_from_root(def_module, sema.db);
+                let import_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
+                if import_paths.insert(import_path.clone()) {
+                    plan.required_imports.push(RequiredImportPlan { path: import_path });
+                }
+                continue;
+            }
+
+            let Some(def_name) = definition.name(sema.db) else { continue; };
+            let module_path = module_path_from_root(def_module, sema.db);
+            let absolute_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
+            if let Some((range, replacement)) = compute_path_replacement(&path, &absolute_path) {
+                if !plan.path_rewrites.iter().any(|rewrite| {
+                    rewrite.file_id == moved_item.editioned_file_id && rewrite.range == range
+                }) {
+                    plan.path_rewrites.push(InternalPathRewrite {
+                        file_id: moved_item.editioned_file_id,
+                        range,
+                        replacement,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
+fn definition_is_within_moved_items(
+    definition: &Definition,
+    moved_ranges: &[(ide_db::EditionedFileId, TextRange)],
+    sema: &Semantics<'_, RootDatabase>,
+) -> bool {
+    definition
+        .range_for_rename(sema)
+        .map(|file_range| {
+            moved_ranges.iter().any(|(file_id, range)| {
+                file_range.file_id == *file_id && range.contains_range(file_range.range)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn module_within_source_tree(
+    mut module: Module,
+    source: Module,
+    db: &RootDatabase,
+) -> bool {
+    loop {
+        if module == source {
+            return true;
+        }
+        match module.parent(db) {
+            Some(parent) => module = parent,
+            None => return false,
+        }
+    }
+}
+
+fn path_in_use_tree(path: &ast::Path) -> bool {
+    path.syntax().ancestors().any(|node| ast::UseTree::cast(node).is_some())
+}
+
+fn compute_path_replacement(path: &ast::Path, new_path: &str) -> Option<(TextRange, String)> {
+    let name_ref = path.segment()?.name_ref()?;
+    let path_range = path.syntax().text_range();
+    let path_text = path.syntax().text();
+
+    let offset_start = path_range.start();
+    let name_range = name_ref.syntax().text_range();
+    let suffix_start = name_range.end() - offset_start;
+    let suffix_end = path_range.end() - offset_start;
+    let suffix = path_text.slice(TextRange::new(suffix_start, suffix_end)).to_string();
+
+    let mut replacement = String::from(new_path);
+    replacement.push_str(&suffix);
+
+    Some((path_range, replacement))
 }
 
 fn resolve_existing_destination_module(
@@ -1581,9 +1792,10 @@ mod tests {
     use span::Edition;
 
     use super::{
-        detect_move_operation, find_definitions, plan_external_reference_updates, plan_item_relocation,
-        plan_module_file_system_ops, ExternalReferenceUpdatePlan, IdentifierKind, ItemRelocationPlan,
-        ModuleFileSystemPlan, ParsedRenameTarget, RangeInfo, RelocationDestination, RenameDefinition, RenameError,
+        detect_move_operation, find_definitions, plan_external_reference_updates, plan_internal_reference_updates,
+        plan_item_relocation, plan_module_file_system_ops, ExternalReferenceUpdatePlan, IdentifierKind,
+        InternalPathRewrite, InternalReferenceUpdatePlan, ItemRelocationPlan, ModuleFileSystemPlan, ParsedRenameTarget,
+        RangeInfo, RelocationDestination, RenameDefinition, RenameError,
     };
 
     #[track_caller]
@@ -1842,6 +2054,59 @@ mod tests {
                 )
                 .expect("external reference planning failed");
                 return (analysis, external_plan);
+            }
+        }
+        panic!("No move operation was detected for the provided fixture");
+    }
+
+    fn compute_internal_reference_plan(
+        new_name: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+    ) -> (crate::Analysis, ItemRelocationPlan, InternalReferenceUpdatePlan) {
+        let (analysis, position) = fixture::position(ra_fixture_before);
+        let db = &analysis.db;
+        let sema = Semantics::new(db);
+
+        let file_id = sema
+            .attach_first_edition(position.file_id)
+            .expect("failed to attach file edition for internal reference plan");
+        let source_file = sema.parse(file_id);
+        let syntax = source_file.syntax();
+
+        let edition = file_id.edition(db);
+        let parsed_target = ParsedRenameTarget::parse(edition, new_name)
+            .expect("expected move target parsing to succeed");
+        let move_target = parsed_target
+            .move_target()
+            .expect("internal reference plan requires a move target");
+        let (final_name, _) =
+            IdentifierKind::classify(edition, parsed_target.final_name_text()).unwrap();
+
+        let definitions = find_definitions(&sema, syntax, position, &final_name)
+            .expect("failed to find definitions")
+            .collect::<Vec<_>>();
+        assert!(
+            !definitions.is_empty(),
+            "expected at least one definition when computing internal reference plan"
+        );
+
+        for (_, _, def, resolved_name, rename_def) in definitions {
+            if rename_def != RenameDefinition::Yes {
+                continue;
+            }
+            if let Some(move_operation) =
+                detect_move_operation(&sema, &def, &resolved_name, move_target)
+                    .expect("move detection failed")
+            {
+                let module_plan =
+                    plan_module_file_system_ops(&sema, &def, &move_operation)
+                        .expect("module filesystem planning failed");
+                let relocation_plan = plan_item_relocation(&sema, &def, &move_operation, &module_plan)
+                    .expect("item relocation planning failed");
+                let internal_plan =
+                    plan_internal_reference_updates(&sema, &def, &relocation_plan)
+                        .expect("internal reference planning failed");
+                return (analysis, relocation_plan, internal_plan);
             }
         }
         panic!("No move operation was detected for the provided fixture");
@@ -2117,6 +2382,126 @@ pub fn make() -> OldAlias {
             ),
             &text
         );
+    }
+
+    #[test]
+    fn internal_reference_plan_adds_imports_for_unqualified_references() {
+        let (analysis, relocation, plan) = compute_internal_reference_plan(
+            "crate::beta::Foo",
+            r#"
+//- /lib.rs
+mod alpha;
+mod beta;
+
+//- /alpha.rs
+pub struct Helper;
+pub fn helper_fn() {}
+
+pub struct Foo$0 {
+    helper: Helper,
+}
+
+impl Foo {
+    fn call() {
+        helper_fn();
+    }
+}
+"#,
+        );
+
+        let mut paths = plan.import_paths();
+        paths.sort();
+        assert_eq!(paths, ["crate::alpha::Helper", "crate::alpha::helper_fn"]);
+        assert!(plan.rewrites().is_empty());
+
+        // Ensure relocated text remains unchanged before rewrite stage.
+        let moved_file = relocation.moved_items[0].file_id;
+        let original = analysis.file_text(moved_file).unwrap();
+        let updated = apply_rewrites(
+            original.to_string(),
+            plan.rewrites()
+                .iter()
+                .filter(|rewrite| rewrite.file_id().file_id(&analysis.db) == moved_file)
+                .cloned()
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        assert_eq_text!(original, &updated);
+    }
+
+    #[test]
+    fn internal_reference_plan_rewrites_relative_paths() {
+        let (analysis, relocation, plan) = compute_internal_reference_plan(
+            "crate::beta::Foo",
+            r#"
+//- /lib.rs
+mod alpha;
+mod beta;
+
+//- /alpha.rs
+pub mod utils {
+    pub fn helper() {}
+}
+
+pub struct Foo$0;
+
+impl Foo {
+    fn call() {
+        self::utils::helper();
+    }
+}
+"#,
+        );
+
+        assert!(plan.import_paths().is_empty());
+        let source_file = relocation.moved_items[0].editioned_file_id.file_id(&analysis.db);
+        let mut rewrites = plan
+            .rewrites()
+            .iter()
+            .filter(|rewrite| rewrite.file_id().file_id(&analysis.db) == source_file)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(rewrites.len(), 1);
+        rewrites.sort_by_key(|rewrite| rewrite.range().start());
+
+        let original = analysis.file_text(source_file).unwrap().to_string();
+        let updated = apply_rewrites(original, &rewrites);
+        assert!(updated.contains("crate::alpha::utils::helper();"));
+    }
+
+    #[test]
+    fn internal_reference_plan_skips_moved_definitions() {
+        let (_, _, plan) = compute_internal_reference_plan(
+            "crate::beta::Foo",
+            r#"
+//- /lib.rs
+mod alpha;
+mod beta;
+
+//- /alpha.rs
+pub struct Foo$0;
+
+impl Foo {
+    fn new() -> Foo {
+        Foo {}
+    }
+}
+"#,
+        );
+
+        assert!(plan.import_paths().is_empty());
+        assert!(plan.rewrites().is_empty());
+    }
+
+    fn apply_rewrites(mut text: String, rewrites: &[InternalPathRewrite]) -> String {
+        let mut sorted = rewrites.to_vec();
+        sorted.sort_by_key(|rewrite| rewrite.range().start());
+        for rewrite in sorted.into_iter().rev() {
+            let start: usize = rewrite.range().start().into();
+            let end: usize = rewrite.range().end().into();
+            text.replace_range(start..end, rewrite.replacement());
+        }
+        text
     }
 
     #[test]
