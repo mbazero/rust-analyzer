@@ -10,9 +10,11 @@ use ide_db::{
     base_db::{AnchoredPathBuf, RootQueryDb, SourceDatabase, VfsPath},
     defs::{Definition, NameClass, NameRefClass},
     rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
+    search::{FileReference, ReferenceCategory},
     source_change::{FileSystemEdit, SourceChangeBuilder},
 };
 use itertools::Itertools;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use stdx::{always, format_to, never};
 use syntax::{
@@ -81,6 +83,46 @@ enum RelocationDestination {
     ExistingFile { file_id: FileId, insert_offset: TextSize },
     InlineModule { file_id: FileId, insert_offset: TextSize, indent: IndentLevel },
     NewFile { relative_path: String },
+}
+
+#[derive(Clone, Debug)]
+struct ExternalReferenceUpdatePlan {
+    edits: Vec<ExternalReferenceEditPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalReferenceEditPlan {
+    file_id: FileId,
+    edit: TextEdit,
+}
+
+impl ExternalReferenceUpdatePlan {
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.edits.is_empty()
+    }
+
+    #[allow(dead_code)]
+    fn iter(&self) -> impl Iterator<Item = &ExternalReferenceEditPlan> {
+        self.edits.iter()
+    }
+
+    #[cfg(test)]
+    fn edits(&self) -> &[ExternalReferenceEditPlan] {
+        &self.edits
+    }
+}
+
+impl ExternalReferenceEditPlan {
+    #[allow(dead_code)]
+    fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    #[allow(dead_code)]
+    fn text_edit(&self) -> &TextEdit {
+        &self.edit
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -634,6 +676,76 @@ fn plan_item_relocation(
     Ok(ItemRelocationPlan { moved_items, destination })
 }
 
+#[allow(dead_code)]
+fn plan_external_reference_updates(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    move_op: &MoveOperation,
+    relocation_plan: &ItemRelocationPlan,
+) -> RenameResult<ExternalReferenceUpdatePlan> {
+    let usages = def.usages(sema).all();
+    if usages.is_empty() {
+        return Ok(ExternalReferenceUpdatePlan { edits: Vec::new() });
+    }
+
+    let edition = def
+        .krate(sema.db)
+        .map(|krate| krate.edition(sema.db))
+        .unwrap_or(Edition::LATEST);
+    let new_path = format_crate_item_path(
+        sema.db,
+        edition,
+        &move_op.dest_module_path,
+        &move_op.dest_item_name,
+    );
+
+    let mut per_file_replacements: BTreeMap<FileId, Vec<(TextRange, String)>> = BTreeMap::new();
+
+    for (file_id, references) in usages.iter() {
+        for reference in references {
+            if relocation_plan
+                .moved_items
+                .iter()
+                .any(|item| item.editioned_file_id == file_id && item.range.contains_range(reference.range))
+            {
+                continue;
+            }
+
+            let replacement = if reference.category.contains(ReferenceCategory::IMPORT) {
+                plan_import_reference(reference, &new_path)
+            } else {
+                plan_non_import_reference(reference, &new_path)
+            };
+            let Some((range, text)) = replacement else { continue };
+
+            let actual_file_id = file_id.file_id(sema.db);
+            let entry = per_file_replacements.entry(actual_file_id).or_default();
+            if entry.iter().any(|(existing, _)| *existing == range) {
+                continue;
+            }
+            entry.push((range, text));
+        }
+    }
+
+    let mut edits = Vec::new();
+    for (file_id, replacements) in per_file_replacements {
+        if replacements.is_empty() {
+            continue;
+        }
+        let mut builder = TextEdit::builder();
+        for (range, text) in replacements {
+            builder.replace(range, text);
+        }
+        let edit = builder.finish();
+        if edit.is_empty() {
+            continue;
+        }
+        edits.push(ExternalReferenceEditPlan { file_id, edit });
+    }
+
+    Ok(ExternalReferenceUpdatePlan { edits })
+}
+
 fn resolve_existing_destination_module(
     mut current: Module,
     move_op: &MoveOperation,
@@ -758,6 +870,66 @@ fn module_declaration_exists_in_inline_module(
 
 fn module_name_matches(module: &ast::Module, target: &str) -> bool {
     module.name().is_some_and(|name| name.text() == target)
+}
+
+#[allow(dead_code)]
+fn plan_import_reference(
+    reference: &FileReference,
+    new_path: &str,
+) -> Option<(TextRange, String)> {
+    let name_ref = reference.name.as_name_ref()?;
+    let use_tree = name_ref.syntax().ancestors().find_map(ast::UseTree::cast)?;
+
+    let mut replacement = String::from(new_path);
+    if let Some(rename) = use_tree.rename() {
+        format_to!(replacement, " {}", rename.syntax().text());
+    }
+
+    Some((use_tree.syntax().text_range(), replacement))
+}
+
+#[allow(dead_code)]
+fn plan_non_import_reference(
+    reference: &FileReference,
+    new_path: &str,
+) -> Option<(TextRange, String)> {
+    let name_ref = reference.name.as_name_ref()?;
+    let segment = name_ref.syntax().ancestors().find_map(ast::PathSegment::cast)?;
+    let path = segment.parent_path();
+
+    if path.qualifier().is_none() {
+        return None;
+    }
+
+    let path_syntax = path.syntax();
+    let path_range = path_syntax.text_range();
+    let path_text = path_syntax.text();
+
+    let offset_start = path_range.start();
+    let name_range = name_ref.syntax().text_range();
+    let suffix_start = name_range.end() - offset_start;
+    let suffix_end = path_range.end() - offset_start;
+    let suffix = path_text.slice(TextRange::new(suffix_start, suffix_end)).to_string();
+
+    let mut replacement = String::from(new_path);
+    replacement.push_str(&suffix);
+
+    Some((path_range, replacement))
+}
+
+#[allow(dead_code)]
+fn format_crate_item_path(
+    db: &RootDatabase,
+    edition: Edition,
+    module_path: &[Name],
+    item_name: &Name,
+) -> String {
+    let mut result = String::from("crate");
+    for segment in module_path {
+        format_to!(result, "::{}", segment.display(db, edition));
+    }
+    format_to!(result, "::{}", item_name.display(db, edition));
+    result
 }
 
 fn plan_mod_decl_in_source_file(
@@ -1409,9 +1581,9 @@ mod tests {
     use span::Edition;
 
     use super::{
-        detect_move_operation, find_definitions, plan_item_relocation, plan_module_file_system_ops, IdentifierKind,
-        ItemRelocationPlan, ModuleFileSystemPlan, ParsedRenameTarget, RangeInfo,
-        RelocationDestination, RenameDefinition, RenameError,
+        detect_move_operation, find_definitions, plan_external_reference_updates, plan_item_relocation,
+        plan_module_file_system_ops, ExternalReferenceUpdatePlan, IdentifierKind, ItemRelocationPlan,
+        ModuleFileSystemPlan, ParsedRenameTarget, RangeInfo, RelocationDestination, RenameDefinition, RenameError,
     };
 
     #[track_caller]
@@ -1618,6 +1790,63 @@ mod tests {
         panic!("No move operation was detected for the provided fixture");
     }
 
+    fn compute_external_reference_plan(
+        new_name: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+    ) -> (crate::Analysis, ExternalReferenceUpdatePlan) {
+        let (analysis, position) = fixture::position(ra_fixture_before);
+        let db = &analysis.db;
+        let sema = Semantics::new(db);
+
+        let file_id = sema
+            .attach_first_edition(position.file_id)
+            .expect("failed to attach file edition for external reference plan");
+        let source_file = sema.parse(file_id);
+        let syntax = source_file.syntax();
+
+        let edition = file_id.edition(db);
+        let parsed_target = ParsedRenameTarget::parse(edition, new_name)
+            .expect("expected move target parsing to succeed");
+        let move_target = parsed_target
+            .move_target()
+            .expect("external reference plan requires a move target");
+        let (final_name, _) =
+            IdentifierKind::classify(edition, parsed_target.final_name_text()).unwrap();
+
+        let definitions = find_definitions(&sema, syntax, position, &final_name)
+            .expect("failed to find definitions")
+            .collect::<Vec<_>>();
+        assert!(
+            !definitions.is_empty(),
+            "expected at least one definition when computing external reference plan"
+        );
+
+        for (_, _, def, resolved_name, rename_def) in definitions {
+            if rename_def != RenameDefinition::Yes {
+                continue;
+            }
+            if let Some(move_operation) =
+                detect_move_operation(&sema, &def, &resolved_name, move_target)
+                    .expect("move detection failed")
+            {
+                let module_plan =
+                    plan_module_file_system_ops(&sema, &def, &move_operation)
+                        .expect("module filesystem planning failed");
+                let relocation_plan = plan_item_relocation(&sema, &def, &move_operation, &module_plan)
+                    .expect("item relocation planning failed");
+                let external_plan = plan_external_reference_updates(
+                    &sema,
+                    &def,
+                    &move_operation,
+                    &relocation_plan,
+                )
+                .expect("external reference planning failed");
+                return (analysis, external_plan);
+            }
+        }
+        panic!("No move operation was detected for the provided fixture");
+    }
+
     #[test]
     fn module_fs_plan_creates_nested_modules() {
         let (plan, _) = compute_move_plans(
@@ -1762,6 +1991,132 @@ struct ToMove$0;
             }
             _ => panic!("expected new file destination"),
         }
+    }
+
+    #[test]
+    fn external_reference_plan_updates_use_and_paths() {
+        let (analysis, plan) = compute_external_reference_plan(
+            "crate::beta::Final",
+            r#"
+//- /lib.rs
+mod alpha;
+mod beta;
+
+//- /alpha.rs
+pub struct ToMove$0;
+
+//- /beta.rs
+use crate::alpha::ToMove;
+
+fn f() {
+    let _ = crate::alpha::ToMove::default();
+}
+"#,
+        );
+
+        let edits = plan.edits();
+        assert_eq!(edits.len(), 1, "expected edits in beta.rs only");
+        let edit_plan = &edits[0];
+        let mut text = analysis.file_text(edit_plan.file_id).unwrap().to_string();
+        edit_plan.edit.apply(&mut text);
+        assert_eq_text!(
+            trim_indent(
+                r#"
+use crate::beta::Final;
+
+fn f() {
+    let _ = crate::beta::Final::default();
+}
+"#
+            ),
+            &text
+        );
+    }
+
+    #[test]
+    fn external_reference_plan_updates_relative_imports() {
+        let (analysis, plan) = compute_external_reference_plan(
+            "crate::beta::Final",
+            r#"
+//- /lib.rs
+mod alpha;
+mod beta;
+
+//- /alpha.rs
+pub struct ToMove$0;
+
+pub mod nested {
+    use super::ToMove;
+
+    pub fn access() {
+        let _ = super::super::alpha::ToMove;
+    }
+}
+"#,
+        );
+
+        let edits = plan.edits();
+        assert_eq!(edits.len(), 1, "expected edits in alpha.rs only");
+        let edit_plan = &edits[0];
+        let mut text = analysis.file_text(edit_plan.file_id).unwrap().to_string();
+        edit_plan.edit.apply(&mut text);
+        assert_eq_text!(
+            trim_indent(
+                r#"
+pub struct ToMove;
+
+pub mod nested {
+    use crate::beta::Final;
+
+    pub fn access() {
+        let _ = crate::beta::Final;
+    }
+}
+"#
+            ),
+            &text
+        );
+    }
+
+    #[test]
+    fn external_reference_plan_preserves_use_alias() {
+        let (analysis, plan) = compute_external_reference_plan(
+            "crate::beta::Final",
+            r#"
+//- /lib.rs
+mod alpha;
+mod beta;
+mod consumer;
+
+//- /alpha.rs
+pub struct ToMove$0;
+
+//- /consumer.rs
+use crate::alpha::ToMove as OldAlias;
+
+pub fn make() -> OldAlias {
+    OldAlias {}
+}
+"#,
+        );
+
+        let edits = plan.edits();
+        assert_eq!(edits.len(), 1, "expected edits in consumer.rs only");
+        let edit_plan = &edits[0];
+        let mut text = analysis.file_text(edit_plan.file_id).unwrap().to_string();
+        edit_plan.edit.apply(&mut text);
+        assert_eq_text!(
+            trim_indent(
+                r#"
+use crate::beta::Final as OldAlias;
+
+pub fn make() -> OldAlias {
+    OldAlias {}
+}
+"#
+            ),
+            &text
+        );
     }
 
     #[test]
