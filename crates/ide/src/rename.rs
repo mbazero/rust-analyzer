@@ -4,10 +4,10 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, InFile, Module, Name, Semantics, sym};
+use hir::{AsAssocItem, InFile, Module, ModuleSource, Name, Semantics, sym};
 use ide_db::{
     FileId, FileRange, RootDatabase,
-    base_db::{AnchoredPathBuf, SourceDatabase, VfsPath},
+    base_db::{AnchoredPathBuf, RootQueryDb, SourceDatabase, VfsPath},
     defs::{Definition, NameClass, NameRefClass},
     rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
     source_change::{FileSystemEdit, SourceChangeBuilder},
@@ -17,7 +17,10 @@ use std::fmt::Write;
 use stdx::{always, format_to, never};
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
-    ast::{self, HasArgList, HasGenericArgs, PathSegmentKind, prec::ExprPrecedence},
+    ast::{
+        self, HasArgList, HasGenericArgs, HasModuleItem, HasName, PathSegmentKind, edit::IndentLevel,
+        prec::ExprPrecedence,
+    },
 };
 
 use span::Edition;
@@ -43,12 +46,20 @@ struct ModuleFileSystemPlan {
     anchor: FileId,
     destination_relative_path: String,
     file_creations: Vec<PlannedFileCreation>,
+    module_declarations: Vec<ModuleDeclarationPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PlannedFileCreation {
     relative_path: String,
     initial_contents: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModuleDeclarationPlan {
+    file_id: FileId,
+    insert_offset: TextSize,
+    text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,7 +227,7 @@ fn detect_move_operation(
 impl ModuleFileSystemPlan {
     #[allow(dead_code)]
     fn is_no_op(&self) -> bool {
-        self.file_creations.is_empty()
+        self.file_creations.is_empty() && self.module_declarations.is_empty()
     }
 
     #[allow(dead_code)]
@@ -235,9 +246,35 @@ impl ModuleFileSystemPlan {
         &self.destination_relative_path
     }
 
+    #[allow(dead_code)]
+    fn module_declaration_edits(&self) -> Vec<(FileId, TextEdit)> {
+        self.module_declarations
+            .iter()
+            .map(|decl| {
+                (
+                    decl.file_id,
+                    TextEdit::insert(decl.insert_offset, decl.text.clone()),
+                )
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     fn file_paths(&self) -> Vec<&str> {
         self.file_creations.iter().map(|creation| creation.relative_path.as_str()).collect()
+    }
+
+    #[cfg(test)]
+    fn file_initial_contents(&self) -> Vec<&str> {
+        self.file_creations
+            .iter()
+            .map(|creation| creation.initial_contents.as_str())
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn module_declaration_texts(&self) -> Vec<&str> {
+        self.module_declarations.iter().map(|decl| decl.text.as_str()).collect()
     }
 }
 
@@ -277,7 +314,7 @@ fn plan_module_file_system_ops(
             bail!("Cannot move items into modules declared with #[path] attributes yet");
         }
         if child_module.is_inline(db) {
-            bail!("Cannot move items into inline modules yet");
+            break;
         }
 
         let Some(file_id) = child_module.as_source_file_id(db) else {
@@ -304,6 +341,7 @@ fn plan_module_file_system_ops(
     }
 
     let mut file_creations = Vec::new();
+    let mut module_declarations = Vec::new();
     let mut parent_context: Option<ModuleCreationContext> =
         Some(ModuleCreationContext::Existing { module: current_parent_module });
     if existing_prefix_len == 0 {
@@ -318,10 +356,24 @@ fn plan_module_file_system_ops(
     };
 
     for segment in move_op.dest_module_path.iter().skip(existing_prefix_len) {
-        let style = match parent_context {
+        match parent_context {
             Some(ModuleCreationContext::Existing { module }) => {
-                infer_child_style(module, db)
+                if let Some(decl) =
+                    plan_module_declaration_for_existing_parent(db, module, segment)?
+                {
+                    module_declarations.push(decl);
+                }
             }
+            Some(ModuleCreationContext::New { .. }) => {
+                if let Some(prev_creation) = file_creations.last_mut() {
+                    append_child_declaration_to_new_module(prev_creation, segment);
+                }
+            }
+            None => (),
+        }
+
+        let style = match parent_context {
+            Some(ModuleCreationContext::Existing { module }) => infer_child_style(module, db),
             Some(ModuleCreationContext::New { preferred_style }) => preferred_style,
             None => ModuleCreationStyle::File,
         };
@@ -336,10 +388,16 @@ fn plan_module_file_system_ops(
         current_parent_dir.push('/');
         current_parent_dir = normalize_directory_path(&current_parent_dir);
         destination_relative_path = file_path.clone();
-        parent_context = Some(ModuleCreationContext::New { preferred_style: ModuleCreationStyle::File });
+        parent_context =
+            Some(ModuleCreationContext::New { preferred_style: ModuleCreationStyle::File });
     }
 
-    Ok(ModuleFileSystemPlan { anchor: root_anchor, destination_relative_path, file_creations })
+    Ok(ModuleFileSystemPlan {
+        anchor: root_anchor,
+        destination_relative_path,
+        file_creations,
+        module_declarations,
+    })
 }
 
 fn find_child_module_by_name(
@@ -413,6 +471,139 @@ fn normalize_directory_path(path: &str) -> String {
         normalized.push('/');
     }
     normalized
+}
+
+fn append_child_declaration_to_new_module(creation: &mut PlannedFileCreation, segment: &Name) {
+    if !creation.initial_contents.is_empty() && !creation.initial_contents.ends_with('\n') {
+        creation.initial_contents.push('\n');
+    }
+    creation.initial_contents.push_str("pub mod ");
+    creation.initial_contents.push_str(segment.as_str());
+    creation.initial_contents.push_str(";\n");
+}
+
+fn plan_module_declaration_for_existing_parent(
+    db: &RootDatabase,
+    parent_module: Module,
+    child_name: &Name,
+) -> RenameResult<Option<ModuleDeclarationPlan>> {
+    if module_declaration_exists(db, parent_module, child_name) {
+        return Ok(None);
+    }
+
+    let visibility_prefix = if parent_module.parent(db).is_some() { "pub " } else { "" };
+    if parent_module.is_inline(db) {
+        let InFile { file_id, value: source } = parent_module.definition_source(db);
+        let ModuleSource::Module(module_ast) = source else {
+            bail!("Inline module missing syntax body");
+        };
+        let vfs_file_id = file_id.original_file(db).file_id(db);
+        let plan = plan_mod_decl_in_inline_module(&module_ast, vfs_file_id, visibility_prefix, child_name.as_str())?;
+        Ok(Some(plan))
+    } else {
+        let def_hir_file = parent_module.definition_source_file_id(db);
+        let editioned_file_id = def_hir_file.original_file(db);
+        let vfs_file_id = editioned_file_id.file_id(db);
+        let parsed = db.parse(editioned_file_id);
+        let source_file = parsed.tree();
+        let plan = plan_mod_decl_in_source_file(
+            db,
+            vfs_file_id,
+            &source_file,
+            visibility_prefix,
+            child_name.as_str(),
+        );
+        Ok(Some(plan))
+    }
+}
+
+fn module_declaration_exists(db: &RootDatabase, module: Module, child_name: &Name) -> bool {
+    if module.is_inline(db) {
+        let InFile { value: source, .. } = module.definition_source(db);
+        let ModuleSource::Module(module_ast) = source else {
+            return false;
+        };
+        module_declaration_exists_in_inline_module(&module_ast, child_name)
+    } else {
+        let def_hir_file = module.definition_source_file_id(db);
+        let editioned_file_id = def_hir_file.original_file(db);
+        let source_file = db.parse(editioned_file_id).tree();
+        module_declaration_exists_in_source_file(&source_file, child_name)
+    }
+}
+
+fn module_declaration_exists_in_source_file(
+    source_file: &ast::SourceFile,
+    child_name: &Name,
+) -> bool {
+    source_file
+        .items()
+        .filter_map(|item| match item {
+            ast::Item::Module(module) => Some(module),
+            _ => None,
+        })
+        .any(|module| module_name_matches(&module, child_name.as_str()))
+}
+
+fn module_declaration_exists_in_inline_module(
+    module_ast: &ast::Module,
+    child_name: &Name,
+) -> bool {
+    module_ast
+        .item_list()
+        .into_iter()
+        .flat_map(|list| list.items())
+        .filter_map(|item| match item {
+            ast::Item::Module(module) => Some(module),
+            _ => None,
+        })
+        .any(|module| module_name_matches(&module, child_name.as_str()))
+}
+
+fn module_name_matches(module: &ast::Module, target: &str) -> bool {
+    module.name().is_some_and(|name| name.text() == target)
+}
+
+fn plan_mod_decl_in_source_file(
+    db: &RootDatabase,
+    file_id: FileId,
+    source_file: &ast::SourceFile,
+    visibility_prefix: &str,
+    child_name: &str,
+) -> ModuleDeclarationPlan {
+    let file_text = db.file_text(file_id).text(db);
+    let mut text = String::new();
+    if !file_text.is_empty() && !file_text.ends_with('\n') {
+        text.push('\n');
+    }
+    if !file_text.trim().is_empty() && (text.is_empty() || !text.ends_with('\n')) {
+        // ensure separation from existing items
+        text.push('\n');
+    }
+    text.push_str(visibility_prefix);
+    text.push_str("mod ");
+    text.push_str(child_name);
+    text.push_str(";\n");
+    let insert_offset = source_file.syntax().text_range().end();
+    ModuleDeclarationPlan { file_id, insert_offset, text }
+}
+
+fn plan_mod_decl_in_inline_module(
+    module_ast: &ast::Module,
+    file_id: FileId,
+    visibility_prefix: &str,
+    child_name: &str,
+) -> RenameResult<ModuleDeclarationPlan> {
+    let item_list = module_ast
+        .item_list()
+        .ok_or_else(|| format_err!("Inline module missing item list"))?;
+    let insert_offset = item_list
+        .r_curly_token()
+        .map(|tok| tok.text_range().start())
+        .ok_or_else(|| format_err!("Inline module missing closing brace"))?;
+    let indent = IndentLevel::from_node(item_list.syntax()) + 1;
+    let text = format!("{indent}{visibility_prefix}mod {child_name};\n");
+    Ok(ModuleDeclarationPlan { file_id, insert_offset, text })
 }
 
 enum ModuleCreationContext {
@@ -1241,6 +1432,16 @@ pub struct Existing;
 
         assert_eq!(plan.file_paths(), ["mod_two.rs", "mod_two/finish.rs"]);
         assert_eq!(plan.destination_path(), "mod_two/finish.rs");
+        assert_eq!(
+            plan.file_initial_contents(),
+            ["pub mod finish;\n", ""]
+        );
+        let decls: Vec<_> = plan
+            .module_declaration_texts()
+            .into_iter()
+            .map(|text| text.trim().to_owned())
+            .collect();
+        assert_eq!(decls, ["mod mod_two;"]);
     }
 
     #[test]
@@ -1259,6 +1460,8 @@ struct Existing;
 
         assert!(plan.file_paths().is_empty());
         assert_eq!(plan.destination_path(), "mod_one.rs");
+        assert!(plan.file_initial_contents().is_empty());
+        assert!(plan.module_declaration_texts().is_empty());
     }
 
     #[test]
@@ -1277,6 +1480,32 @@ pub struct Something;
 
         assert_eq!(plan.file_paths(), ["new_mod/mod.rs"]);
         assert_eq!(plan.destination_path(), "new_mod/mod.rs");
+        assert_eq!(plan.file_initial_contents(), [""]);
+        let decls: Vec<_> = plan
+            .module_declaration_texts()
+            .into_iter()
+            .map(|text| text.trim().to_owned())
+            .collect();
+        assert_eq!(decls, ["mod new_mod;"]);
+    }
+
+    #[test]
+    fn module_fs_plan_skips_duplicate_declarations() {
+        let plan = compute_move_plan(
+            "crate::mod_one::finish::Final",
+            r#"
+//- /lib.rs
+mod mod_one;
+struct ToMove$0;
+
+//- /mod_one.rs
+pub mod finish;
+"#,
+        );
+
+        assert_eq!(plan.file_paths(), ["mod_one/finish.rs"]);
+        assert_eq!(plan.file_initial_contents(), [""]);
+        assert!(plan.module_declaration_texts().is_empty());
     }
 
     #[test]

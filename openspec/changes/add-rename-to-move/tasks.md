@@ -19,11 +19,11 @@
 
 ## 3. Module Declaration Management
 
-- [ ] 3.1 Implement parent module detection for new modules
-- [ ] 3.2 Add logic to insert `pub mod` declarations in parent modules
-- [ ] 3.3 Handle visibility modifiers for module declarations (pub vs private)
-- [ ] 3.4 Detect and skip duplicate module declarations
-- [ ] 3.5 Write tests for module declaration insertion
+- [x] 3.1 Implement parent module detection for new modules
+- [x] 3.2 Add logic to insert `pub mod` declarations in parent modules
+- [x] 3.3 Handle visibility modifiers for module declarations (pub vs private)
+- [x] 3.4 Detect and skip duplicate module declarations
+- [x] 3.5 Write tests for module declaration insertion
 
 ## 4. Item Definition Relocation
 
