@@ -7,9 +7,10 @@
 use hir::{AsAssocItem, InFile, Module, Name, Semantics, sym};
 use ide_db::{
     FileId, FileRange, RootDatabase,
+    base_db::{AnchoredPathBuf, SourceDatabase, VfsPath},
     defs::{Definition, NameClass, NameRefClass},
     rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
-    source_change::SourceChangeBuilder,
+    source_change::{FileSystemEdit, SourceChangeBuilder},
 };
 use itertools::Itertools;
 use std::fmt::Write;
@@ -35,6 +36,19 @@ struct MoveOperation {
     dest_module_path: Vec<Name>,
     source_item_name: Name,
     dest_item_name: Name,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModuleFileSystemPlan {
+    anchor: FileId,
+    destination_relative_path: String,
+    file_creations: Vec<PlannedFileCreation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedFileCreation {
+    relative_path: String,
+    initial_contents: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +164,7 @@ impl ParsedRenameTarget {
 }
 
 impl MoveTarget {
+    #[allow(dead_code)]
     fn module_path(&self) -> &[Name] {
         &self.module_path
     }
@@ -196,6 +211,232 @@ fn detect_move_operation(
         source_item_name,
         dest_item_name: resolved_name.clone(),
     }))
+}
+
+impl ModuleFileSystemPlan {
+    #[allow(dead_code)]
+    fn is_no_op(&self) -> bool {
+        self.file_creations.is_empty()
+    }
+
+    #[allow(dead_code)]
+    fn file_system_edits(&self) -> Vec<FileSystemEdit> {
+        self.file_creations
+            .iter()
+            .map(|creation| FileSystemEdit::CreateFile {
+                dst: AnchoredPathBuf { anchor: self.anchor, path: creation.relative_path.clone() },
+                initial_contents: creation.initial_contents.clone(),
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    fn destination_path(&self) -> &str {
+        &self.destination_relative_path
+    }
+
+    #[cfg(test)]
+    fn file_paths(&self) -> Vec<&str> {
+        self.file_creations.iter().map(|creation| creation.relative_path.as_str()).collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleCreationStyle {
+    File,
+    ModRs,
+}
+
+fn plan_module_file_system_ops(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    move_op: &MoveOperation,
+) -> RenameResult<ModuleFileSystemPlan> {
+    let db = sema.db;
+    let krate = def.krate(db).ok_or_else(|| format_err!("Cannot move items outside of a crate"))?;
+    let root_module = krate.root_module();
+    let root_definition = root_module.definition_source(db);
+    let root_file_id = root_definition.file_id.original_file(db);
+    let root_anchor = root_file_id.file_id(db);
+
+    let root_path = vfs_path(db, root_anchor).ok_or_else(|| {
+        format_err!("Unable to resolve path for crate root when planning move operation")
+    })?;
+    let root_dir = root_path.parent().unwrap_or_else(|| root_path.clone());
+
+    let mut current_parent_module = root_module;
+    let mut current_parent_dir = String::new();
+    let mut existing_prefix_len = 0usize;
+    let mut existing_paths: Vec<String> = Vec::new();
+
+    for segment in &move_op.dest_module_path {
+        let child = find_child_module_by_name(current_parent_module, db, segment);
+        let Some(child_module) = child else { break };
+
+        if child_module.has_path(db) {
+            bail!("Cannot move items into modules declared with #[path] attributes yet");
+        }
+        if child_module.is_inline(db) {
+            bail!("Cannot move items into inline modules yet");
+        }
+
+        let Some(file_id) = child_module.as_source_file_id(db) else {
+            bail!("Destination module `{}` has no associated source file", segment.as_str());
+        };
+        let module_path = relative_path_from_anchor(db, root_anchor, file_id.file_id(db), &root_dir)
+            .ok_or_else(|| {
+                format_err!(
+                    "Failed to resolve file path for destination module `{}`",
+                    segment.as_str()
+                )
+            })?;
+        existing_paths.push(module_path.clone());
+        current_parent_dir =
+            module_directory_from_file_path(&module_path, child_module.is_mod_rs(db))
+                .ok_or_else(|| {
+                    format_err!(
+                        "Failed to resolve destination directory for module `{}`",
+                        segment.as_str()
+                    )
+                })?;
+        current_parent_module = child_module;
+        existing_prefix_len += 1;
+    }
+
+    let mut file_creations = Vec::new();
+    let mut parent_context: Option<ModuleCreationContext> =
+        Some(ModuleCreationContext::Existing { module: current_parent_module });
+    if existing_prefix_len == 0 {
+        parent_context = Some(ModuleCreationContext::Existing { module: root_module });
+    }
+
+    let mut destination_relative_path = if existing_paths.is_empty() {
+        relative_path_from_anchor(db, root_anchor, root_anchor, &root_dir)
+            .unwrap_or_else(|| root_definition_path_from_anchor(&root_dir, &root_path))
+    } else {
+        existing_paths.last().cloned().unwrap()
+    };
+
+    for segment in move_op.dest_module_path.iter().skip(existing_prefix_len) {
+        let style = match parent_context {
+            Some(ModuleCreationContext::Existing { module }) => {
+                infer_child_style(module, db)
+            }
+            Some(ModuleCreationContext::New { preferred_style }) => preferred_style,
+            None => ModuleCreationStyle::File,
+        };
+
+        let file_path = build_module_file_path(&current_parent_dir, segment.as_str(), style);
+        file_creations.push(PlannedFileCreation {
+            relative_path: file_path.clone(),
+            initial_contents: String::new(),
+        });
+
+        current_parent_dir.push_str(segment.as_str());
+        current_parent_dir.push('/');
+        current_parent_dir = normalize_directory_path(&current_parent_dir);
+        destination_relative_path = file_path.clone();
+        parent_context = Some(ModuleCreationContext::New { preferred_style: ModuleCreationStyle::File });
+    }
+
+    Ok(ModuleFileSystemPlan { anchor: root_anchor, destination_relative_path, file_creations })
+}
+
+fn find_child_module_by_name(
+    parent: Module,
+    db: &RootDatabase,
+    segment: &Name,
+) -> Option<Module> {
+    parent
+        .children(db)
+        .find(|child| child.name(db).is_some_and(|name| name == *segment))
+}
+
+fn vfs_path(db: &RootDatabase, file_id: FileId) -> Option<VfsPath> {
+    let source_root_input = db.file_source_root(file_id);
+    let source_root_id = source_root_input.source_root_id(db);
+    let source_root = db.source_root(source_root_id).source_root(db);
+    source_root.path_for_file(&file_id).cloned()
+}
+
+fn relative_path_from_anchor(
+    db: &RootDatabase,
+    anchor: FileId,
+    target: FileId,
+    anchor_dir: &VfsPath,
+) -> Option<String> {
+    let anchor_source_root = db.file_source_root(anchor).source_root_id(db);
+    let target_source_root = db.file_source_root(target).source_root_id(db);
+    if anchor_source_root != target_source_root {
+        return None;
+    }
+    let target_path = vfs_path(db, target)?;
+    let rel = target_path.strip_prefix(anchor_dir)?;
+    let trimmed = rel.as_str().trim_start_matches('/');
+    Some(trimmed.to_owned())
+}
+
+fn root_definition_path_from_anchor(anchor_dir: &VfsPath, root_path: &VfsPath) -> String {
+    if let Some(rel) = root_path.strip_prefix(anchor_dir) {
+        rel.as_str().trim_start_matches('/').to_owned()
+    } else {
+        "mod.rs".to_owned()
+    }
+}
+
+fn module_directory_from_file_path(rel_path: &str, is_mod_rs: bool) -> Option<String> {
+    if is_mod_rs {
+        let dir = rel_path.strip_suffix("mod.rs")?;
+        return Some(dir.to_owned());
+    }
+    let stripped = rel_path.strip_suffix(".rs")?;
+    Some(format!("{stripped}/"))
+}
+
+fn build_module_file_path(
+    current_dir: &str,
+    segment: &str,
+    style: ModuleCreationStyle,
+) -> String {
+    match style {
+        ModuleCreationStyle::File => format!("{current_dir}{segment}.rs"),
+        ModuleCreationStyle::ModRs => format!("{current_dir}{segment}/mod.rs"),
+    }
+}
+
+fn normalize_directory_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let mut normalized = path.to_owned();
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+enum ModuleCreationContext {
+    Existing { module: Module },
+    New { preferred_style: ModuleCreationStyle },
+}
+
+fn infer_child_style(module: Module, db: &RootDatabase) -> ModuleCreationStyle {
+    let mut saw_mod_rs = false;
+    let mut saw_file = false;
+    for child in module.children(db) {
+        if child.is_inline(db) {
+            continue;
+        }
+        if child.is_mod_rs(db) {
+            saw_mod_rs = true;
+        } else {
+            saw_file = true;
+        }
+    }
+    match (saw_mod_rs, saw_file) {
+        (true, false) => ModuleCreationStyle::ModRs,
+        _ => ModuleCreationStyle::File,
+    }
 }
 
 /// This is similar to `collect::<Result<Vec<_>, _>>`, but unlike it, it succeeds if there is *any* `Ok` item.
@@ -335,9 +576,10 @@ pub(crate) fn rename(
         None => ok_if_any(defs.map(|(.., def, resolved_name, rename_def)| {
             if let Some(move_target) = move_target_ref {
                 if rename_def == RenameDefinition::Yes {
-                    if let Some(_move_operation) =
+                    if let Some(move_operation) =
                         detect_move_operation(&sema, &def, &resolved_name, move_target)?
                     {
+                        let _ = plan_module_file_system_ops(&sema, &def, &move_operation)?;
                         bail!("rename-to-move is not implemented yet");
                     }
                 }
@@ -774,10 +1016,14 @@ mod tests {
 
     use crate::fixture;
 
-    use hir::Name;
+    use hir::{Name, Semantics};
+    use syntax::AstNode;
     use span::Edition;
 
-    use super::{ParsedRenameTarget, RangeInfo, RenameError};
+    use super::{
+        detect_move_operation, find_definitions, plan_module_file_system_ops, IdentifierKind,
+        ModuleFileSystemPlan, ParsedRenameTarget, RangeInfo, RenameDefinition, RenameError,
+    };
 
     #[track_caller]
     fn check(
@@ -931,6 +1177,106 @@ mod tests {
         let err =
             ParsedRenameTarget::parse(Edition::Edition2021, "alpha::beta::Item").unwrap_err();
         assert_eq!(err.to_string(), "Rename-to-move paths must start with `crate::`");
+    }
+
+    fn compute_move_plan(
+        new_name: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+    ) -> ModuleFileSystemPlan {
+        let (analysis, position) = fixture::position(ra_fixture_before);
+        let db = &analysis.db;
+        let sema = Semantics::new(db);
+
+        let file_id = sema
+            .attach_first_edition(position.file_id)
+            .expect("failed to attach file edition for move plan");
+        let source_file = sema.parse(file_id);
+        let syntax = source_file.syntax();
+
+        let edition = file_id.edition(db);
+        let parsed_target = ParsedRenameTarget::parse(edition, new_name)
+            .expect("expected move target parsing to succeed");
+        let move_target = parsed_target
+            .move_target()
+            .expect("compute_move_plan requires a move target");
+        let (final_name, _) =
+            IdentifierKind::classify(edition, parsed_target.final_name_text()).unwrap();
+
+        let definitions = find_definitions(&sema, syntax, position, &final_name)
+            .expect("failed to find definitions")
+            .collect::<Vec<_>>();
+        assert!(
+            !definitions.is_empty(),
+            "expected at least one definition when computing move plan"
+        );
+
+        for (_, _, def, resolved_name, rename_def) in definitions {
+            if rename_def != RenameDefinition::Yes {
+                continue;
+            }
+            if let Some(move_operation) =
+                detect_move_operation(&sema, &def, &resolved_name, move_target)
+                    .expect("move detection failed")
+            {
+                return plan_module_file_system_ops(&sema, &def, &move_operation)
+                    .expect("module filesystem planning failed");
+            }
+        }
+        panic!("No move operation was detected for the provided fixture");
+    }
+
+    #[test]
+    fn module_fs_plan_creates_nested_modules() {
+        let plan = compute_move_plan(
+            "crate::mod_two::finish::Final",
+            r#"
+//- /lib.rs
+mod mod_one;
+struct ToMove$0;
+
+//- /mod_one.rs
+pub struct Existing;
+"#,
+        );
+
+        assert_eq!(plan.file_paths(), ["mod_two.rs", "mod_two/finish.rs"]);
+        assert_eq!(plan.destination_path(), "mod_two/finish.rs");
+    }
+
+    #[test]
+    fn module_fs_plan_uses_existing_destination() {
+        let plan = compute_move_plan(
+            "crate::mod_one::Final",
+            r#"
+//- /lib.rs
+mod mod_one;
+struct ToMove$0;
+
+//- /mod_one.rs
+struct Existing;
+"#,
+        );
+
+        assert!(plan.file_paths().is_empty());
+        assert_eq!(plan.destination_path(), "mod_one.rs");
+    }
+
+    #[test]
+    fn module_fs_plan_prefers_mod_rs_when_siblings_use_it() {
+        let plan = compute_move_plan(
+            "crate::new_mod::Final",
+            r#"
+//- /lib.rs
+mod existing;
+struct Item$0;
+
+//- /existing/mod.rs
+pub struct Something;
+"#,
+        );
+
+        assert_eq!(plan.file_paths(), ["new_mod/mod.rs"]);
+        assert_eq!(plan.destination_path(), "new_mod/mod.rs");
     }
 
     #[test]

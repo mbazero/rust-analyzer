@@ -10,12 +10,12 @@
 
 ## 2. Module File System Operations
 
-- [ ] 2.1 Implement module path resolution to file system paths
-- [ ] 2.2 Add logic to choose between `mod.rs` and named module files
-- [ ] 2.3 Create file creation operations for new modules
-- [ ] 2.4 Implement directory creation for nested module structures
-- [ ] 2.5 Add detection for existing project module style preferences
-- [ ] 2.6 Write tests for various module creation scenarios
+- [x] 2.1 Implement module path resolution to file system paths
+- [x] 2.2 Add logic to choose between `mod.rs` and named module files
+- [x] 2.3 Create file creation operations for new modules
+- [x] 2.4 Implement directory creation for nested module structures
+- [x] 2.5 Add detection for existing project module style preferences
+- [x] 2.6 Write tests for various module creation scenarios
 
 ## 3. Module Declaration Management
 
