@@ -28,12 +28,12 @@ use crate::{
 };
 use base_db::AnchoredPathBuf;
 use either::Either;
-use hir::{FieldSource, FileRange, InFile, ModuleSource, Name, Semantics, sym};
+use hir::{FieldSource, FileRange, InFile, Module, ModuleSource, Name, Semantics, sym, ModPath, PathKind, db::ExpandDatabase};
 use span::{Edition, FileId, SyntaxContext};
 use stdx::{TupleExt, never};
 use syntax::{
     AstNode, SyntaxKind, T, TextRange,
-    ast::{self, HasName},
+    ast::{self, HasName, HasModuleItem},
 };
 
 use crate::{
@@ -49,6 +49,41 @@ pub type Result<T, E = RenameError> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub struct RenameError(pub String);
+
+/// Context for rename operations, including move operations
+#[derive(Debug)]
+pub struct RenameContext {
+    pub original_def: Definition,
+    pub original_name: Name,
+    pub target_module_path: ModPath,
+    pub new_item_name: Name,
+    pub operation_type: RenameOperationType,
+    pub source_module: Module,
+}
+
+/// Types of rename operations supported
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenameOperationType {
+    /// Same module, name change only (Requirement 5.1)
+    SimpleRename,
+    /// Different module, name change (Requirement 1.2)
+    MoveAndRename,
+    /// Different module, same name (Requirement 1.2)
+    MoveOnly,
+    /// Relative path within current module (Requirement 5.2)
+    RelativeMove,
+}
+
+/// Result of comparing current item path with target path
+#[derive(Debug, PartialEq, Eq)]
+pub enum PathComparison {
+    /// Only name change (Requirement 5.1)
+    SameLocation,
+    /// Move required (Requirement 1.2)
+    DifferentModule,
+    /// Invalid path syntax (Requirement 1.3)
+    Invalid,
+}
 
 impl fmt::Display for RenameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -676,6 +711,199 @@ fn source_edit_from_def(
     Ok((file_id.file_id(sema.db), edit.finish()))
 }
 
+/// Parse a rename target that may be a fully-qualified path
+/// Leverages existing ModPath::from_src infrastructure (Requirement 1.1, 1.3)
+pub fn parse_rename_target(
+    input: &str,
+    db: &dyn ExpandDatabase,
+) -> Result<ModPath> {
+    // Parse as AST path first to validate syntax (Requirement 1.3)
+    let parsed = syntax::ast::SourceFile::parse(&format!("use {};", input), Edition::CURRENT);
+    if !parsed.errors().is_empty() {
+        return Err(RenameError(format!("Invalid path syntax: {}", input)));
+    }
+    
+    // Extract path and convert using existing ModPath::from_src (Requirement 1.1)
+    let use_stmt = parsed.tree().items().find_map(|item| match item {
+        syntax::ast::Item::Use(use_stmt) => use_stmt.use_tree()?.path(),
+        _ => None,
+    }).ok_or_else(|| RenameError(format!("Could not extract path from: {}", input)))?;
+    
+    ModPath::from_src(db, use_stmt, &mut |_| SyntaxContext::root(Edition::CURRENT))
+        .ok_or_else(|| RenameError(format!("Could not parse path: {}", input)))
+}
+
+/// Extract module path and item name from a fully-qualified path
+/// (Requirements 1.4, 1.5)
+pub fn parse_fully_qualified_path(
+    path: &str,
+    db: &dyn ExpandDatabase,
+) -> Result<(ModPath, Name)> {
+    // Parse using existing rust-analyzer infrastructure
+    let mod_path = parse_rename_target(path, db)?;
+    
+    // Extract item name from final segment (Requirement 1.4)
+    let item_name = mod_path.segments().last()
+        .ok_or_else(|| RenameError("Path must contain at least one segment".to_string()))?
+        .clone();
+    
+    // Create module path by removing final segment (Requirement 1.5)
+    let mut module_segments = mod_path.segments().to_vec();
+    module_segments.pop(); // Remove item name
+    
+    let module_path = if module_segments.is_empty() {
+        // Item in crate root
+        ModPath::from_kind(mod_path.kind)
+    } else {
+        ModPath::from_segments(mod_path.kind, module_segments)
+    };
+    
+    Ok((module_path, item_name))
+}
+
+/// Compare current item's ModPath with target ModPath (Requirements 1.2, 5.1, 5.2, 5.3)
+pub fn compare_paths(
+    current_module: &ModPath,
+    target_module: &ModPath,
+) -> PathComparison {
+    // Check if paths are identical (same module location)
+    if current_module.kind == target_module.kind 
+        && current_module.segments() == target_module.segments() {
+        return PathComparison::SameLocation;
+    }
+    
+    // Different module paths indicate a move operation is required
+    PathComparison::DifferentModule
+}
+
+/// Determine the type of rename operation based on current and target paths
+/// (Requirements 1.2, 5.1, 5.2, 5.3)
+pub fn determine_operation_type(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    target_module_path: &ModPath,
+    new_item_name: &Name,
+) -> Result<RenameOperationType> {
+    // Get current module of the definition
+    let current_module = match def.module(sema.db) {
+        Some(module) => module,
+        None => return Err(RenameError("Cannot determine current module for definition".to_string())),
+    };
+    
+    // Convert current module to ModPath for comparison
+    let current_module_path = module_to_mod_path(sema, current_module)?;
+    
+    // Get current item name
+    let current_name = def.name(sema.db)
+        .ok_or_else(|| RenameError("Cannot determine current name for definition".to_string()))?;
+    
+    // Compare paths to determine operation type
+    let path_comparison = compare_paths(&current_module_path, target_module_path);
+    
+    match path_comparison {
+        PathComparison::SameLocation => {
+            // Same module - check if name is changing (Requirement 5.1)
+            if current_name == *new_item_name {
+                // Same location, same name - no operation needed
+                Ok(RenameOperationType::SimpleRename)
+            } else {
+                // Same location, different name - simple rename (Requirement 5.1)
+                Ok(RenameOperationType::SimpleRename)
+            }
+        }
+        PathComparison::DifferentModule => {
+            // Different module - determine if name is also changing (Requirement 1.2)
+            if current_name == *new_item_name {
+                // Different module, same name - move only (Requirement 1.2)
+                Ok(RenameOperationType::MoveOnly)
+            } else {
+                // Different module, different name - move and rename (Requirement 1.2)
+                Ok(RenameOperationType::MoveAndRename)
+            }
+        }
+        PathComparison::Invalid => {
+            Err(RenameError("Invalid target path".to_string()))
+        }
+    }
+}
+
+/// Convert a Module to ModPath for comparison purposes
+fn module_to_mod_path(
+    sema: &Semantics<'_, RootDatabase>,
+    module: Module,
+) -> Result<ModPath> {
+    let mut segments = Vec::new();
+    let mut current = Some(module);
+    
+    // Walk up the module hierarchy to build the path
+    while let Some(mod_) = current {
+        if let Some(parent) = mod_.parent(sema.db) {
+            if let Some(name) = mod_.name(sema.db) {
+                segments.insert(0, name);
+            }
+            current = Some(parent);
+        } else {
+            // Reached crate root
+            break;
+        }
+    }
+    
+    // Create ModPath with crate root kind
+    if segments.is_empty() {
+        Ok(ModPath::from_kind(PathKind::Crate))
+    } else {
+        Ok(ModPath::from_segments(PathKind::Crate, segments))
+    }
+}
+
+/// Detect if a path specification is relative within the current module (Requirement 5.2)
+pub fn is_relative_path_in_same_module(
+    current_module_path: &ModPath,
+    target_module_path: &ModPath,
+) -> bool {
+    // Check if target is a relative path within the same module
+    // This handles cases like renaming "Item" to "submodule::Item" within the same parent module
+    if target_module_path.kind == PathKind::Plain {
+        // Plain paths are relative - check if they extend the current module
+        let current_segments = current_module_path.segments();
+        let target_segments = target_module_path.segments();
+        
+        if target_segments.len() > current_segments.len() {
+            // Check if target starts with current module path
+            return target_segments[..current_segments.len()] == *current_segments;
+        }
+    }
+    
+    false
+}
+
+/// Support both absolute (crate::) and relative path specifications (Requirements 5.2, 5.3)
+pub fn normalize_target_path(
+    current_module_path: &ModPath,
+    target_path_str: &str,
+    db: &dyn ExpandDatabase,
+) -> Result<ModPath> {
+    let parsed_path = parse_rename_target(target_path_str, db)?;
+    
+    match parsed_path.kind {
+        PathKind::Crate | PathKind::Super(_) | PathKind::Abs => {
+            // Absolute path - use as-is (Requirement 5.3)
+            Ok(parsed_path)
+        }
+        PathKind::Plain => {
+            // Relative path - resolve relative to current module (Requirement 5.2)
+            let mut resolved_segments = current_module_path.segments().to_vec();
+            resolved_segments.extend(parsed_path.segments().iter().cloned());
+            
+            Ok(ModPath::from_segments(current_module_path.kind, resolved_segments))
+        }
+        PathKind::DollarCrate(_) => {
+            // Dollar crate paths are treated as absolute
+            Ok(parsed_path)
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum IdentifierKind {
     Ident,
@@ -707,5 +935,180 @@ impl IdentifierKind {
             },
             None => bail!("Invalid name `{}`: not an identifier", new_name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hir::PathKind;
+    use crate::RootDatabase;
+    use test_fixture::WithFixture;
+
+    #[test]
+    fn test_parse_rename_target_simple() {
+        let db = RootDatabase::with_files("");
+        
+        // Test simple identifier
+        let result = parse_rename_target("foo", &db);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.kind, PathKind::Plain);
+        assert_eq!(path.segments().len(), 1);
+        assert_eq!(path.segments()[0].as_str(), "foo");
+    }
+
+    #[test]
+    fn test_parse_rename_target_qualified() {
+        let db = RootDatabase::with_files("");
+        
+        // Test fully-qualified path
+        let result = parse_rename_target("crate::module::Item", &db);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.kind, PathKind::Crate);
+        assert_eq!(path.segments().len(), 2);
+        assert_eq!(path.segments()[0].as_str(), "module");
+        assert_eq!(path.segments()[1].as_str(), "Item");
+    }
+
+    #[test]
+    fn test_parse_fully_qualified_path() {
+        let db = RootDatabase::with_files("");
+        
+        // Test extracting module path and item name
+        let result = parse_fully_qualified_path("crate::module::submodule::Item", &db);
+        assert!(result.is_ok());
+        let (module_path, item_name) = result.unwrap();
+        
+        assert_eq!(module_path.kind, PathKind::Crate);
+        assert_eq!(module_path.segments().len(), 2);
+        assert_eq!(module_path.segments()[0].as_str(), "module");
+        assert_eq!(module_path.segments()[1].as_str(), "submodule");
+        assert_eq!(item_name.as_str(), "Item");
+    }
+
+    #[test]
+    fn test_parse_fully_qualified_path_crate_root() {
+        let db = RootDatabase::with_files("");
+        
+        // Test item in crate root
+        let result = parse_fully_qualified_path("crate::Item", &db);
+        assert!(result.is_ok());
+        let (module_path, item_name) = result.unwrap();
+        
+        assert_eq!(module_path.kind, PathKind::Crate);
+        assert_eq!(module_path.segments().len(), 0);
+        assert_eq!(item_name.as_str(), "Item");
+    }
+
+    #[test]
+    fn test_parse_invalid_path() {
+        let db = RootDatabase::with_files("");
+        
+        // Test invalid syntax
+        let result = parse_rename_target("invalid!@#", &db);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("Invalid path syntax"));
+    }
+
+    #[test]
+    fn test_compare_paths_same_location() {
+        // Test same module paths (Requirement 5.1)
+        let path1 = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("module")]);
+        let path2 = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("module")]);
+        
+        let result = compare_paths(&path1, &path2);
+        assert_eq!(result, PathComparison::SameLocation);
+    }
+
+    #[test]
+    fn test_compare_paths_different_module() {
+        // Test different module paths (Requirement 1.2)
+        let path1 = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("module1")]);
+        let path2 = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("module2")]);
+        
+        let result = compare_paths(&path1, &path2);
+        assert_eq!(result, PathComparison::DifferentModule);
+    }
+
+    #[test]
+    fn test_compare_paths_crate_root() {
+        // Test crate root paths
+        let path1 = ModPath::from_kind(PathKind::Crate);
+        let path2 = ModPath::from_kind(PathKind::Crate);
+        
+        let result = compare_paths(&path1, &path2);
+        assert_eq!(result, PathComparison::SameLocation);
+    }
+
+    #[test]
+    fn test_compare_paths_nested_modules() {
+        // Test nested module paths
+        let path1 = ModPath::from_segments(PathKind::Crate, vec![
+            Name::new_root("module"), 
+            Name::new_root("submodule")
+        ]);
+        let path2 = ModPath::from_segments(PathKind::Crate, vec![
+            Name::new_root("module"), 
+            Name::new_root("other")
+        ]);
+        
+        let result = compare_paths(&path1, &path2);
+        assert_eq!(result, PathComparison::DifferentModule);
+    }
+
+    #[test]
+    fn test_is_relative_path_in_same_module() {
+        // Test relative path detection (Requirement 5.2)
+        let current = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("module")]);
+        let target = ModPath::from_segments(PathKind::Plain, vec![
+            Name::new_root("module"), 
+            Name::new_root("submodule")
+        ]);
+        
+        let result = is_relative_path_in_same_module(&current, &target);
+        assert!(result);
+    }
+
+    #[test]
+    fn test_is_not_relative_path_different_module() {
+        // Test non-relative path detection
+        let current = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("module1")]);
+        let target = ModPath::from_segments(PathKind::Plain, vec![Name::new_root("module2")]);
+        
+        let result = is_relative_path_in_same_module(&current, &target);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_normalize_target_path_absolute() {
+        let db = RootDatabase::with_files("");
+        let current = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("current")]);
+        
+        // Test absolute path normalization (Requirement 5.3)
+        let result = normalize_target_path(&current, "crate::target::Item", &db);
+        assert!(result.is_ok());
+        let normalized = result.unwrap();
+        assert_eq!(normalized.kind, PathKind::Crate);
+        assert_eq!(normalized.segments().len(), 2);
+        assert_eq!(normalized.segments()[0].as_str(), "target");
+        assert_eq!(normalized.segments()[1].as_str(), "Item");
+    }
+
+    #[test]
+    fn test_normalize_target_path_relative() {
+        let db = RootDatabase::with_files("");
+        let current = ModPath::from_segments(PathKind::Crate, vec![Name::new_root("current")]);
+        
+        // Test relative path normalization (Requirement 5.2)
+        let result = normalize_target_path(&current, "submodule::Item", &db);
+        assert!(result.is_ok());
+        let normalized = result.unwrap();
+        assert_eq!(normalized.kind, PathKind::Crate);
+        assert_eq!(normalized.segments().len(), 3);
+        assert_eq!(normalized.segments()[0].as_str(), "current");
+        assert_eq!(normalized.segments()[1].as_str(), "submodule");
+        assert_eq!(normalized.segments()[2].as_str(), "Item");
     }
 }
