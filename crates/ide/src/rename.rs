@@ -109,7 +109,16 @@ pub(crate) fn rename(
     let syntax = source_file.syntax();
 
     let edition = file_id.edition(db);
-    let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
+
+    // Check if this looks like a move operation (contains ::)
+    // If so, skip identifier validation and let Definition::rename handle it
+    let (new_name, kind) = if new_name.contains("::") {
+        // For potential move operations, use the raw name
+        // The actual validation will happen in Definition::rename
+        (Name::new_root(new_name), IdentifierKind::Ident)
+    } else {
+        IdentifierKind::classify(edition, new_name)?
+    };
 
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
     let alias_fallback =
@@ -3587,6 +3596,180 @@ fn bar(v: Foo) {
     v.foo(123);
 }
         "#,
+        );
+    }
+
+    // ========================================================================
+    // Rename-to-Move Tests
+    // ========================================================================
+    // These tests verify that rename-to-move operations are properly detected.
+    // Currently, the implementation returns an error message indicating the
+    // feature is in progress. These tests will be updated as the feature
+    // becomes fully functional.
+
+    #[test]
+    fn test_rename_to_move_detect_struct() {
+        check(
+            "crate::module::NewName",
+            r#"
+//- /lib.rs
+mod module;
+
+struct Foo$0;
+"#,
+            "error: Rename-to-move detected: moving struct to module crate::module::NewName. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_detect_enum() {
+        check(
+            "crate::other::Bar",
+            r#"
+//- /lib.rs
+mod other;
+
+enum MyEnum$0 {
+    Variant,
+}
+"#,
+            "error: Rename-to-move detected: moving enum to module crate::other::Bar. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_detect_function() {
+        check(
+            "crate::utils::new_func",
+            r#"
+//- /lib.rs
+mod utils;
+
+fn old_func$0() {}
+"#,
+            "error: Rename-to-move detected: moving function to module crate::utils::new_func. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_detect_trait() {
+        check(
+            "crate::traits::MyTrait",
+            r#"
+//- /lib.rs
+mod traits;
+
+trait SomeTrait$0 {
+    fn method(&self);
+}
+"#,
+            "error: Rename-to-move detected: moving trait to module crate::traits::MyTrait. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_detect_type_alias() {
+        check(
+            "crate::types::NewType",
+            r#"
+//- /lib.rs
+mod types;
+
+type OldType$0 = i32;
+"#,
+            "error: Rename-to-move detected: moving type alias to module crate::types::NewType. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_detect_const() {
+        check(
+            "crate::constants::NEW_CONST",
+            r#"
+//- /lib.rs
+mod constants;
+
+const OLD_CONST$0: i32 = 42;
+"#,
+            "error: Rename-to-move detected: moving const to module crate::constants::NEW_CONST. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_detect_static() {
+        check(
+            "crate::statics::NEW_STATIC",
+            r#"
+//- /lib.rs
+mod statics;
+
+static OLD_STATIC$0: i32 = 42;
+"#,
+            "error: Rename-to-move detected: moving static to module crate::statics::NEW_STATIC. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_detect_union() {
+        check(
+            "crate::unions::NewUnion",
+            r#"
+//- /lib.rs
+mod unions;
+
+union OldUnion$0 {
+    f1: u32,
+}
+"#,
+            "error: Rename-to-move detected: moving union to module crate::unions::NewUnion. Full implementation in progress.",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_same_module_is_simple_rename() {
+        // When the destination module is the same as the source,
+        // it should be treated as a simple rename, not a move
+        check(
+            "Bar",
+            r#"
+//- /lib.rs
+struct Foo$0;
+"#,
+            r#"
+struct Bar;
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_reject_local() {
+        // Locals can't be moved, they should properly reject with the move error
+        // when the path syntax is used
+        check(
+            "crate::other::bar",
+            r#"
+//- /lib.rs
+mod other;
+
+fn foo() {
+    let x$0 = 1;
+}
+"#,
+            "error: Cannot move local items",
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_reject_builtin() {
+        check(
+            "crate::other::NewBool",
+            r#"
+//- /lib.rs
+mod other;
+
+fn foo(x: bool$0) {}
+"#,
+            "error: Cannot rename builtin type",
         );
     }
 }

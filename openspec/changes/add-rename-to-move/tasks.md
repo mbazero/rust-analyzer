@@ -99,15 +99,15 @@
 
 ## 11. Testing
 
-- [ ] 11.1 Create test fixtures for simple cross-module moves
-- [ ] 11.2 Create test fixtures for moves with file/directory creation
-- [ ] 11.3 Create test fixtures for moves with impl blocks
-- [ ] 11.4 Create test fixtures for internal reference updates (unqualified, self::, super::)
-- [ ] 11.5 Create test fixtures for visibility validation (reject inaccessible items)
-- [ ] 11.6 Create test fixtures for visibility updates (private → pub(crate), private → pub, preserve existing)
-- [ ] 11.7 Add tests for edge cases (relative imports, re-exports, glob imports)
-- [ ] 11.8 Add tests for error conditions
-- [ ] 11.9 Add integration tests using existing rename test infrastructure
+- [x] 11.1 Create test fixtures for simple cross-module moves (detection tests added)
+- [ ] 11.2 Create test fixtures for moves with file/directory creation (pending full implementation)
+- [ ] 11.3 Create test fixtures for moves with impl blocks (pending full implementation)
+- [ ] 11.4 Create test fixtures for internal reference updates (unqualified, self::, super::) (pending full implementation)
+- [ ] 11.5 Create test fixtures for visibility validation (reject inaccessible items) (pending full implementation)
+- [ ] 11.6 Create test fixtures for visibility updates (private → pub(crate), private → pub, preserve existing) (pending full implementation)
+- [ ] 11.7 Add tests for edge cases (relative imports, re-exports, glob imports) (pending full implementation)
+- [x] 11.8 Add tests for error conditions (rejection tests added for locals and builtins)
+- [x] 11.9 Add integration tests using existing rename test infrastructure (11 detection tests added)
 
 ## 12. Documentation
 

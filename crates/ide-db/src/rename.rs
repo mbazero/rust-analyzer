@@ -488,6 +488,17 @@ fn rename_reference(
     rename_definition: RenameDefinition,
     edition: Edition,
 ) -> Result<SourceChange> {
+    // Check if this looks like a move operation (contains ::)
+    // Items that reach rename_reference don't support moves
+    if new_name.contains("::") {
+        // Provide specific error for local variables
+        if matches!(def, Definition::Local(_)) {
+            bail!("Cannot move local items");
+        }
+        // For other non-movable items, fall through to normal identifier validation
+        // which will provide an appropriate error
+    }
+
     let (mut new_name, ident_kind) = IdentifierKind::classify(edition, new_name)?;
 
     if matches!(
