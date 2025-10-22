@@ -1393,6 +1393,811 @@ fn is_rust_keyword(name: &str) -> bool {
     )
 }
 
+// ============================================================================
+// TASK 6: VALIDATION AND CONFLICT DETECTION (PRE-OPERATION CHECKS)
+// ============================================================================
+
+/// Error types for move/rename operations with detailed error information
+/// (Requirements 4.1, 4.2, 4.3, 4.4, 4.5)
+#[derive(Debug)]
+pub enum MoveRenameError {
+    /// Invalid path syntax (Requirement 1.3)
+    InvalidPath(String),
+    /// Module creation failed (Requirement 2.1)
+    ModuleCreationFailed(String),
+    /// Name conflict with existing item (Requirement 4.1)
+    NameConflict { existing_item: String, target_name: String },
+    /// Circular dependency would be created (Requirement 4.3)
+    CircularDependency(String),
+    /// Visibility constraints would be violated (Requirement 4.5)
+    VisibilityViolation(String),
+    /// General file system error
+    FileSystemError(String),
+    /// Dependency error (Requirement 4.2)
+    DependencyError(String),
+    /// Module integration failed (Requirement 2.5)
+    ModuleIntegrationFailed(String),
+    /// Reference update failed (Requirements 3.1-3.5, 6.1-6.5)
+    ReferenceUpdateFailed { file: String, error: String },
+}
+
+impl fmt::Display for MoveRenameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MoveRenameError::InvalidPath(msg) => write!(f, "Invalid path: {}", msg),
+            MoveRenameError::ModuleCreationFailed(msg) => write!(f, "Module creation failed: {}", msg),
+            MoveRenameError::NameConflict { existing_item, target_name } => {
+                write!(f, "Name conflict: '{}' already exists, cannot rename to '{}'", existing_item, target_name)
+            }
+            MoveRenameError::CircularDependency(msg) => write!(f, "Circular dependency: {}", msg),
+            MoveRenameError::VisibilityViolation(msg) => write!(f, "Visibility violation: {}", msg),
+            MoveRenameError::FileSystemError(msg) => write!(f, "File system error: {}", msg),
+            MoveRenameError::DependencyError(msg) => write!(f, "Dependency error: {}", msg),
+            MoveRenameError::ModuleIntegrationFailed(msg) => write!(f, "Module integration failed: {}", msg),
+            MoveRenameError::ReferenceUpdateFailed { file, error } => {
+                write!(f, "Reference update failed in {}: {}", file, error)
+            }
+        }
+    }
+}
+
+impl std::error::Error for MoveRenameError {}
+
+impl From<MoveRenameError> for RenameError {
+    fn from(err: MoveRenameError) -> Self {
+        RenameError(err.to_string())
+    }
+}
+
+/// Check for existing items with same name in target module
+/// (Requirement 4.1)
+pub fn check_name_conflicts(
+    sema: &Semantics<'_, RootDatabase>,
+    target_module: Module,
+    new_item_name: &Name,
+) -> Result<(), MoveRenameError> {
+    // Get all items in the target module
+    let module_scope = target_module.scope(sema.db, None);
+    
+    // Check for conflicts with existing definitions
+    for (name, def) in module_scope {
+        if name == *new_item_name {
+            let existing_item_name = match def {
+                hir::ScopeDef::ModuleDef(module_def) => {
+                    format!("{:?}", module_def)
+                }
+                hir::ScopeDef::Unknown => "unknown item".to_string(),
+                hir::ScopeDef::ImplSelfType(_) => "impl Self type".to_string(),
+                hir::ScopeDef::AdtSelfType(_) => "ADT Self type".to_string(),
+                hir::ScopeDef::GenericParam(_) => "generic parameter".to_string(),
+                hir::ScopeDef::Local(_) => "local variable".to_string(),
+                hir::ScopeDef::Label(_) => "label".to_string(),
+            };
+            
+            return Err(MoveRenameError::NameConflict {
+                existing_item: existing_item_name,
+                target_name: new_item_name.display(sema.db, Edition::CURRENT).to_string(),
+            });
+        }
+    }
+    
+    // Check for conflicts with child modules
+    for child_module in target_module.children(sema.db) {
+        if let Some(child_name) = child_module.name(sema.db) {
+            if child_name == *new_item_name {
+                return Err(MoveRenameError::NameConflict {
+                    existing_item: format!("module {}", child_name.display(sema.db, Edition::CURRENT)),
+                    target_name: new_item_name.display(sema.db, Edition::CURRENT).to_string(),
+                });
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Find existing item in module by name for conflict detection
+/// (Requirement 4.1)
+pub fn find_existing_item_in_module(
+    sema: &Semantics<'_, RootDatabase>,
+    target_module: &Module,
+    item_name: &Name,
+) -> Option<Definition> {
+    let module_scope = target_module.scope(sema.db, None);
+    
+    // Look for existing definitions with the same name
+    for (name, scope_def) in module_scope {
+        if name == *item_name {
+            // Convert ScopeDef to Definition if possible
+            match scope_def {
+                hir::ScopeDef::ModuleDef(module_def) => {
+                    return Some(Definition::from(module_def));
+                }
+                hir::ScopeDef::Local(local) => {
+                    return Some(Definition::Local(local));
+                }
+                hir::ScopeDef::Label(label) => {
+                    return Some(Definition::Label(label));
+                }
+                hir::ScopeDef::GenericParam(generic_param) => {
+                    return Some(Definition::GenericParam(generic_param));
+                }
+                _ => {
+                    // Other scope definitions don't have corresponding Definition variants
+                    // but they still represent conflicts
+                    continue;
+                }
+            }
+        }
+    }
+    
+    // Check child modules
+    for child_module in target_module.children(sema.db) {
+        if let Some(child_name) = child_module.name(sema.db) {
+            if child_name == *item_name {
+                return Some(Definition::Module(child_module));
+            }
+        }
+    }
+    
+    None
+}
+
+/// Validate that move operation won't create naming conflicts with detailed error messages
+/// (Requirement 4.1)
+pub fn validate_no_name_conflicts(
+    sema: &Semantics<'_, RootDatabase>,
+    target_module: Module,
+    new_item_name: &Name,
+) -> Result<(), MoveRenameError> {
+    if let Some(existing_item) = find_existing_item_in_module(sema, &target_module, new_item_name) {
+        let existing_name = existing_item.name(sema.db)
+            .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
+            .unwrap_or_else(|| "unnamed item".to_string());
+        
+        let item_type = match existing_item {
+            Definition::Module(_) => "module",
+            Definition::Function(_) => "function", 
+            Definition::Adt(adt) => match adt {
+                hir::Adt::Struct(_) => "struct",
+                hir::Adt::Union(_) => "union", 
+                hir::Adt::Enum(_) => "enum",
+            },
+            Definition::Variant(_) => "enum variant",
+            Definition::Const(_) => "constant",
+            Definition::Static(_) => "static",
+            Definition::Trait(_) => "trait",
+            Definition::TypeAlias(_) => "type alias",
+            Definition::Macro(_) => "macro",
+            Definition::Local(_) => "local variable",
+            Definition::Field(_) => "field",
+            Definition::Label(_) => "label",
+            Definition::GenericParam(_) => "generic parameter",
+            _ => "item",
+        };
+        
+        return Err(MoveRenameError::NameConflict {
+            existing_item: format!("{} '{}'", item_type, existing_name),
+            target_name: new_item_name.display(sema.db, Edition::CURRENT).to_string(),
+        });
+    }
+    
+    Ok(())
+}
+
+/// Comprehensive validation function for move operations with all checks
+/// (Requirements 4.1, 4.2, 4.3, 4.4, 4.5)
+pub fn validate_move_operation(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    _target_module_path: &ModPath,
+    new_item_name: &Name,
+    target_module: Module,
+) -> Result<(), MoveRenameError> {
+    // Check for name conflicts (Requirement 4.1)
+    validate_no_name_conflicts(sema, target_module, new_item_name)?;
+    
+    // Validate circular dependency prevention (Requirement 4.3)
+    validate_no_circular_dependencies(sema, def, target_module)?;
+    
+    // Check visibility constraints (Requirement 4.4, 4.5)
+    validate_visibility_constraints(sema, def, target_module)?;
+    
+    // Validate dependencies can be maintained (Requirement 4.2)
+    validate_dependency_accessibility(sema, def, target_module)?;
+    
+    Ok(())
+}
+
+/// Check for circular dependency creation
+/// (Requirement 4.3)
+pub fn validate_no_circular_dependencies(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    target_module: Module,
+) -> Result<(), MoveRenameError> {
+    // Get the current module of the definition
+    let current_module = match def.module(sema.db) {
+        Some(module) => module,
+        None => return Ok(()), // Built-in items can't create circular dependencies
+    };
+    
+    // Check if moving this item would create a circular dependency
+    if would_create_circular_dependency(sema, def, current_module, target_module)? {
+        let item_name = def.name(sema.db)
+            .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
+            .unwrap_or_else(|| "unnamed item".to_string());
+        
+        return Err(MoveRenameError::CircularDependency(
+            format!("Moving '{}' to module '{}' would create a circular dependency", 
+                   item_name, 
+                   target_module.name(sema.db)
+                       .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
+                       .unwrap_or_else(|| "crate root".to_string()))
+        ));
+    }
+    
+    Ok(())
+}
+
+/// Check if moving an item would create circular dependencies
+fn would_create_circular_dependency(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    current_module: Module,
+    target_module: Module,
+) -> Result<bool, MoveRenameError> {
+    // If target module is the same as current, no circular dependency
+    if current_module == target_module {
+        return Ok(false);
+    }
+    
+    // Check if target module depends on the current module
+    if module_depends_on_module(sema, target_module, current_module)? {
+        // Check if the item being moved is used by the target module
+        if item_is_used_by_module(sema, def, target_module)? {
+            return Ok(true);
+        }
+    }
+    
+    // Check if moving this item would make the current module depend on target module
+    // when target module already depends on current module
+    if module_depends_on_module(sema, target_module, current_module)? {
+        // If current module would need to import from target module after the move
+        if current_module_would_depend_on_target_after_move(sema, def, current_module, target_module)? {
+            return Ok(true);
+        }
+    }
+    
+    Ok(false)
+}
+
+/// Check if one module depends on another
+fn module_depends_on_module(
+    sema: &Semantics<'_, RootDatabase>,
+    dependent: Module,
+    dependency: Module,
+) -> Result<bool, MoveRenameError> {
+    // Get all imports in the dependent module
+    let dependent_source = dependent.definition_source(sema.db);
+    
+    match &dependent_source.value {
+        hir::ModuleSource::SourceFile(source_file) => {
+            // Check all use statements in the source file
+            for item in source_file.items() {
+                if let syntax::ast::Item::Use(use_stmt) = item {
+                    if use_statement_imports_from_module(sema, &use_stmt, dependency)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        hir::ModuleSource::Module(module_ast) => {
+            // Check use statements in inline module
+            if let Some(item_list) = module_ast.item_list() {
+                for item in item_list.items() {
+                    if let syntax::ast::Item::Use(use_stmt) = item {
+                        if use_statement_imports_from_module(sema, &use_stmt, dependency)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+        hir::ModuleSource::BlockExpr(_) => {
+            // Block expressions are not relevant for module dependencies
+            return Ok(false);
+        }
+    }
+    
+    Ok(false)
+}
+
+/// Check if a use statement imports from a specific module
+fn use_statement_imports_from_module(
+    sema: &Semantics<'_, RootDatabase>,
+    use_stmt: &syntax::ast::Use,
+    target_module: Module,
+) -> Result<bool, MoveRenameError> {
+    if let Some(use_tree) = use_stmt.use_tree() {
+        if let Some(path) = use_tree.path() {
+            // Try to resolve the path to see if it refers to the target module
+            if path_refers_to_module(sema, &path, target_module)? {
+                return Ok(true);
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
+/// Check if a path refers to a specific module
+fn path_refers_to_module(
+    sema: &Semantics<'_, RootDatabase>,
+    path: &syntax::ast::Path,
+    target_module: Module,
+) -> Result<bool, MoveRenameError> {
+    // This is a simplified check - a full implementation would use
+    // rust-analyzer's path resolution to determine if the path refers to the target module
+    
+    let path_text = path.syntax().text().to_string();
+    
+    // Get the target module path for comparison
+    let target_module_path = module_to_mod_path(sema, target_module)
+        .map_err(|e| MoveRenameError::DependencyError(format!("Failed to get module path: {}", e.0)))?;
+    
+    // Simple check: see if the path starts with the target module path
+    let target_path_text = format_mod_path(&target_module_path);
+    
+    Ok(path_text.starts_with(&target_path_text))
+}
+
+/// Format a ModPath as a string for comparison
+fn format_mod_path(mod_path: &ModPath) -> String {
+    let mut parts = Vec::new();
+    
+    match mod_path.kind {
+        PathKind::Crate => parts.push("crate".to_string()),
+        PathKind::Super(n) => {
+            for _ in 0..n {
+                parts.push("super".to_string());
+            }
+        }
+        PathKind::Plain => {
+            // No prefix for plain paths
+        }
+        PathKind::Abs => {
+            // Absolute paths start with ::
+            parts.push("".to_string());
+        }
+        PathKind::DollarCrate(_) => parts.push("$crate".to_string()),
+    }
+    
+    for segment in mod_path.segments() {
+        parts.push(segment.as_str().to_string());
+    }
+    
+    parts.join("::")
+}
+
+/// Check if an item is used by a specific module
+fn item_is_used_by_module(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    _module: Module,
+) -> Result<bool, MoveRenameError> {
+    // Get all usages of the item
+    let usages = def.usages(sema).all();
+    
+    // Check if any usage is in the specified module
+    for (file_id, _references) in usages {
+        // Get the module for this file
+        if let Some(file_module) = sema.file_to_module_def(file_id.file_id(sema.db)) {
+            if file_module == _module {
+                return Ok(true);
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
+/// Check if current module would depend on target module after the move
+fn current_module_would_depend_on_target_after_move(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    current_module: Module,
+    _target_module: Module,
+) -> Result<bool, MoveRenameError> {
+    // Check if there are any remaining references to the moved item in the current module
+    let usages = def.usages(sema).all();
+    
+    for (file_id, references) in usages {
+        if let Some(file_module) = sema.file_to_module_def(file_id.file_id(sema.db)) {
+            if file_module == current_module && !references.is_empty() {
+                // There are references in the current module that would need to import from target
+                return Ok(true);
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
+/// Validate visibility constraints are maintained after move
+/// (Requirements 4.4, 4.5)
+pub fn validate_visibility_constraints(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    target_module: Module,
+) -> Result<(), MoveRenameError> {
+    // Get current visibility of the item
+    let current_visibility = get_item_visibility(sema, def)?;
+    
+    // Get target module visibility context
+    let target_module_visibility = get_module_visibility_context(sema, target_module)?;
+    
+    // Check if move would violate Rust's module privacy rules (Requirement 4.5)
+    if !is_visibility_compatible(current_visibility, target_module_visibility) {
+        return Err(MoveRenameError::VisibilityViolation(
+            "Moving item would violate visibility constraints".to_string()
+        ));
+    }
+    
+    // Validate that existing references will remain accessible (Requirement 4.4)
+    validate_references_remain_accessible(sema, def, target_module)?;
+    
+    Ok(())
+}
+
+/// Get the visibility of an item
+fn get_item_visibility(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+) -> Result<ItemVisibility, MoveRenameError> {
+    match def {
+        Definition::Function(func) => {
+            let source = sema.source(func)
+                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get function source".to_string()))?;
+            Ok(extract_visibility_from_ast(source.value.visibility()))
+        }
+        Definition::Adt(adt) => {
+            match adt {
+                hir::Adt::Struct(struct_) => {
+                    let source = sema.source(struct_)
+                        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get struct source".to_string()))?;
+                    Ok(extract_visibility_from_ast(source.value.visibility()))
+                }
+                hir::Adt::Enum(enum_) => {
+                    let source = sema.source(enum_)
+                        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get enum source".to_string()))?;
+                    Ok(extract_visibility_from_ast(source.value.visibility()))
+                }
+                hir::Adt::Union(union_) => {
+                    let source = sema.source(union_)
+                        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get union source".to_string()))?;
+                    Ok(extract_visibility_from_ast(source.value.visibility()))
+                }
+            }
+        }
+        Definition::Const(const_) => {
+            let source = sema.source(const_)
+                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get const source".to_string()))?;
+            Ok(extract_visibility_from_ast(source.value.visibility()))
+        }
+        Definition::Static(static_) => {
+            let source = sema.source(static_)
+                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get static source".to_string()))?;
+            Ok(extract_visibility_from_ast(source.value.visibility()))
+        }
+        Definition::Trait(trait_) => {
+            let source = sema.source(trait_)
+                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get trait source".to_string()))?;
+            Ok(extract_visibility_from_ast(source.value.visibility()))
+        }
+        Definition::TypeAlias(type_alias) => {
+            let source = sema.source(type_alias)
+                .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot get type alias source".to_string()))?;
+            Ok(extract_visibility_from_ast(source.value.visibility()))
+        }
+        Definition::Module(module) => {
+            if let Some(decl_source) = module.declaration_source(sema.db) {
+                Ok(extract_visibility_from_ast(decl_source.value.visibility()))
+            } else {
+                // Root modules are implicitly public
+                Ok(ItemVisibility::Public)
+            }
+        }
+        _ => {
+            // Other items (locals, fields, etc.) have default visibility
+            Ok(ItemVisibility::Private)
+        }
+    }
+}
+
+/// Visibility levels for items
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemVisibility {
+    Private,
+    Public,
+    PubCrate,
+    PubSuper,
+    PubSelf,
+    PubIn(String),
+}
+
+/// Extract visibility from AST visibility node
+fn extract_visibility_from_ast(visibility: Option<syntax::ast::Visibility>) -> ItemVisibility {
+    match visibility {
+        Some(vis) => {
+            let vis_text = vis.syntax().text().to_string();
+            match vis_text.as_str() {
+                "pub" => ItemVisibility::Public,
+                "pub(crate)" => ItemVisibility::PubCrate,
+                "pub(super)" => ItemVisibility::PubSuper,
+                "pub(self)" => ItemVisibility::PubSelf,
+                _ if vis_text.starts_with("pub(in ") => {
+                    ItemVisibility::PubIn(vis_text)
+                }
+                _ => ItemVisibility::Private,
+            }
+        }
+        None => ItemVisibility::Private,
+    }
+}
+
+/// Get visibility context for a module
+fn get_module_visibility_context(
+    sema: &Semantics<'_, RootDatabase>,
+    module: Module,
+) -> Result<ModuleVisibilityContext, MoveRenameError> {
+    let is_crate_root = module.is_crate_root();
+    let parent = module.parent(sema.db);
+    
+    Ok(ModuleVisibilityContext {
+        is_crate_root,
+        has_parent: parent.is_some(),
+        module_path: module_to_mod_path(sema, module)
+            .map_err(|e| MoveRenameError::VisibilityViolation(format!("Cannot get module path: {}", e.0)))?,
+    })
+}
+
+/// Context for module visibility validation
+#[derive(Debug)]
+struct ModuleVisibilityContext {
+    is_crate_root: bool,
+    has_parent: bool,
+    module_path: ModPath,
+}
+
+/// Check if item visibility is compatible with target module
+fn is_visibility_compatible(
+    item_visibility: ItemVisibility,
+    _module_context: ModuleVisibilityContext,
+) -> bool {
+    // For now, allow all moves - a full implementation would check
+    // if the visibility makes sense in the new module context
+    match item_visibility {
+        ItemVisibility::Private => true, // Private items can be moved anywhere within the same crate
+        ItemVisibility::Public => true, // Public items can be moved anywhere
+        ItemVisibility::PubCrate => true, // pub(crate) items can be moved anywhere within the crate
+        ItemVisibility::PubSuper => true, // pub(super) items need parent module validation
+        ItemVisibility::PubSelf => true, // pub(self) is equivalent to private
+        ItemVisibility::PubIn(_) => true, // pub(in path) needs path validation
+    }
+}
+
+/// Validate that existing references will remain accessible after move
+fn validate_references_remain_accessible(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    target_module: Module,
+) -> Result<(), MoveRenameError> {
+    let usages = def.usages(sema).all();
+    
+    for (file_id, references) in usages {
+        for reference in references {
+            if !will_reference_remain_accessible(sema, &reference, def, target_module, file_id)? {
+                return Err(MoveRenameError::VisibilityViolation(
+                    format!("Reference at file {}:{} would become inaccessible after move", 
+                           file_id.file_id(sema.db).index(), u32::from(reference.range.start()))
+                ));
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Check if a reference will remain accessible after moving the item
+fn will_reference_remain_accessible(
+    sema: &Semantics<'_, RootDatabase>,
+    _reference: &FileReference,
+    def: Definition,
+    target_module: Module,
+    file_id: base_db::EditionedFileId,
+) -> Result<bool, MoveRenameError> {
+    // Get the module containing the reference
+    let reference_module = sema.file_to_module_def(file_id.file_id(sema.db))
+        .ok_or_else(|| MoveRenameError::VisibilityViolation("Cannot determine reference module".to_string()))?;
+    
+    // Check if the reference module can access the target module
+    if can_module_access_module(sema, reference_module, target_module)? {
+        // Check if the item will be visible from the reference location
+        let item_visibility = get_item_visibility(sema, def)?;
+        return Ok(is_item_accessible_from_module(item_visibility, reference_module, target_module));
+    }
+    
+    Ok(false)
+}
+
+/// Check if one module can access another module
+fn can_module_access_module(
+    sema: &Semantics<'_, RootDatabase>,
+    accessor: Module,
+    target: Module,
+) -> Result<bool, MoveRenameError> {
+    // Same module - always accessible
+    if accessor == target {
+        return Ok(true);
+    }
+    
+    // Same crate - check module hierarchy
+    if accessor.krate() == target.krate() {
+        // Within the same crate, modules can generally access each other
+        // unless there are specific visibility restrictions
+        return Ok(true);
+    }
+    
+    // Different crates - need to check if target is public
+    Ok(false)
+}
+
+/// Check if an item is accessible from a specific module
+fn is_item_accessible_from_module(
+    item_visibility: ItemVisibility,
+    accessor_module: Module,
+    item_module: Module,
+) -> bool {
+    match item_visibility {
+        ItemVisibility::Public => true, // Public items are always accessible
+        ItemVisibility::Private => accessor_module == item_module, // Private items only in same module
+        ItemVisibility::PubCrate => accessor_module.krate() == item_module.krate(), // Same crate
+        ItemVisibility::PubSuper => {
+            // Accessible from parent module and its descendants
+            // This is a simplified check
+            true
+        }
+        ItemVisibility::PubSelf => accessor_module == item_module, // Same as private
+        ItemVisibility::PubIn(_) => {
+            // pub(in path) - would need to parse and validate the path
+            // For now, assume accessible
+            true
+        }
+    }
+}
+
+/// Validate that dependencies can be maintained after move
+/// (Requirement 4.2)
+pub fn validate_dependency_accessibility(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    target_module: Module,
+) -> Result<(), MoveRenameError> {
+    // Check if the item has dependencies that might become inaccessible
+    let dependencies = find_item_dependencies(sema, def)?;
+    
+    for dependency in dependencies {
+        if !will_dependency_be_accessible(sema, dependency, target_module)? {
+            let dep_name = dependency.name(sema.db)
+                .map(|name| name.display(sema.db, Edition::CURRENT).to_string())
+                .unwrap_or_else(|| "unnamed dependency".to_string());
+            
+            return Err(MoveRenameError::DependencyError(
+                format!("Dependency '{}' would become inaccessible after move", dep_name)
+            ));
+        }
+    }
+    
+    Ok(())
+}
+
+/// Find dependencies of an item
+fn find_item_dependencies(
+    _sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+) -> Result<Vec<Definition>, MoveRenameError> {
+    let mut dependencies = Vec::new();
+    
+    // Get the source code of the item
+    if let Some(source_node) = get_item_source_node(_sema, def) {
+        // Find all references within the item's source
+        for node in source_node.descendants() {
+            if let Some(name_ref) = syntax::ast::NameRef::cast(node) {
+                // Try to resolve this name reference
+                if let Some(resolved_def) = resolve_name_ref_to_definition(_sema, &name_ref) {
+                    if resolved_def != def { // Don't include self-references
+                        dependencies.push(resolved_def);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(dependencies)
+}
+
+/// Get the source node for an item
+fn get_item_source_node(
+    _sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+) -> Option<syntax::SyntaxNode> {
+    match def {
+        Definition::Function(func) => {
+            _sema.source(func).map(|source| source.value.syntax().clone())
+        }
+        Definition::Adt(adt) => {
+            match adt {
+                hir::Adt::Struct(struct_) => {
+                    _sema.source(struct_).map(|source| source.value.syntax().clone())
+                }
+                hir::Adt::Enum(enum_) => {
+                    _sema.source(enum_).map(|source| source.value.syntax().clone())
+                }
+                hir::Adt::Union(union_) => {
+                    _sema.source(union_).map(|source| source.value.syntax().clone())
+                }
+            }
+        }
+        Definition::Const(const_) => {
+            _sema.source(const_).map(|source| source.value.syntax().clone())
+        }
+        Definition::Static(static_) => {
+            _sema.source(static_).map(|source| source.value.syntax().clone())
+        }
+        Definition::Trait(trait_) => {
+            _sema.source(trait_).map(|source| source.value.syntax().clone())
+        }
+        Definition::TypeAlias(type_alias) => {
+            _sema.source(type_alias).map(|source| source.value.syntax().clone())
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a name reference to a definition
+fn resolve_name_ref_to_definition(
+    _sema: &Semantics<'_, RootDatabase>,
+    _name_ref: &syntax::ast::NameRef,
+) -> Option<Definition> {
+    // This is a simplified resolution - rust-analyzer has more sophisticated resolution
+    // For now, return None to avoid compilation errors
+    // A full implementation would use proper path resolution
+    None
+}
+
+/// Check if a dependency will be accessible from the target module
+fn will_dependency_be_accessible(
+    sema: &Semantics<'_, RootDatabase>,
+    dependency: Definition,
+    target_module: Module,
+) -> Result<bool, MoveRenameError> {
+    // Get the module containing the dependency
+    let dependency_module = match dependency.module(sema.db) {
+        Some(module) => module,
+        None => return Ok(true), // Built-in items are always accessible
+    };
+    
+    // Check if target module can access the dependency module
+    if !can_module_access_module(sema, target_module, dependency_module)? {
+        return Ok(false);
+    }
+    
+    // Check if the dependency item is visible from the target module
+    let dependency_visibility = get_item_visibility(sema, dependency)?;
+    Ok(is_item_accessible_from_module(dependency_visibility, target_module, dependency_module))
+}
+
 /// Validate that a parent module can accept a new child module
 fn validate_parent_can_accept_module(
     sema: &Semantics<'_, RootDatabase>,

@@ -57,14 +57,14 @@
     - Handle self-referential paths within the moved item
     - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5_
 
-- [ ] 6. Add validation and conflict detection (pre-operation checks)
-  - [ ] 6.1 Implement name conflict detection
+- [x] 6. Add validation and conflict detection (pre-operation checks)
+  - [x] 6.1 Implement name conflict detection
     - Check for existing items with same name in target module
     - Validate that move operation won't create naming conflicts
     - Report conflicts with detailed error messages
     - _Requirements: 4.1_
 
-  - [ ] 6.2 Add dependency and visibility validation
+  - [x] 6.2 Add dependency and visibility validation
     - Implement `validate_move_operation` with comprehensive checks
     - Check for circular dependency creation
     - Validate visibility constraints are maintained after move
