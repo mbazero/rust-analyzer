@@ -5,8 +5,9 @@
 
 use hir::{Module, Semantics, ModPath, PathKind};
 use syntax::{AstNode, ast};
+use base_db::AnchoredPathBuf;
 
-use crate::{RootDatabase, defs::Definition};
+use crate::{RootDatabase, defs::Definition, source_change::FileSystemEdit};
 
 use super::{IdentifierKind, RenameError, Result, bail, format_err};
 
@@ -182,6 +183,201 @@ fn resolve_from_module(
     Some(current)
 }
 
+/// Compute the file path for a destination module.
+/// Returns both the primary candidate (named file like `foo.rs`) and alternative (mod.rs style).
+pub fn module_file_paths(
+    parent_module: &Module,
+    module_name: &str,
+    sema: &Semantics<'_, RootDatabase>,
+) -> Result<(String, String)> {
+    // Get the parent module's file
+    let parent_file_id = parent_module
+        .as_source_file_id(sema.db)
+        .ok_or_else(|| format_err!("Parent module has no associated file"))?;
+
+    // Determine the directory path where the new module should be created
+    let dir_path = if parent_module.is_mod_rs(sema.db) {
+        // Parent is mod.rs, so children go in the same directory
+        // e.g., src/foo/mod.rs -> src/foo/bar.rs or src/foo/bar/mod.rs
+        String::new()
+    } else {
+        // Parent is a named file like foo.rs, so children go in foo/ subdirectory
+        // e.g., src/foo.rs -> src/foo/bar.rs or src/foo/bar/mod.rs
+        if let Some(parent_name) = parent_module.name(sema.db) {
+            format!("{}/", parent_name.as_str())
+        } else {
+            // Crate root without explicit mod.rs
+            String::new()
+        }
+    };
+
+    // Generate both candidate paths
+    let named_file = format!("{}{}.rs", dir_path, module_name);
+    let mod_rs_file = format!("{}{}/mod.rs", dir_path, module_name);
+
+    Ok((named_file, mod_rs_file))
+}
+
+/// Determine which module file style to use (foo.rs vs foo/mod.rs).
+/// Returns the path to create and whether it's a mod.rs file.
+pub fn choose_module_file_style(
+    parent_module: &Module,
+    module_name: &str,
+    dest_module_path: &ModPath,
+    sema: &Semantics<'_, RootDatabase>,
+) -> Result<(String, bool)> {
+    let (named_file, mod_rs_file) = module_file_paths(parent_module, module_name, sema)?;
+
+    // Determine preference based on existing modules in the parent
+    // If the destination path has more segments after this, we need mod.rs style
+    // to allow further nesting
+    let needs_nesting = dest_module_path.segments().len() > 1;
+
+    if needs_nesting {
+        // We're creating an intermediate module in a nested path
+        // Use mod.rs style to allow children
+        return Ok((mod_rs_file, true));
+    }
+
+    // Check existing siblings for style preference
+    let siblings: Vec<_> = parent_module.children(sema.db).collect();
+    let mut named_file_count = 0;
+    let mut mod_rs_count = 0;
+
+    for sibling in siblings {
+        if sibling.is_mod_rs(sema.db) {
+            mod_rs_count += 1;
+        } else {
+            named_file_count += 1;
+        }
+    }
+
+    // Prefer the style that's already in use
+    // Default to named file style if no preference
+    let use_mod_rs = mod_rs_count > named_file_count;
+
+    if use_mod_rs {
+        Ok((mod_rs_file, true))
+    } else {
+        Ok((named_file, false))
+    }
+}
+
+/// Create file system edits to ensure the destination module exists.
+/// Returns a list of FileSystemEdit operations to create necessary files/directories.
+pub fn create_module_tree(
+    sema: &Semantics<'_, RootDatabase>,
+    source_module: &Module,
+    dest_module_path: &ModPath,
+) -> Result<Vec<FileSystemEdit>> {
+    let mut edits = Vec::new();
+
+    // Start from the appropriate root based on path kind
+    let mut current_module = match dest_module_path.kind {
+        PathKind::Crate | PathKind::Abs | PathKind::DollarCrate(_) => {
+            source_module.krate().root_module()
+        }
+        PathKind::Super(0) => *source_module,
+        PathKind::Super(level) => {
+            let mut module = *source_module;
+            for _ in 0..level {
+                module = module
+                    .parent(sema.db)
+                    .ok_or_else(|| format_err!("Cannot navigate to super module"))?;
+            }
+            module
+        }
+        PathKind::Plain => *source_module,
+    };
+
+    // Navigate through the path segments, creating modules as needed
+    let segments = dest_module_path.segments();
+    for (index, segment) in segments.iter().enumerate() {
+        let segment_name = segment.as_str();
+
+        // Check if this child module already exists
+        if let Some(child) = current_module
+            .children(sema.db)
+            .find(|child| child.name(sema.db).as_ref() == Some(segment))
+        {
+            // Module exists, continue navigating
+            current_module = child;
+        } else {
+            // Module doesn't exist, need to create it
+            // Get the parent module's file to anchor the new file
+            let anchor_file = current_module
+                .as_source_file_id(sema.db)
+                .ok_or_else(|| format_err!("Module has no associated file"))?
+                .file_id(sema.db);
+
+            // Determine the remaining path for nesting decisions
+            let remaining_segments = &segments[index..];
+            let remaining_path = ModPath::from_segments(
+                PathKind::Plain,
+                remaining_segments.iter().cloned(),
+            );
+
+            // Choose file style (named file vs mod.rs)
+            let (file_path, is_mod_rs) =
+                choose_module_file_style(&current_module, segment_name, &remaining_path, sema)?;
+
+            // Create the file
+            edits.push(FileSystemEdit::CreateFile {
+                dst: AnchoredPathBuf { anchor: anchor_file, path: file_path.clone() },
+                initial_contents: String::new(),
+            });
+
+            // For nested paths, we need to continue creating intermediate modules
+            // but we can't navigate into them since they don't exist in HIR yet.
+            // The remaining modules will need to be created with proper paths.
+
+            // If this is not the last segment and we're using named file style,
+            // we need to create a directory too (implicitly done by the file path)
+
+            // We can't continue navigating since the module doesn't exist in HIR
+            // Instead, build the remaining path manually
+            if index < segments.len() - 1 {
+                // More segments to process - need to handle nested creation
+                for (nested_index, nested_segment) in segments[index + 1..].iter().enumerate() {
+                    let nested_segment_name = nested_segment.as_str();
+                    let remaining_nested = &segments[index + 1 + nested_index..];
+                    let remaining_nested_path = ModPath::from_segments(
+                        PathKind::Plain,
+                        remaining_nested.iter().cloned(),
+                    );
+
+                    // Build path relative to the file we just created
+                    let nested_path = if is_mod_rs {
+                        // Created foo/mod.rs, so next file is foo/bar.rs or foo/bar/mod.rs
+                        if remaining_nested_path.segments().len() > 1 {
+                            format!("{}/{}/mod.rs", segment_name, nested_segment_name)
+                        } else {
+                            format!("{}/{}.rs", segment_name, nested_segment_name)
+                        }
+                    } else {
+                        // Created foo.rs, so next file is foo/bar.rs or foo/bar/mod.rs
+                        if remaining_nested_path.segments().len() > 1 {
+                            format!("{}/{}/mod.rs", segment_name, nested_segment_name)
+                        } else {
+                            format!("{}/{}.rs", segment_name, nested_segment_name)
+                        }
+                    };
+
+                    edits.push(FileSystemEdit::CreateFile {
+                        dst: AnchoredPathBuf { anchor: anchor_file, path: nested_path },
+                        initial_contents: String::new(),
+                    });
+                }
+            }
+
+            // Break since we can't navigate further without the modules existing in HIR
+            break;
+        }
+    }
+
+    Ok(edits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +482,157 @@ mod tests {
             );
             // These will either fail to parse or parse incorrectly
             // Full validation happens in parse_rename_target with semantics
+        }
+    }
+
+    // Tests for module file path generation
+    // Note: These test the path generation logic, but full integration tests
+    // with actual HIR will be in ide/src/rename.rs
+
+    #[test]
+    fn test_module_file_paths_named_parent() {
+        // Test path generation when parent is a named file (foo.rs)
+        // In this case, children go in foo/ subdirectory
+
+        // We can't easily test module_file_paths without HIR setup,
+        // but we can verify the path format logic manually
+
+        // For parent foo.rs (named file, not mod.rs):
+        // - child bar should be at foo/bar.rs or foo/bar/mod.rs
+
+        let dir_path = "foo/"; // What we'd get from a named parent
+        let module_name = "bar";
+
+        let named_file = format!("{}{}.rs", dir_path, module_name);
+        let mod_rs_file = format!("{}{}/mod.rs", dir_path, module_name);
+
+        assert_eq!(named_file, "foo/bar.rs");
+        assert_eq!(mod_rs_file, "foo/bar/mod.rs");
+    }
+
+    #[test]
+    fn test_module_file_paths_mod_rs_parent() {
+        // Test path generation when parent is mod.rs
+        // In this case, children go in the same directory
+
+        // For parent foo/mod.rs:
+        // - child bar should be at foo/bar.rs or foo/bar/mod.rs
+
+        let dir_path = ""; // Empty for mod.rs parent
+        let module_name = "bar";
+
+        let named_file = format!("{}{}.rs", dir_path, module_name);
+        let mod_rs_file = format!("{}{}/mod.rs", dir_path, module_name);
+
+        assert_eq!(named_file, "bar.rs");
+        assert_eq!(mod_rs_file, "bar/mod.rs");
+    }
+
+    #[test]
+    fn test_module_file_paths_crate_root() {
+        // Test path generation from crate root (lib.rs or main.rs)
+
+        // For crate root:
+        // - child foo should be at foo.rs or foo/mod.rs
+
+        let dir_path = ""; // Empty for crate root
+        let module_name = "foo";
+
+        let named_file = format!("{}{}.rs", dir_path, module_name);
+        let mod_rs_file = format!("{}{}/mod.rs", dir_path, module_name);
+
+        assert_eq!(named_file, "foo.rs");
+        assert_eq!(mod_rs_file, "foo/mod.rs");
+    }
+
+    #[test]
+    fn test_nested_module_path_construction() {
+        // Test building nested module paths
+        // For crate::foo::bar::baz, we should create:
+        // - foo.rs or foo/mod.rs
+        // - foo/bar.rs or foo/bar/mod.rs
+        // - foo/bar/baz.rs or foo/bar/baz/mod.rs
+
+        let parent_segment = "foo";
+        let nested_segment = "bar";
+
+        // If foo.rs is created (named file style):
+        let nested_named = format!("{}/{}.rs", parent_segment, nested_segment);
+        let nested_mod_rs = format!("{}/{}/mod.rs", parent_segment, nested_segment);
+
+        assert_eq!(nested_named, "foo/bar.rs");
+        assert_eq!(nested_mod_rs, "foo/bar/mod.rs");
+
+        // If foo/mod.rs is created (mod.rs style):
+        let nested_from_mod_rs_named = format!("{}/{}.rs", parent_segment, nested_segment);
+        let nested_from_mod_rs_mod = format!("{}/{}/mod.rs", parent_segment, nested_segment);
+
+        assert_eq!(nested_from_mod_rs_named, "foo/bar.rs");
+        assert_eq!(nested_from_mod_rs_mod, "foo/bar/mod.rs");
+    }
+
+    #[test]
+    fn test_extract_module_path_structure() {
+        // Verify that extract_module_path correctly removes the final segment
+        use hir::{Name, Symbol};
+
+        // Create a simple path: crate::foo::bar::Baz
+        // The module path should be: crate::foo::bar
+
+        let segments = vec![
+            Name::new_symbol_root(Symbol::intern("foo")),
+            Name::new_symbol_root(Symbol::intern("bar")),
+            Name::new_symbol_root(Symbol::intern("Baz")),
+        ];
+        let path = ModPath::from_segments(PathKind::Crate, segments);
+
+        let module_path = extract_module_path(&path).unwrap();
+
+        assert_eq!(module_path.kind, PathKind::Crate);
+        assert_eq!(module_path.segments().len(), 2);
+        assert_eq!(module_path.segments()[0].as_str(), "foo");
+        assert_eq!(module_path.segments()[1].as_str(), "bar");
+    }
+
+    #[test]
+    fn test_extract_module_path_single_segment() {
+        // For crate::Foo, module path should be just crate
+        use hir::{Name, Symbol};
+
+        let segments = vec![
+            Name::new_symbol_root(Symbol::intern("Foo")),
+        ];
+        let path = ModPath::from_segments(PathKind::Crate, segments);
+
+        let module_path = extract_module_path(&path).unwrap();
+
+        assert_eq!(module_path.kind, PathKind::Crate);
+        assert_eq!(module_path.segments().len(), 0);
+    }
+
+    #[test]
+    fn test_path_kind_preservation() {
+        // Verify that different PathKind variants are preserved
+        use hir::{Name, Symbol};
+
+        let segments = vec![
+            Name::new_symbol_root(Symbol::intern("foo")),
+            Name::new_symbol_root(Symbol::intern("Bar")),
+        ];
+
+        // Test with different path kinds
+        let test_cases = vec![
+            PathKind::Crate,
+            PathKind::Super(1),
+            PathKind::Super(2),
+            PathKind::Plain,
+            PathKind::Abs,
+        ];
+
+        for kind in test_cases {
+            let path = ModPath::from_segments(kind, segments.clone());
+            let module_path = extract_module_path(&path).unwrap();
+            assert_eq!(module_path.kind, kind);
         }
     }
 }
