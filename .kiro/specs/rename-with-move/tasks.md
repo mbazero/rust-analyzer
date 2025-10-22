@@ -28,14 +28,14 @@
     - Ensure proper module integration into existing module tree
     - _Requirements: 2.2, 2.3, 2.4, 2.5_
 
-- [ ] 4. Implement item movement and module creation
-  - [ ] 4.1 Create file system operations for module structure
+- [x] 4. Implement item movement and module creation
+  - [x] 4.1 Create file system operations for module structure
     - Add directory creation logic with proper error handling
     - Implement module file creation with correct content
     - Add module declarations to parent modules
     - _Requirements: 2.1, 2.4, 2.5_
 
-  - [ ] 4.2 Implement item extraction and insertion
+  - [x] 4.2 Implement item extraction and insertion
     - Extract item definition from source module
     - Insert item into target module with correct formatting
     - Handle visibility modifiers and attributes preservation
