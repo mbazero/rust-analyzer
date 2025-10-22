@@ -63,6 +63,27 @@ struct ModuleDeclarationPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct ItemRelocationPlan {
+    moved_items: Vec<PlannedItem>,
+    destination: RelocationDestination,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedItem {
+    file_id: FileId,
+    editioned_file_id: ide_db::EditionedFileId,
+    range: TextRange,
+    text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RelocationDestination {
+    ExistingFile { file_id: FileId, insert_offset: TextSize },
+    InlineModule { file_id: FileId, insert_offset: TextSize, indent: IndentLevel },
+    NewFile { relative_path: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedRenameTarget {
     final_name_text: String,
     move_target: Option<MoveTarget>,
@@ -482,6 +503,181 @@ fn append_child_declaration_to_new_module(creation: &mut PlannedFileCreation, se
     creation.initial_contents.push_str(";\n");
 }
 
+fn extract_definition_item(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+) -> RenameResult<PlannedItem> {
+    let (editioned_file_id, syntax) = match def {
+        Definition::Function(fun) => {
+            let src = sema.source(*fun).ok_or_else(|| format_err!("Cannot find source for function"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        Definition::Adt(hir::Adt::Struct(strukt)) => {
+            let src = sema.source(*strukt).ok_or_else(|| format_err!("Cannot find source for struct"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        Definition::Adt(hir::Adt::Enum(enm)) => {
+            let src = sema.source(*enm).ok_or_else(|| format_err!("Cannot find source for enum"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        Definition::Adt(hir::Adt::Union(union)) => {
+            let src = sema.source(*union).ok_or_else(|| format_err!("Cannot find source for union"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        Definition::Trait(trait_def) => {
+            let src = sema.source(*trait_def).ok_or_else(|| format_err!("Cannot find source for trait"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        Definition::Const(konst) => {
+            let src = sema.source(*konst).ok_or_else(|| format_err!("Cannot find source for const"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        Definition::Static(stat) => {
+            let src = sema.source(*stat).ok_or_else(|| format_err!("Cannot find source for static"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        Definition::TypeAlias(ty) => {
+            let src = sema.source(*ty).ok_or_else(|| format_err!("Cannot find source for type alias"))?;
+            (src.file_id.original_file(sema.db), src.value.syntax().clone())
+        }
+        _ => bail!("Unsupported definition type for relocation"),
+    };
+
+    let range = syntax.text_range();
+    let vfs_file_id = editioned_file_id.file_id(sema.db);
+    let file_text = sema.db.file_text(vfs_file_id);
+    let text_slice = file_text.text(sema.db);
+    let start: usize = range.start().into();
+    let end: usize = range.end().into();
+    let text = text_slice[start..end].to_string();
+
+    Ok(PlannedItem { file_id: vfs_file_id, editioned_file_id, range, text })
+}
+
+fn collect_associated_impls(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    primary: &PlannedItem,
+) -> Vec<PlannedItem> {
+    let Some(type_name) = def.name(sema.db).map(|name| name.as_str().trim_start_matches("r#").to_string()) else {
+        return Vec::new();
+    };
+
+    let editioned_file_id = primary.editioned_file_id;
+    let source_file = sema.parse(editioned_file_id);
+    let file_text = sema.db.file_text(primary.file_id);
+    let text_slice = file_text.text(sema.db);
+
+    source_file
+        .syntax()
+        .children()
+        .filter_map(ast::Item::cast)
+        .filter_map(|item| match item {
+            ast::Item::Impl(impl_block) => Some(impl_block),
+            _ => None,
+        })
+        .filter(|impl_block| impl_targets_type(impl_block, &type_name))
+        .map(|impl_block| {
+            let range = impl_block.syntax().text_range();
+            let start: usize = range.start().into();
+            let end: usize = range.end().into();
+            let text = text_slice[start..end].to_string();
+            PlannedItem { file_id: primary.file_id, editioned_file_id, range, text }
+        })
+        .collect()
+}
+
+fn impl_targets_type(impl_block: &ast::Impl, type_name: &str) -> bool {
+    let Some(self_ty) = impl_block.self_ty() else { return false; };
+    let path_type = match self_ty {
+        ast::Type::PathType(path_type) => path_type,
+        _ => return false,
+    };
+    let Some(path) = path_type.path() else { return false; };
+    let Some(segment) = path_last_segment(&path) else { return false; };
+    segment.text().trim_start_matches("r#") == type_name
+}
+
+fn path_last_segment(path: &ast::Path) -> Option<ast::NameRef> {
+    path.segments().last()?.name_ref()
+}
+
+fn plan_item_relocation(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    move_op: &MoveOperation,
+    module_plan: &ModuleFileSystemPlan,
+) -> RenameResult<ItemRelocationPlan> {
+    let primary = extract_definition_item(sema, def)?;
+    let mut moved_items = vec![primary.clone()];
+    moved_items.extend(collect_associated_impls(sema, def, &primary));
+    moved_items.sort_by_key(|item| (item.file_id, item.range.start()));
+    moved_items.dedup_by(|a, b| a.file_id == b.file_id && a.range == b.range);
+
+    let root_module = def
+        .krate(sema.db)
+        .ok_or_else(|| format_err!("Cannot determine crate for definition"))?
+        .root_module();
+    let destination_module = resolve_existing_destination_module(root_module, move_op, sema.db);
+
+    let destination = if let Some(module) = destination_module {
+        match plan_insertion_for_existing_module(sema, module) {
+            Ok(dest) => dest,
+            Err(_) => RelocationDestination::NewFile {
+                relative_path: module_plan.destination_relative_path.clone(),
+            },
+        }
+    } else {
+        RelocationDestination::NewFile { relative_path: module_plan.destination_relative_path.clone() }
+    };
+
+    Ok(ItemRelocationPlan { moved_items, destination })
+}
+
+fn resolve_existing_destination_module(
+    mut current: Module,
+    move_op: &MoveOperation,
+    db: &RootDatabase,
+) -> Option<Module> {
+    for segment in &move_op.dest_module_path {
+        let child = find_child_module_by_name(current, db, segment)?;
+        current = child;
+    }
+    Some(current)
+}
+
+fn plan_insertion_for_existing_module(
+    sema: &Semantics<'_, RootDatabase>,
+    module: Module,
+) -> RenameResult<RelocationDestination> {
+    let source = module.definition_source(sema.db);
+    match source.value {
+        ModuleSource::SourceFile(_) => {
+            let hir_file = module.definition_source_file_id(sema.db);
+            let editioned_file = hir_file.original_file(sema.db);
+            let file_id = editioned_file.file_id(sema.db);
+            let source_file = sema.parse(editioned_file);
+            let insert_offset = source_file.syntax().text_range().end();
+            Ok(RelocationDestination::ExistingFile { file_id, insert_offset })
+        }
+        ModuleSource::Module(ref module_ast) => {
+            let item_list = module_ast
+                .item_list()
+                .ok_or_else(|| format_err!("Inline module missing item list"))?;
+            let insert_offset = item_list
+                .r_curly_token()
+                .map(|tok| tok.text_range().start())
+                .ok_or_else(|| format_err!("Inline module missing closing brace"))?;
+            let indent = IndentLevel::from_node(item_list.syntax()) + 1;
+            let file_id = source.file_id.original_file(sema.db).file_id(sema.db);
+            Ok(RelocationDestination::InlineModule { file_id, insert_offset, indent })
+        }
+        ModuleSource::BlockExpr(_) => {
+            bail!("Moving items into block expression modules is not supported yet")
+        }
+    }
+}
+
 fn plan_module_declaration_for_existing_parent(
     db: &RootDatabase,
     parent_module: Module,
@@ -770,7 +966,8 @@ pub(crate) fn rename(
                     if let Some(move_operation) =
                         detect_move_operation(&sema, &def, &resolved_name, move_target)?
                     {
-                        let _ = plan_module_file_system_ops(&sema, &def, &move_operation)?;
+                        let module_plan = plan_module_file_system_ops(&sema, &def, &move_operation)?;
+                        let _ = plan_item_relocation(&sema, &def, &move_operation, &module_plan)?;
                         bail!("rename-to-move is not implemented yet");
                     }
                 }
@@ -1212,8 +1409,9 @@ mod tests {
     use span::Edition;
 
     use super::{
-        detect_move_operation, find_definitions, plan_module_file_system_ops, IdentifierKind,
-        ModuleFileSystemPlan, ParsedRenameTarget, RangeInfo, RenameDefinition, RenameError,
+        detect_move_operation, find_definitions, plan_item_relocation, plan_module_file_system_ops, IdentifierKind,
+        ItemRelocationPlan, ModuleFileSystemPlan, ParsedRenameTarget, RangeInfo,
+        RelocationDestination, RenameDefinition, RenameError,
     };
 
     #[track_caller]
@@ -1370,10 +1568,10 @@ mod tests {
         assert_eq!(err.to_string(), "Rename-to-move paths must start with `crate::`");
     }
 
-    fn compute_move_plan(
+    fn compute_move_plans(
         new_name: &str,
         #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
-    ) -> ModuleFileSystemPlan {
+    ) -> (ModuleFileSystemPlan, ItemRelocationPlan) {
         let (analysis, position) = fixture::position(ra_fixture_before);
         let db = &analysis.db;
         let sema = Semantics::new(db);
@@ -1409,8 +1607,12 @@ mod tests {
                 detect_move_operation(&sema, &def, &resolved_name, move_target)
                     .expect("move detection failed")
             {
-                return plan_module_file_system_ops(&sema, &def, &move_operation)
-                    .expect("module filesystem planning failed");
+                let module_plan =
+                    plan_module_file_system_ops(&sema, &def, &move_operation)
+                        .expect("module filesystem planning failed");
+                let relocation_plan = plan_item_relocation(&sema, &def, &move_operation, &module_plan)
+                    .expect("item relocation planning failed");
+                return (module_plan, relocation_plan);
             }
         }
         panic!("No move operation was detected for the provided fixture");
@@ -1418,7 +1620,7 @@ mod tests {
 
     #[test]
     fn module_fs_plan_creates_nested_modules() {
-        let plan = compute_move_plan(
+        let (plan, _) = compute_move_plans(
             "crate::mod_two::finish::Final",
             r#"
 //- /lib.rs
@@ -1446,7 +1648,7 @@ pub struct Existing;
 
     #[test]
     fn module_fs_plan_uses_existing_destination() {
-        let plan = compute_move_plan(
+        let (plan, _) = compute_move_plans(
             "crate::mod_one::Final",
             r#"
 //- /lib.rs
@@ -1466,7 +1668,7 @@ struct Existing;
 
     #[test]
     fn module_fs_plan_prefers_mod_rs_when_siblings_use_it() {
-        let plan = compute_move_plan(
+        let (plan, _) = compute_move_plans(
             "crate::new_mod::Final",
             r#"
 //- /lib.rs
@@ -1491,7 +1693,7 @@ pub struct Something;
 
     #[test]
     fn module_fs_plan_skips_duplicate_declarations() {
-        let plan = compute_move_plan(
+        let (plan, _) = compute_move_plans(
             "crate::mod_one::finish::Final",
             r#"
 //- /lib.rs
@@ -1506,6 +1708,60 @@ pub mod finish;
         assert_eq!(plan.file_paths(), ["mod_one/finish.rs"]);
         assert_eq!(plan.file_initial_contents(), [""]);
         assert!(plan.module_declaration_texts().is_empty());
+    }
+
+    #[test]
+    fn relocation_plan_existing_destination() {
+        let (_, relocation) = compute_move_plans(
+            "crate::mod_one::Final",
+            r#"
+//- /lib.rs
+mod mod_one;
+struct ToMove$0 {
+    field: i32,
+}
+
+impl ToMove {
+    fn new() -> Self { Self { field: 0 } }
+}
+
+//- /mod_one.rs
+struct Existing;
+"#,
+        );
+
+        assert_eq!(relocation.moved_items.len(), 2);
+        let texts: Vec<_> = relocation
+            .moved_items
+            .iter()
+            .map(|item| item.text.trim().to_owned())
+            .collect();
+        assert!(texts[0].starts_with("struct ToMove"));
+        assert!(texts[1].starts_with("impl ToMove"));
+        match relocation.destination {
+            RelocationDestination::ExistingFile { .. } => {}
+            _ => panic!("expected existing file destination"),
+        }
+    }
+
+    #[test]
+    fn relocation_plan_new_file_destination() {
+        let (module_plan, relocation) = compute_move_plans(
+            "crate::fresh::ToMove",
+            r#"
+//- /lib.rs
+struct ToMove$0;
+"#,
+        );
+
+        assert_eq!(module_plan.file_paths(), ["fresh.rs"]);
+        assert_eq!(relocation.moved_items.len(), 1);
+        match relocation.destination {
+            RelocationDestination::NewFile { ref relative_path } => {
+                assert_eq!(relative_path, "fresh.rs");
+            }
+            _ => panic!("expected new file destination"),
+        }
     }
 
     #[test]
