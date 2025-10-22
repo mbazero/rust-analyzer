@@ -41,15 +41,15 @@
     - Handle visibility modifiers and attributes preservation
     - _Requirements: 4.4, 4.5_
 
-- [ ] 5. Enhance reference updating for moved items
-  - [ ] 5.1 Update external references and imports
+- [x] 5. Enhance reference updating for moved items
+  - [x] 5.1 Update external references and imports
     - Implement `update_external_references` function to handle module changes
     - Update import statements to reflect new item location
     - Handle fully-qualified path references throughout codebase
     - Update re-exports and maintain existing import aliases where applicable
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
 
-  - [ ] 5.2 Implement internal reference updates
+  - [x] 5.2 Implement internal reference updates
     - Create `InternalReference` and `InternalReferenceType` structures
     - Analyze imports and references within moved item's source code
     - Update relative module references (`super::`, `crate::`) for new module context

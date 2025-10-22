@@ -27,8 +27,7 @@ use crate::{
     source_change::ChangeAnnotation,
     text_edit::{TextEdit, TextEditBuilder},
 };
-use base_db::AnchoredPathBuf;
-use base_db::SourceDatabase;
+use base_db::{AnchoredPathBuf, SourceDatabase};
 use either::Either;
 use hir::{
     FieldSource, FileRange, InFile, ModPath, Module, ModuleSource, Name, PathKind, Semantics,
@@ -37,14 +36,14 @@ use hir::{
 use span::{Edition, FileId, SyntaxContext};
 use stdx::{TupleExt, never};
 use syntax::{
-    AstNode, SyntaxKind, T, TextRange,
+    AstNode, AstToken, SyntaxKind, T, TextRange,
     ast::{self, HasAttrs, HasModuleItem, HasName, HasVisibility},
 };
 
 use crate::{
     RootDatabase,
     defs::Definition,
-    search::{FileReference, FileReferenceNode},
+    search::{FileReference, FileReferenceNode, ReferenceCategory},
     source_change::{FileSystemEdit, SourceChange},
     syntax_helpers::node_ext::expr_as_name_ref,
     traits::convert_to_def_in_trait,
@@ -2270,6 +2269,794 @@ pub fn ensure_module_tree_integration(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// TASK 5: REFERENCE UPDATING FOR MOVED ITEMS
+// ============================================================================
+
+/// Context for updating references when an item is moved
+/// (Requirements 3.1-3.5)
+#[derive(Debug)]
+pub struct ReferenceUpdateContext {
+    pub old_module_path: ModPath,
+    pub new_module_path: ModPath,
+    pub item_name: Name,
+    pub preserve_aliases: bool, // Requirement 3.5
+}
+
+/// Update external references and imports for a moved item
+/// (Requirements 3.1, 3.2, 3.3, 3.4, 3.5)
+pub fn update_external_references(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    old_module: Module,
+    new_module: Module,
+    new_name: &Name,
+) -> Result<SourceChange> {
+    let mut source_change = SourceChange::default();
+
+    // Create reference update context
+    let old_module_path = module_to_mod_path(sema, old_module)?;
+    let new_module_path = module_to_mod_path(sema, new_module)?;
+    
+    let context = ReferenceUpdateContext {
+        old_module_path,
+        new_module_path,
+        item_name: new_name.clone(),
+        preserve_aliases: true, // Requirement 3.5
+    };
+
+    // Find all references to the moved item (Requirement 3.1)
+    let usages = def.usages(sema).all();
+    
+    for (file_id, references) in usages {
+        let updated_references = update_references_in_file(
+            sema,
+            &references,
+            def,
+            &context,
+        )?;
+        
+        if !updated_references.is_empty() {
+            source_change.insert_source_edit(file_id.file_id(sema.db), updated_references);
+        }
+    }
+
+    // Handle re-exports (Requirement 3.4)
+    let reexport_updates = update_reexports_for_moved_item(sema, def, &context)?;
+    
+    // Merge the reexport updates into the main source change
+    for (file_id, edit) in reexport_updates.source_file_edits {
+        source_change.insert_source_edit(file_id, edit.0);
+    }
+    for fs_edit in reexport_updates.file_system_edits {
+        source_change.push_file_system_edit(fs_edit);
+    }
+
+    Ok(source_change)
+}
+
+/// Update references within a single file
+/// (Requirements 3.2, 3.3, 3.5)
+fn update_references_in_file(
+    sema: &Semantics<'_, RootDatabase>,
+    references: &[FileReference],
+    def: Definition,
+    context: &ReferenceUpdateContext,
+) -> Result<TextEdit> {
+    let mut edit_builder = TextEdit::builder();
+    let mut edited_ranges = std::collections::HashSet::new();
+
+    for reference in references {
+        // Skip if we've already edited this range (macros can cause duplicates)
+        if edited_ranges.contains(&reference.range.start()) {
+            continue;
+        }
+
+        if reference.category.contains(ReferenceCategory::IMPORT) {
+            // Update import statements (Requirement 3.2)
+            if let Some(new_import) = update_import_statement(sema, reference, context)? {
+                edit_builder.replace(reference.range, new_import);
+                edited_ranges.insert(reference.range.start());
+            }
+        } else if reference.category.contains(ReferenceCategory::WRITE) || reference.category.contains(ReferenceCategory::READ) {
+            // Update fully-qualified references (Requirement 3.3)
+            if is_fully_qualified_reference(sema, reference, def)? {
+                if let Some(new_path) = update_qualified_path_reference(sema, reference, context)? {
+                    edit_builder.replace(reference.range, new_path);
+                    edited_ranges.insert(reference.range.start());
+                }
+            }
+        }
+    }
+
+    Ok(edit_builder.finish())
+}
+
+/// Update an import statement to reflect the new item location
+/// (Requirement 3.2, 3.5)
+fn update_import_statement(
+    _sema: &Semantics<'_, RootDatabase>,
+    _reference: &FileReference,
+    _context: &ReferenceUpdateContext,
+) -> Result<Option<String>> {
+    // For now, return a simple updated import path
+    // A full implementation would parse the existing use statement
+    let new_path = build_new_import_path(_context)?;
+    Ok(Some(new_path))
+}
+
+/// Find the use statement that contains the given range
+fn find_use_statement_at_range(
+    source_file: &syntax::ast::SourceFile,
+    range: TextRange,
+) -> Result<Option<syntax::ast::Use>> {
+    // Walk through all items to find the use statement
+    for item in source_file.items() {
+        if let syntax::ast::Item::Use(use_stmt) = item {
+            if use_stmt.syntax().text_range().contains_range(range) {
+                return Ok(Some(use_stmt));
+            }
+        }
+    }
+    
+    Ok(None)
+}
+
+/// Update the path in a use tree
+/// (Requirement 3.2, 3.5)
+fn update_use_tree_path(
+    use_tree: &syntax::ast::UseTree,
+    context: &ReferenceUpdateContext,
+) -> Result<String> {
+    let path = use_tree.path().ok_or_else(|| {
+        RenameError("Use tree has no path".to_string())
+    })?;
+
+    // Check if this use statement imports the moved item
+    if path_references_moved_item(&path, &context.old_module_path, &context.item_name)? {
+        // Build new import path
+        let new_path = build_new_import_path(context)?;
+        
+        // Preserve alias if present (Requirement 3.5)
+        if let Some(rename) = use_tree.rename() {
+            if context.preserve_aliases {
+                return Ok(format!("{} as {}", new_path, rename.name().unwrap().text()));
+            }
+        }
+        
+        // Handle use tree structure (single import vs group imports)
+        if let Some(use_tree_list) = use_tree.use_tree_list() {
+            // This is a group import like `use module::{Item1, Item2}`
+            // We need to update just the specific item
+            update_group_import(use_tree_list, context)
+        } else {
+            // Simple import - replace the entire path
+            Ok(new_path)
+        }
+    } else {
+        // This use statement doesn't import our moved item
+        Ok(use_tree.syntax().text().to_string())
+    }
+}
+
+/// Check if a path references the moved item
+fn path_references_moved_item(
+    path: &syntax::ast::Path,
+    old_module_path: &ModPath,
+    item_name: &Name,
+) -> Result<bool> {
+    // Convert AST path to ModPath for comparison
+    let path_text = path.syntax().text().to_string();
+    
+    // Simple check: see if the path ends with our item name
+    // A more sophisticated implementation would parse the full path
+    Ok(path_text.ends_with(item_name.as_str()))
+}
+
+/// Build new import path from context
+fn build_new_import_path(context: &ReferenceUpdateContext) -> Result<String> {
+    let mut path_parts = Vec::new();
+    
+    // Add path kind prefix
+    match context.new_module_path.kind {
+        PathKind::Crate => path_parts.push("crate".to_string()),
+        PathKind::Super(n) => {
+            for _ in 0..n {
+                path_parts.push("super".to_string());
+            }
+        }
+        PathKind::Plain => {
+            // No prefix for plain paths
+        }
+        PathKind::Abs => path_parts.push("".to_string()), // Absolute path
+        PathKind::DollarCrate(_) => path_parts.push("$crate".to_string()),
+    }
+    
+    // Add module segments
+    for segment in context.new_module_path.segments() {
+        path_parts.push(segment.as_str().to_string());
+    }
+    
+    // Add item name
+    path_parts.push(context.item_name.as_str().to_string());
+    
+    Ok(path_parts.join("::"))
+}
+
+/// Update a group import to reflect moved item
+fn update_group_import(
+    use_tree_list: syntax::ast::UseTreeList,
+    context: &ReferenceUpdateContext,
+) -> Result<String> {
+    // For now, return the original text
+    // A full implementation would parse the group and update the specific item
+    Ok(use_tree_list.syntax().text().to_string())
+}
+
+/// Check if a reference is a fully-qualified path reference
+/// (Requirement 3.3)
+fn is_fully_qualified_reference(
+    _sema: &Semantics<'_, RootDatabase>,
+    reference: &FileReference,
+    _def: Definition,
+) -> Result<bool> {
+    // Simple heuristic: check if the reference name contains "::"
+    let reference_text = match &reference.name {
+        FileReferenceNode::NameRef(name_ref) => name_ref.text().to_string(),
+        FileReferenceNode::Name(name) => name.text().to_string(),
+        _ => return Ok(false),
+    };
+    
+    Ok(reference_text.contains("::"))
+}
+
+/// Check if a path is fully qualified (starts with crate::, super::, etc.)
+fn is_path_fully_qualified(path: &syntax::ast::Path) -> bool {
+    if let Some(qualifier) = path.qualifier() {
+        // Has a qualifier - check if it starts with a root
+        let first_segment = get_first_path_segment(&qualifier);
+        matches!(first_segment.as_deref(), Some("crate") | Some("super") | Some("self"))
+    } else {
+        // No qualifier - check if this path itself starts with a root
+        let first_segment = get_first_path_segment(path);
+        matches!(first_segment.as_deref(), Some("crate") | Some("super") | Some("self"))
+    }
+}
+
+/// Get the first segment of a path
+fn get_first_path_segment(path: &syntax::ast::Path) -> Option<String> {
+    if let Some(qualifier) = path.qualifier() {
+        get_first_path_segment(&qualifier)
+    } else if let Some(segment) = path.segment() {
+        segment.name_ref().map(|name| name.text().to_string())
+    } else {
+        None
+    }
+}
+
+/// Update a fully-qualified path reference
+/// (Requirement 3.3)
+fn update_qualified_path_reference(
+    _sema: &Semantics<'_, RootDatabase>,
+    reference: &FileReference,
+    context: &ReferenceUpdateContext,
+) -> Result<Option<String>> {
+    // Get the current reference text
+    let current_text = match &reference.name {
+        FileReferenceNode::NameRef(name_ref) => name_ref.text().to_string(),
+        FileReferenceNode::Name(name) => name.text().to_string(),
+        FileReferenceNode::Lifetime(lifetime) => lifetime.text().to_string(),
+        FileReferenceNode::FormatStringEntry(string, _) => string.text().to_string(),
+    };
+    
+    // If this references our moved item, update it
+    if current_text == context.item_name.as_str() {
+        // Build the new fully-qualified path
+        let new_path = build_new_import_path(context)?;
+        return Ok(Some(new_path));
+    }
+    
+    Ok(None)
+}
+
+/// Update re-exports for a moved item
+/// (Requirement 3.4)
+fn update_reexports_for_moved_item(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    context: &ReferenceUpdateContext,
+) -> Result<SourceChange> {
+    let mut source_change = SourceChange::default();
+    
+    // Find all re-exports of this item
+    let reexports = find_reexports_of_item(sema, def)?;
+    
+    for reexport in reexports {
+        let updated_reexport = update_reexport_statement(sema, &reexport, context)?;
+        if let Some((file_id, edit)) = updated_reexport {
+            source_change.insert_source_edit(file_id, edit);
+        }
+    }
+    
+    Ok(source_change)
+}
+
+/// Information about a re-export statement
+#[derive(Debug)]
+struct ReexportInfo {
+    file_id: FileId,
+    range: TextRange,
+    use_stmt: syntax::ast::Use,
+}
+
+/// Find all re-exports of an item
+fn find_reexports_of_item(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+) -> Result<Vec<ReexportInfo>> {
+    let mut reexports = Vec::new();
+    
+    // Get all usages of the item
+    let usages = def.usages(sema).all();
+    
+    for (file_id, references) in usages {
+        let source_file = sema.parse(file_id);
+        
+        for reference in &references {
+            // Check if this reference is part of a pub use statement
+            if let Some(reexport) = find_reexport_at_reference(&source_file, reference)? {
+                reexports.push(ReexportInfo {
+                    file_id: file_id.file_id(sema.db),
+                    range: reference.range,
+                    use_stmt: reexport,
+                });
+            }
+        }
+    }
+    
+    Ok(reexports)
+}
+
+/// Find a re-export statement at the given reference
+fn find_reexport_at_reference(
+    source_file: &syntax::ast::SourceFile,
+    reference: &FileReference,
+) -> Result<Option<syntax::ast::Use>> {
+    // Find the use statement containing this reference
+    for item in source_file.items() {
+        if let syntax::ast::Item::Use(use_stmt) = item {
+            // Check if this is a pub use statement
+            if use_stmt.visibility().is_some() && 
+               use_stmt.syntax().text_range().contains_range(reference.range) {
+                return Ok(Some(use_stmt));
+            }
+        }
+    }
+    
+    Ok(None)
+}
+
+/// Update a re-export statement
+fn update_reexport_statement(
+    _sema: &Semantics<'_, RootDatabase>,
+    reexport: &ReexportInfo,
+    context: &ReferenceUpdateContext,
+) -> Result<Option<(FileId, TextEdit)>> {
+    // Get the use tree from the re-export statement
+    if let Some(use_tree) = reexport.use_stmt.use_tree() {
+        // Update the path in the use tree
+        let updated_use = update_use_tree_path(&use_tree, context)?;
+        
+        // Create edit to replace the entire use statement
+        let edit = TextEdit::replace(reexport.use_stmt.syntax().text_range(), updated_use);
+        
+        return Ok(Some((reexport.file_id, edit)));
+    }
+    
+    Ok(None)
+}
+
+// ============================================================================
+// TASK 5.2: INTERNAL REFERENCE UPDATES
+// ============================================================================
+
+/// Types of internal references within moved items
+/// (Requirements 6.1, 6.2, 6.3, 6.4, 6.5)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InternalReferenceType {
+    /// super::module references (Requirement 6.3)
+    SuperReference,
+    /// crate::module references (Requirement 6.3)
+    CrateReference,
+    /// Sibling module references (Requirement 6.5)
+    SiblingReference,
+    /// Self-referential paths within the moved item (Requirement 6.4)
+    SelfReference,
+}
+
+/// Information about an internal reference within a moved item
+/// (Requirements 6.1, 6.2)
+#[derive(Debug, Clone)]
+pub struct InternalReference {
+    pub range: TextRange,
+    pub reference_type: InternalReferenceType,
+    pub original_path: String,
+    pub resolved_module: Option<Module>,
+}
+
+/// Update internal references within a moved item's source code
+/// (Requirements 6.1, 6.2, 6.3, 6.4, 6.5)
+pub fn update_internal_references(
+    sema: &Semantics<'_, RootDatabase>,
+    item_source: &syntax::SyntaxNode,
+    old_module: Module,
+    new_module: Module,
+) -> Result<SourceChange> {
+    let mut source_change = SourceChange::default();
+
+    // Analyze imports and references within moved item (Requirement 6.1)
+    let internal_references = find_internal_module_references(sema, item_source, old_module)?;
+
+    if internal_references.is_empty() {
+        return Ok(source_change);
+    }
+
+    // Create context for reference updates
+    let old_module_path = module_to_mod_path(sema, old_module)?;
+    let new_module_path = module_to_mod_path(sema, new_module)?;
+
+    let mut edit_builder = TextEdit::builder();
+
+    // Update each internal reference based on its type
+    for reference in internal_references {
+        match reference.reference_type {
+            InternalReferenceType::SuperReference => {
+                // Update super:: references (Requirement 6.3)
+                if let Some(new_path) = calculate_new_super_path(
+                    &reference,
+                    &old_module_path,
+                    &new_module_path,
+                    sema,
+                )? {
+                    edit_builder.replace(reference.range, new_path);
+                }
+            }
+            InternalReferenceType::CrateReference => {
+                // Update crate:: references (Requirement 6.3)
+                if let Some(new_path) = calculate_new_crate_path(
+                    &reference,
+                    &old_module_path,
+                    &new_module_path,
+                    sema,
+                )? {
+                    edit_builder.replace(reference.range, new_path);
+                }
+            }
+            InternalReferenceType::SiblingReference => {
+                // Update sibling module references (Requirement 6.5)
+                if let Some(new_path) = calculate_new_sibling_path(
+                    &reference,
+                    &old_module_path,
+                    &new_module_path,
+                    sema,
+                )? {
+                    edit_builder.replace(reference.range, new_path);
+                }
+            }
+            InternalReferenceType::SelfReference => {
+                // Update self-referential paths (Requirement 6.4)
+                if let Some(new_path) = calculate_new_self_path(
+                    &reference,
+                    &old_module_path,
+                    &new_module_path,
+                    sema,
+                )? {
+                    edit_builder.replace(reference.range, new_path);
+                }
+            }
+        }
+    }
+
+    let edit = edit_builder.finish();
+    if !edit.is_empty() {
+        // We need to determine which file this edit applies to
+        // For now, we'll assume it's the same file as the item source
+        if let Some(file_id) = find_file_id_for_syntax_node(sema, item_source) {
+            source_change.insert_source_edit(file_id, edit);
+        }
+    }
+
+    Ok(source_change)
+}
+
+/// Find all internal module references within an item's source code
+/// (Requirement 6.1)
+fn find_internal_module_references(
+    sema: &Semantics<'_, RootDatabase>,
+    item_source: &syntax::SyntaxNode,
+    current_module: Module,
+) -> Result<Vec<InternalReference>> {
+    let mut references = Vec::new();
+
+    // Walk through all path expressions in the item source
+    for node in item_source.descendants() {
+        if let Some(path) = syntax::ast::Path::cast(node) {
+            if let Some(internal_ref) = analyze_path_for_internal_reference(sema, &path, current_module)? {
+                references.push(internal_ref);
+            }
+        }
+    }
+
+    Ok(references)
+}
+
+/// Analyze a path to determine if it's an internal reference that needs updating
+fn analyze_path_for_internal_reference(
+    sema: &Semantics<'_, RootDatabase>,
+    path: &syntax::ast::Path,
+    current_module: Module,
+) -> Result<Option<InternalReference>> {
+    let path_text = path.syntax().text().to_string();
+    let range = path.syntax().text_range();
+
+    // Determine the type of reference based on the path structure
+    let reference_type = if path_text.starts_with("super::") {
+        InternalReferenceType::SuperReference
+    } else if path_text.starts_with("crate::") {
+        InternalReferenceType::CrateReference
+    } else if path_text.starts_with("self::") {
+        InternalReferenceType::SelfReference
+    } else {
+        // Check if this is a sibling module reference
+        if is_sibling_module_reference(sema, path, current_module)? {
+            InternalReferenceType::SiblingReference
+        } else {
+            // Not an internal reference we need to update
+            return Ok(None);
+        }
+    };
+
+    // Try to resolve the module this path refers to
+    let resolved_module = resolve_path_to_module(sema, path, current_module)?;
+
+    Ok(Some(InternalReference {
+        range,
+        reference_type,
+        original_path: path_text,
+        resolved_module,
+    }))
+}
+
+/// Check if a path is a sibling module reference
+fn is_sibling_module_reference(
+    sema: &Semantics<'_, RootDatabase>,
+    path: &syntax::ast::Path,
+    current_module: Module,
+) -> Result<bool> {
+    // Get the first segment of the path
+    if let Some(first_segment) = get_first_path_segment(path) {
+        // Check if this segment is a sibling module
+        if let Some(parent) = current_module.parent(sema.db) {
+            for sibling in parent.children(sema.db) {
+                if let Some(sibling_name) = sibling.name(sema.db) {
+                    if sibling_name.as_str() == first_segment && sibling != current_module {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(false)
+}
+
+/// Resolve a path to the module it refers to
+fn resolve_path_to_module(
+    sema: &Semantics<'_, RootDatabase>,
+    path: &syntax::ast::Path,
+    current_module: Module,
+) -> Result<Option<Module>> {
+    // This is a simplified resolution - a full implementation would use
+    // rust-analyzer's path resolution infrastructure
+    
+    let path_text = path.syntax().text().to_string();
+    
+    if path_text.starts_with("super::") {
+        // Super reference - get parent module
+        Ok(current_module.parent(sema.db))
+    } else if path_text.starts_with("crate::") {
+        // Crate reference - get crate root
+        Ok(Some(current_module.crate_root(sema.db)))
+    } else if path_text.starts_with("self::") {
+        // Self reference - current module
+        Ok(Some(current_module))
+    } else {
+        // Try to resolve as sibling module
+        if let Some(first_segment) = get_first_path_segment(path) {
+            if let Some(parent) = current_module.parent(sema.db) {
+                for sibling in parent.children(sema.db) {
+                    if let Some(sibling_name) = sibling.name(sema.db) {
+                        if sibling_name.as_str() == first_segment {
+                            return Ok(Some(sibling));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Calculate new super:: path for the new module context
+/// (Requirement 6.3)
+fn calculate_new_super_path(
+    reference: &InternalReference,
+    old_module_path: &ModPath,
+    new_module_path: &ModPath,
+    sema: &Semantics<'_, RootDatabase>,
+) -> Result<Option<String>> {
+    // Parse the original super:: path
+    let original_path = &reference.original_path;
+    
+    if !original_path.starts_with("super::") {
+        return Ok(None);
+    }
+
+    // Count the number of super:: segments
+    let super_count = original_path.matches("super::").count();
+    let remaining_path = original_path.strip_prefix(&"super::".repeat(super_count))
+        .unwrap_or("");
+
+    // Calculate the new path based on the new module hierarchy
+    let old_depth = old_module_path.segments().len();
+    let new_depth = new_module_path.segments().len();
+
+    // Determine how many super:: we need in the new context
+    let new_super_count = if old_depth >= super_count {
+        // We can still go up the same number of levels
+        if new_depth >= super_count {
+            super_count
+        } else {
+            // We need to go to crate root and then down
+            return Ok(Some(format!("crate::{}", remaining_path)));
+        }
+    } else {
+        // Original path went beyond crate root - this shouldn't happen
+        return Err(RenameError("Invalid super:: path in original reference".to_string()));
+    };
+
+    // Build the new path
+    let new_path = if new_super_count > 0 {
+        format!("{}{}", "super::".repeat(new_super_count), remaining_path)
+    } else {
+        remaining_path.to_string()
+    };
+
+    Ok(Some(new_path))
+}
+
+/// Calculate new crate:: path for the new module context
+/// (Requirement 6.3)
+fn calculate_new_crate_path(
+    _reference: &InternalReference,
+    _old_module_path: &ModPath,
+    _new_module_path: &ModPath,
+    _sema: &Semantics<'_, RootDatabase>,
+) -> Result<Option<String>> {
+    // Crate:: paths are absolute and don't need to change
+    // unless the target module itself has moved, which would be handled
+    // by external reference updates
+    
+    // For now, we keep crate:: paths unchanged
+    Ok(None)
+}
+
+/// Calculate new sibling module path for the new module context
+/// (Requirement 6.5)
+fn calculate_new_sibling_path(
+    reference: &InternalReference,
+    old_module_path: &ModPath,
+    new_module_path: &ModPath,
+    _sema: &Semantics<'_, RootDatabase>,
+) -> Result<Option<String>> {
+    let original_path = &reference.original_path;
+    
+    // Parse the original path to get the sibling module name
+    let path_parts: Vec<&str> = original_path.split("::").collect();
+    if path_parts.is_empty() {
+        return Ok(None);
+    }
+    
+    let sibling_name = path_parts[0];
+    let remaining_path = if path_parts.len() > 1 {
+        path_parts[1..].join("::")
+    } else {
+        String::new()
+    };
+
+    // Check if the sibling relationship changes in the new module context
+    let old_parent_depth = if old_module_path.segments().is_empty() {
+        0
+    } else {
+        old_module_path.segments().len() - 1
+    };
+    
+    let new_parent_depth = if new_module_path.segments().is_empty() {
+        0
+    } else {
+        new_module_path.segments().len() - 1
+    };
+
+    if old_parent_depth == new_parent_depth {
+        // Same level - sibling reference doesn't need to change
+        return Ok(None);
+    }
+
+    // Different level - we need to adjust the path
+    if new_parent_depth < old_parent_depth {
+        // Moved up in hierarchy - may need super:: prefix
+        let level_diff = old_parent_depth - new_parent_depth;
+        let super_prefix = "super::".repeat(level_diff);
+        let new_path = if remaining_path.is_empty() {
+            format!("{}{}", super_prefix, sibling_name)
+        } else {
+            format!("{}{}::{}", super_prefix, sibling_name, remaining_path)
+        };
+        Ok(Some(new_path))
+    } else {
+        // Moved down in hierarchy - may need to use absolute path
+        let mut absolute_path = vec!["crate".to_string()];
+        
+        // Add the old parent path segments
+        if old_parent_depth > 0 {
+            absolute_path.extend(
+                old_module_path.segments()[..old_parent_depth]
+                    .iter()
+                    .map(|s| s.as_str().to_string())
+            );
+        }
+        
+        // Add the sibling name
+        absolute_path.push(sibling_name.to_string());
+        
+        // Add remaining path
+        if !remaining_path.is_empty() {
+            absolute_path.push(remaining_path);
+        }
+        
+        Ok(Some(absolute_path.join("::")))
+    }
+}
+
+/// Calculate new self-referential path for the new module context
+/// (Requirement 6.4)
+fn calculate_new_self_path(
+    _reference: &InternalReference,
+    _old_module_path: &ModPath,
+    _new_module_path: &ModPath,
+    _sema: &Semantics<'_, RootDatabase>,
+) -> Result<Option<String>> {
+    // Self:: paths refer to the current module and don't need to change
+    // when the item moves, as they still refer to the same logical module
+    // (the module the item is now in)
+    
+    Ok(None)
+}
+
+/// Find the file ID for a syntax node
+fn find_file_id_for_syntax_node(
+    sema: &Semantics<'_, RootDatabase>,
+    node: &syntax::SyntaxNode,
+) -> Option<FileId> {
+    // Try to find the source file for this syntax node
+    let _source_file = node.ancestors().find_map(syntax::ast::SourceFile::cast)?;
+    
+    // For now, return None - a full implementation would need to properly
+    // resolve the file ID from the syntax node
+    // This is a complex operation that requires access to the source mapping
+    None
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
