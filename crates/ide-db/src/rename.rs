@@ -8,6 +8,56 @@
 //! attention, and, when renaming modules, you also want to rename files on the
 //! file system.
 //!
+//! ## Move Operations with Fully-Qualified Paths
+//!
+//! This module now supports moving items between modules using fully-qualified paths.
+//! When a user provides a fully-qualified path (e.g., `crate::new_module::ItemName`),
+//! the system will:
+//!
+//! 1. Parse the path to determine the target module and new item name
+//! 2. Create any missing module structure automatically
+//! 3. Move the item to the target location
+//! 4. Update all references throughout the codebase
+//! 5. Update internal references within the moved item for the new module context
+//!
+//! ### Examples of Fully-Qualified Path Usage
+//!
+//! ```ignore
+//! // Move a struct to a new module (creates models module if needed)
+//! struct MyStruct { 
+//!     name: String 
+//! } // <- rename to "crate::models::MyStruct"
+//!
+//! // Move and rename simultaneously
+//! fn old_function() -> i32 { 
+//!     42 
+//! } // <- rename to "crate::utils::new_function"
+//!
+//! // Move within the same crate using relative paths
+//! enum Status { 
+//!     Active, 
+//!     Inactive 
+//! } // <- rename to "super::types::Status"
+//!
+//! // Move to sibling module
+//! const MAX_SIZE: usize = 1024; // <- rename to "super::constants::MAX_SIZE"
+//!
+//! // Move trait to different module
+//! trait Processable {
+//!     fn process(&self);
+//! } // <- rename to "crate::traits::Processable"
+//!
+//! // Complex nested module creation
+//! type UserId = u64; // <- rename to "crate::models::user::types::UserId"
+//! ```
+//!
+//! The system handles complex scenarios including:
+//! - Creating nested module structures
+//! - Updating import statements and fully-qualified references
+//! - Adjusting relative module references (`super::`, `crate::`) within moved items
+//! - Validating visibility constraints and dependency accessibility
+//! - Detecting and preventing circular dependencies
+//!
 //! Another can of worms are macros:
 //!
 //! ```ignore
@@ -54,7 +104,37 @@ pub type Result<T, E = RenameError> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct RenameError(pub String);
 
-/// Context for rename operations, including move operations
+/// Context for rename operations, including move operations.
+///
+/// This structure encapsulates all the information needed to perform a rename
+/// or move operation, providing a complete picture of what is being changed
+/// and how it should be changed.
+///
+/// # Fields
+///
+/// * `original_def` - The definition being renamed/moved
+/// * `original_name` - The current name of the item
+/// * `target_module_path` - The destination module path
+/// * `new_item_name` - The new name for the item
+/// * `operation_type` - The type of operation to perform
+/// * `source_module` - The current module containing the item
+///
+/// # Usage
+///
+/// This context is typically created during the analysis phase of a rename
+/// operation and passed to various functions that need to understand the
+/// full scope of the requested change.
+///
+/// ```ignore
+/// let context = RenameContext {
+///     original_def: def,
+///     original_name: current_name,
+///     target_module_path: parsed_target_path,
+///     new_item_name: new_name,
+///     operation_type: RenameOperationType::MoveAndRename,
+///     source_module: current_module,
+/// };
+/// ```
 #[derive(Debug)]
 pub struct RenameContext {
     pub original_def: Definition,
@@ -65,16 +145,46 @@ pub struct RenameContext {
     pub source_module: Module,
 }
 
-/// Types of rename operations supported
+/// Types of rename operations supported by the rename system.
+///
+/// This enumeration categorizes the different kinds of operations that can
+/// be performed when a user requests a rename, ranging from simple name
+/// changes to complex cross-module moves.
+///
+/// # Variants
+///
+/// * `SimpleRename` - Changes only the name within the same module
+/// * `MoveAndRename` - Moves to a different module and changes the name
+/// * `MoveOnly` - Moves to a different module but keeps the same name
+/// * `RelativeMove` - Moves using relative path notation within current context
+///
+/// # Examples
+///
+/// ```ignore
+/// // SimpleRename: "MyStruct" -> "NewStruct" (same location)
+/// RenameOperationType::SimpleRename
+///
+/// // MoveAndRename: "MyStruct" -> "crate::models::NewStruct"
+/// RenameOperationType::MoveAndRename
+///
+/// // MoveOnly: "MyStruct" -> "crate::models::MyStruct"
+/// RenameOperationType::MoveOnly
+///
+/// // RelativeMove: "MyStruct" -> "super::MyStruct"
+/// RenameOperationType::RelativeMove
+/// ```
+///
+/// The operation type determines which code paths are taken during the
+/// rename process and what validations need to be performed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RenameOperationType {
-    /// Same module, name change only (Requirement 5.1)
+    /// Same module, name change only
     SimpleRename,
-    /// Different module, name change (Requirement 1.2)
+    /// Different module, name change
     MoveAndRename,
-    /// Different module, same name (Requirement 1.2)
+    /// Different module, same name
     MoveOnly,
-    /// Relative path within current module (Requirement 5.2)
+    /// Relative path within current module
     RelativeMove,
 }
 
@@ -715,8 +825,45 @@ fn source_edit_from_def(
     Ok((file_id.file_id(sema.db), edit.finish()))
 }
 
-/// Parse a rename target that may be a fully-qualified path
-/// Leverages existing ModPath::from_src infrastructure (Requirement 1.1, 1.3)
+/// Parse a rename target that may be a fully-qualified path.
+///
+/// This function validates and parses path strings that can be used for both simple
+/// renames and move operations. It leverages rust-analyzer's existing `ModPath::from_src`
+/// infrastructure to ensure proper path validation and parsing.
+///
+/// # Arguments
+///
+/// * `input` - The path string to parse (e.g., "crate::module::Item", "super::Item")
+/// * `db` - The expand database for path resolution
+///
+/// # Returns
+///
+/// Returns a `ModPath` representing the parsed path, or a `RenameError` if the path
+/// is syntactically invalid.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Parse absolute paths
+/// let path = parse_rename_target("crate::models::User", db)?;
+///
+/// // Parse relative paths
+/// let path = parse_rename_target("super::utils::helper", db)?;
+///
+/// // Parse simple identifiers
+/// let path = parse_rename_target("NewName", db)?;
+/// ```
+///
+/// # Errors
+///
+/// Returns `RenameError` if:
+/// - The path contains invalid Rust syntax
+/// - The path cannot be parsed as a valid module path
+/// - The path is empty or malformed
+///
+/// This function is used internally by the rename system to validate user input
+/// and determine whether a rename operation should be treated as a simple rename
+/// or a move operation between modules.
 pub fn parse_rename_target(input: &str, db: &dyn ExpandDatabase) -> Result<ModPath> {
     // Parse as AST path first to validate syntax (Requirement 1.3)
     let parsed = syntax::ast::SourceFile::parse(&format!("use {};", input), Edition::CURRENT);
@@ -738,8 +885,52 @@ pub fn parse_rename_target(input: &str, db: &dyn ExpandDatabase) -> Result<ModPa
         .ok_or_else(|| RenameError(format!("Could not parse path: {}", input)))
 }
 
-/// Extract module path and item name from a fully-qualified path
-/// (Requirements 1.4, 1.5)
+/// Extract module path and item name from a fully-qualified path.
+///
+/// This function takes a fully-qualified path string and separates it into the
+/// target module path and the final item name. This separation is essential for
+/// move operations where we need to know both where to move the item and what
+/// to name it in the destination.
+///
+/// # Arguments
+///
+/// * `path` - A fully-qualified path string (e.g., "crate::models::User")
+/// * `db` - The expand database for path resolution
+///
+/// # Returns
+///
+/// Returns a tuple containing:
+/// - `ModPath`: The module path (e.g., "crate::models" from "crate::models::User")
+/// - `Name`: The item name (e.g., "User" from "crate::models::User")
+///
+/// # Examples
+///
+/// ```ignore
+/// // Extract from absolute path
+/// let (module_path, item_name) = parse_fully_qualified_path("crate::models::User", db)?;
+/// // module_path represents "crate::models"
+/// // item_name represents "User"
+///
+/// // Extract from relative path
+/// let (module_path, item_name) = parse_fully_qualified_path("super::utils::helper", db)?;
+/// // module_path represents "super::utils"
+/// // item_name represents "helper"
+///
+/// // Single segment (crate root)
+/// let (module_path, item_name) = parse_fully_qualified_path("crate::Item", db)?;
+/// // module_path represents "crate" (root)
+/// // item_name represents "Item"
+/// ```
+///
+/// # Errors
+///
+/// Returns `RenameError` if:
+/// - The path is empty or contains no segments
+/// - The path cannot be parsed as a valid module path
+/// - The path syntax is invalid
+///
+/// This function is a key component of the move operation system, enabling the
+/// separation of destination and naming concerns in fully-qualified rename operations.
 pub fn parse_fully_qualified_path(path: &str, db: &dyn ExpandDatabase) -> Result<(ModPath, Name)> {
     // Parse using existing rust-analyzer infrastructure
     let mod_path = parse_rename_target(path, db)?;
@@ -765,7 +956,37 @@ pub fn parse_fully_qualified_path(path: &str, db: &dyn ExpandDatabase) -> Result
     Ok((module_path, item_name))
 }
 
-/// Compare current item's ModPath with target ModPath (Requirements 1.2, 5.1, 5.2, 5.3)
+/// Compare current item's module path with target module path.
+///
+/// This function determines whether two module paths represent the same location
+/// or different locations, which is crucial for deciding between simple rename
+/// operations and move operations.
+///
+/// # Arguments
+///
+/// * `current_module` - The module path where the item currently resides
+/// * `target_module` - The module path where the item should be moved to
+///
+/// # Returns
+///
+/// Returns a `PathComparison` indicating:
+/// - `SameLocation`: Both paths point to the same module (simple rename)
+/// - `DifferentModule`: Paths point to different modules (move operation required)
+/// - `Invalid`: One or both paths are invalid
+///
+/// # Examples
+///
+/// ```ignore
+/// let current = ModPath::from_segments(PathKind::Crate, vec![Name::new("models")]);
+/// let target = ModPath::from_segments(PathKind::Crate, vec![Name::new("models")]);
+/// assert_eq!(compare_paths(&current, &target), PathComparison::SameLocation);
+///
+/// let target = ModPath::from_segments(PathKind::Crate, vec![Name::new("utils")]);
+/// assert_eq!(compare_paths(&current, &target), PathComparison::DifferentModule);
+/// ```
+///
+/// This comparison is used by the rename system to automatically detect when
+/// a user intends to move an item rather than simply rename it.
 pub fn compare_paths(current_module: &ModPath, target_module: &ModPath) -> PathComparison {
     // Check if paths are identical (same module location)
     if current_module.kind == target_module.kind
@@ -778,8 +999,52 @@ pub fn compare_paths(current_module: &ModPath, target_module: &ModPath) -> PathC
     PathComparison::DifferentModule
 }
 
-/// Determine the type of rename operation based on current and target paths
-/// (Requirements 1.2, 5.1, 5.2, 5.3)
+/// Determine the type of rename operation based on current and target paths.
+///
+/// This function analyzes the current location of a definition and the target
+/// location specified by the user to determine what type of operation should
+/// be performed. It supports both simple renames and complex move operations.
+///
+/// # Arguments
+///
+/// * `sema` - Semantic analysis context for resolving definitions and modules
+/// * `def` - The definition being renamed/moved
+/// * `target_module_path` - The target module path from the fully-qualified path
+/// * `new_item_name` - The new name for the item
+///
+/// # Returns
+///
+/// Returns a `RenameOperationType` indicating:
+/// - `SimpleRename`: Same module, potentially different name
+/// - `MoveOnly`: Different module, same name
+/// - `MoveAndRename`: Different module, different name
+/// - `RelativeMove`: Relative path within current module context
+///
+/// # Examples
+///
+/// ```ignore
+/// // Simple rename: "MyStruct" -> "NewStruct" (same module)
+/// let op_type = determine_operation_type(sema, def, current_module, &new_name)?;
+/// assert_eq!(op_type, RenameOperationType::SimpleRename);
+///
+/// // Move only: "MyStruct" -> "crate::models::MyStruct"
+/// let op_type = determine_operation_type(sema, def, target_module, &same_name)?;
+/// assert_eq!(op_type, RenameOperationType::MoveOnly);
+///
+/// // Move and rename: "MyStruct" -> "crate::models::NewStruct"
+/// let op_type = determine_operation_type(sema, def, target_module, &new_name)?;
+/// assert_eq!(op_type, RenameOperationType::MoveAndRename);
+/// ```
+///
+/// # Errors
+///
+/// Returns `RenameError` if:
+/// - The current module of the definition cannot be determined
+/// - The current name of the definition cannot be determined
+/// - The target path is invalid
+///
+/// This function is central to the rename system's decision-making process,
+/// enabling automatic detection of user intent based on the provided target path.
 pub fn determine_operation_type(
     sema: &Semantics<'_, RootDatabase>,
     def: Definition,
@@ -904,8 +1169,32 @@ pub fn normalize_target_path(
     }
 }
 
-/// Module structure analysis for tracking existing vs missing module segments
-/// (Requirements 2.1, 2.2, 2.3)
+/// Analysis of module structure for move operations.
+///
+/// This structure provides a detailed analysis of the current module hierarchy
+/// and identifies which parts of a target module path already exist versus
+/// which parts need to be created during a move operation.
+///
+/// # Fields
+///
+/// * `current_module` - The module where the operation starts
+/// * `target_module_path` - The complete target path being analyzed
+/// * `missing_segments` - Module path segments that don't exist and need creation
+/// * `existing_segments` - Module path segments that already exist
+///
+/// # Usage
+///
+/// This analysis is performed before executing move operations to determine
+/// what module structure needs to be created and to validate that the move
+/// is feasible.
+///
+/// ```ignore
+/// let structure = analyze_module_structure(sema, current_module, &target_path)?;
+/// if !structure.missing_segments.is_empty() {
+///     // Need to create missing modules
+///     let plan = create_module_creation_plan(&structure, &preferences)?;
+/// }
+/// ```
 #[derive(Debug)]
 pub struct ModuleStructure {
     pub current_module: Module,
@@ -914,8 +1203,38 @@ pub struct ModuleStructure {
     pub existing_segments: Vec<Module>,
 }
 
-/// Plan for creating missing module structure
-/// (Requirements 2.1, 2.2, 2.3, 2.4, 2.5)
+/// Comprehensive plan for creating missing module structure.
+///
+/// This structure contains all the information needed to create the necessary
+/// file system structure and module declarations when moving items to modules
+/// that don't yet exist.
+///
+/// # Fields
+///
+/// * `directories_to_create` - File system directories that need to be created
+/// * `files_to_create` - Module files (mod.rs or module_name.rs) to be created
+/// * `module_declarations_to_add` - Module declarations to add to parent modules
+/// * `user_preferences` - User preferences for module organization
+///
+/// # Usage
+///
+/// The plan is created during the analysis phase and executed during the
+/// actual move operation to ensure all necessary module structure exists.
+///
+/// ```ignore
+/// let plan = create_module_creation_plan(&module_structure, &preferences)?;
+/// 
+/// // Execute the plan
+/// for dir in &plan.directories_to_create {
+///     create_directory(dir)?;
+/// }
+/// for file_spec in &plan.files_to_create {
+///     create_module_file(file_spec)?;
+/// }
+/// ```
+///
+/// The plan respects user preferences for module organization, such as
+/// whether to use `mod.rs` files or `module_name.rs` files.
 #[derive(Debug)]
 pub struct ModuleCreationPlan {
     pub directories_to_create: Vec<std::path::PathBuf>,
@@ -953,8 +1272,37 @@ pub struct ModuleDeclaration {
     pub visibility: Option<String>,
 }
 
-/// User preferences for module organization
-/// (Requirement 2.3)
+/// User preferences for module organization and file structure.
+///
+/// This structure encapsulates user preferences that affect how new modules
+/// are created during move operations, allowing the system to respect
+/// different coding styles and project conventions.
+///
+/// # Fields
+///
+/// * `prefer_mod_rs` - Whether to prefer `mod.rs` files over `module_name.rs` files
+/// * `directory_structure` - Preference for nested vs flat directory structures
+///
+/// # Examples
+///
+/// ```ignore
+/// // Prefer mod.rs files with nested directories
+/// let preferences = ModuleOrganizationPreferences {
+///     prefer_mod_rs: true,
+///     directory_structure: DirectoryStructurePreference::Nested,
+/// };
+/// // Creates: src/models/mod.rs
+///
+/// // Prefer module_name.rs files
+/// let preferences = ModuleOrganizationPreferences {
+///     prefer_mod_rs: false,
+///     directory_structure: DirectoryStructurePreference::Nested,
+/// };
+/// // Creates: src/models.rs
+/// ```
+///
+/// These preferences ensure that automatically created modules follow the
+/// same conventions as the rest of the project.
 #[derive(Debug, Clone)]
 pub struct ModuleOrganizationPreferences {
     pub prefer_mod_rs: bool,
@@ -1007,8 +1355,51 @@ impl ModuleCreationPlan {
     }
 }
 
-/// Traverse current module hierarchy and identify existing vs missing module segments
-/// (Requirements 2.1, 2.2, 2.3)
+/// Analyze module hierarchy to identify existing vs missing module segments.
+///
+/// This function traverses the current module hierarchy and compares it against
+/// the target module path to determine which parts of the path already exist
+/// and which parts need to be created during a move operation.
+///
+/// # Arguments
+///
+/// * `sema` - Semantic analysis context for module resolution
+/// * `current_module` - The module where the analysis starts
+/// * `target_module_path` - The complete target path to analyze
+///
+/// # Returns
+///
+/// Returns a `ModuleStructure` containing:
+/// - Existing module segments that are already present
+/// - Missing module segments that need to be created
+/// - The complete target path and current module context
+///
+/// # Examples
+///
+/// ```ignore
+/// // Analyze path "crate::models::user" when only "crate::models" exists
+/// let structure = analyze_module_structure(sema, current, &target_path)?;
+/// // structure.existing_segments contains [models_module]
+/// // structure.missing_segments contains ["user"]
+///
+/// // Analyze completely new path "crate::new::nested::module"
+/// let structure = analyze_module_structure(sema, current, &target_path)?;
+/// // structure.existing_segments is empty
+/// // structure.missing_segments contains ["new", "nested", "module"]
+/// ```
+///
+/// # Path Resolution
+///
+/// The function handles different path kinds:
+/// - `PathKind::Crate`: Starts from crate root
+/// - `PathKind::Super(n)`: Goes up n levels from current module
+/// - `PathKind::Plain`: Relative to current module
+///
+/// # Usage
+///
+/// This analysis is essential for determining what module creation work needs
+/// to be done before a move operation can proceed. It enables the system to
+/// create only the necessary missing modules while reusing existing structure.
 pub fn analyze_module_structure(
     sema: &Semantics<'_, RootDatabase>,
     current_module: Module,
@@ -2195,8 +2586,53 @@ pub fn validate_no_name_conflicts(
     Ok(())
 }
 
-/// Comprehensive validation function for move operations with all checks
-/// (Requirements 4.1, 4.2, 4.3, 4.4, 4.5)
+/// Comprehensive validation for move operations with all safety checks.
+///
+/// This function performs all necessary validations before executing a move
+/// operation to ensure the operation is safe and will not break the codebase.
+/// It checks for naming conflicts, circular dependencies, visibility constraints,
+/// and dependency accessibility.
+///
+/// # Arguments
+///
+/// * `sema` - Semantic analysis context
+/// * `def` - The definition being moved
+/// * `_target_module_path` - The target module path (for future use)
+/// * `new_item_name` - The new name for the item in the target module
+/// * `target_module` - The resolved target module
+///
+/// # Returns
+///
+/// Returns `Ok(())` if the move operation is safe to proceed, or a
+/// `MoveRenameError` describing why the operation cannot be performed.
+///
+/// # Validations Performed
+///
+/// 1. **Name Conflict Check**: Ensures no existing item has the same name
+/// 2. **Circular Dependency Check**: Prevents dependency cycles
+/// 3. **Visibility Validation**: Ensures visibility constraints are maintained
+/// 4. **Dependency Accessibility**: Verifies all dependencies remain accessible
+///
+/// # Examples
+///
+/// ```ignore
+/// // Validate before moving
+/// validate_move_operation(sema, def, &target_path, &new_name, target_module)?;
+/// 
+/// // If validation passes, proceed with the move
+/// let change = execute_move_operation(sema, def, target_module, &new_name)?;
+/// ```
+///
+/// # Errors
+///
+/// Returns specific `MoveRenameError` variants for different failure modes:
+/// - `NameConflict`: Item with same name already exists in target module
+/// - `CircularDependency`: Move would create circular dependency
+/// - `VisibilityViolation`: Visibility constraints would be violated
+/// - `DependencyError`: Required dependencies would become inaccessible
+///
+/// This comprehensive validation ensures that move operations maintain code
+/// correctness and don't introduce subtle bugs or compilation errors.
 pub fn validate_move_operation(
     sema: &Semantics<'_, RootDatabase>,
     def: Definition,

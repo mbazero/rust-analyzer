@@ -1,8 +1,43 @@
-//! Renaming functionality.
+//! Renaming functionality with support for moving items between modules.
 //!
 //! This is mostly front-end for [`ide_db::rename`], but it also includes the
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
+//!
+//! ## Enhanced Rename with Move Operations
+//!
+//! The rename functionality now supports moving items between modules using
+//! fully-qualified paths. When you provide a path like `crate::new_module::ItemName`,
+//! the system will:
+//!
+//! 1. **Parse the path** to determine the target module and new name
+//! 2. **Create missing modules** automatically if they don't exist
+//! 3. **Move the item** to the target location
+//! 4. **Update all references** throughout the codebase
+//! 5. **Fix internal references** within the moved item for the new context
+//!
+//! ### Supported Path Formats
+//!
+//! - **Absolute paths**: `crate::module::submodule::Item`
+//! - **Relative paths**: `super::sibling_module::Item`
+//! - **Simple names**: `NewItemName` (rename in current module)
+//!
+//! ### Examples
+//!
+//! ```ignore
+//! // Move a struct to a new module (creates module if needed)
+//! struct User { name: String } // Rename to: crate::models::User
+//!
+//! // Move and rename simultaneously
+//! fn process_data() {} // Rename to: crate::utils::process_user_data
+//!
+//! // Move using relative paths
+//! enum Status {} // Rename to: super::types::Status
+//! ```
+//!
+//! The system handles complex scenarios including visibility validation,
+//! circular dependency detection, and maintaining code correctness throughout
+//! the move operation.
 
 use hir::{AsAssocItem, InFile, Name, Semantics, sym};
 use ide_db::{
@@ -49,8 +84,39 @@ fn ok_if_any<T, E>(iter: impl Iterator<Item = Result<T, E>>) -> Result<Vec<T>, E
     }
 }
 
-/// Prepares a rename. The sole job of this function is to return the TextRange of the thing that is
-/// being targeted for a rename. Extended to handle fully-qualified path validation for move operations.
+/// Prepares a rename operation by validating the target and returning its text range.
+///
+/// This function identifies what can be renamed at the given position and returns
+/// the text range that will be affected. It supports both simple renames and
+/// move operations using fully-qualified paths.
+///
+/// # Arguments
+///
+/// * `db` - The root database for semantic analysis
+/// * `position` - The file position where the rename is requested
+///
+/// # Returns
+///
+/// Returns a `RangeInfo<()>` containing the text range of the renameable item,
+/// or a `RenameError` if nothing can be renamed at the given position.
+///
+/// # Examples
+///
+/// ```ignore
+/// let position = FilePosition { file_id, offset };
+/// let range_info = prepare_rename(db, position)?;
+/// // range_info.range contains the text range of the identifier
+/// ```
+///
+/// # Validation
+///
+/// The function validates that:
+/// - There is a renameable item at the specified position
+/// - The item supports the requested type of operation
+/// - For move operations, the item can be moved between modules
+///
+/// This preparation step ensures that the actual rename operation will succeed
+/// and provides early feedback to the user about what will be renamed.
 pub(crate) fn prepare_rename(
     db: &RootDatabase,
     position: FilePosition,
@@ -140,13 +206,82 @@ fn supports_move_operation(sema: &Semantics<'_, RootDatabase>, def: Definition) 
 
 // Feature: Rename
 //
-// Renames the item below the cursor and all of its references
+// Renames the item below the cursor and all of its references. Now supports
+// moving items between modules using fully-qualified paths.
 //
 // | Editor  | Shortcut |
 // |---------|----------|
 // | VS Code | <kbd>F2</kbd> |
 //
+// ## Usage
+//
+// ### Simple Rename
+// Position cursor on an identifier and use the rename command with a new name:
+// - `MyStruct` -> `NewStruct` (renames in current module)
+//
+// ### Move Operations
+// Use fully-qualified paths to move items between modules:
+// - `MyStruct` -> `crate::models::MyStruct` (moves to models module)
+// - `MyStruct` -> `crate::models::NewStruct` (moves and renames)
+// - `MyStruct` -> `super::types::MyStruct` (moves using relative path)
+//
+// The system automatically:
+// - Creates missing module structure
+// - Updates all references throughout the codebase
+// - Adjusts internal references within moved items
+// - Validates visibility and dependency constraints
+//
 // ![Rename](https://user-images.githubusercontent.com/48062697/113065582-055aae80-91b1-11eb-8ade-2b58e6d81883.gif)
+
+/// Performs a rename operation on the item at the specified position.
+///
+/// This function handles both simple renames and complex move operations based
+/// on the format of the new name provided. If the new name contains module path
+/// separators (`::`), it will be treated as a move operation.
+///
+/// # Arguments
+///
+/// * `db` - The root database for semantic analysis
+/// * `position` - The file position of the item to rename
+/// * `new_name` - The new name or fully-qualified path for the item
+///
+/// # Returns
+///
+/// Returns a `SourceChange` containing all the edits needed to complete the
+/// rename/move operation, or a `RenameError` if the operation cannot be performed.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Simple rename
+/// let change = rename(db, position, "NewName")?;
+///
+/// // Move to different module
+/// let change = rename(db, position, "crate::models::Item")?;
+///
+/// // Move and rename
+/// let change = rename(db, position, "crate::utils::new_helper")?;
+/// ```
+///
+/// # Operation Types
+///
+/// The function automatically detects the operation type:
+/// - **Simple Rename**: No `::` in new_name, renames in current module
+/// - **Move Only**: Target module differs, same item name
+/// - **Move and Rename**: Target module differs, different item name
+/// - **Relative Move**: Uses `super::` or relative paths
+///
+/// # Validation
+///
+/// For move operations, the function validates:
+/// - Target path syntax and validity
+/// - No naming conflicts in target module
+/// - No circular dependency creation
+/// - Visibility constraints are maintained
+/// - All dependencies remain accessible
+///
+/// The function maintains backward compatibility with existing rename behavior
+/// while adding powerful new move capabilities.
 pub(crate) fn rename(
     db: &RootDatabase,
     position: FilePosition,
@@ -282,8 +417,31 @@ fn execute_standard_rename(
         .ok_or_else(|| format_err!("No references found at position"))
 }
 
-/// Check if a string represents a fully-qualified path
-/// (Requirements 5.3, 5.4)
+/// Check if a string represents a fully-qualified path.
+///
+/// This function determines whether a rename target should be treated as a
+/// simple identifier or as a fully-qualified path that indicates a move operation.
+///
+/// # Arguments
+///
+/// * `name` - The string to check for path separators
+///
+/// # Returns
+///
+/// Returns `true` if the string contains path separators indicating it should
+/// be treated as a fully-qualified path for move operations.
+///
+/// # Examples
+///
+/// ```ignore
+/// assert_eq!(is_fully_qualified_path("SimpleIdentifier"), false);
+/// assert_eq!(is_fully_qualified_path("crate::module::Item"), true);
+/// assert_eq!(is_fully_qualified_path("super::Item"), true);
+/// assert_eq!(is_fully_qualified_path("module::submodule::Item"), true);
+/// ```
+///
+/// This detection enables automatic switching between simple rename and
+/// move operation modes based on user input format.
 fn is_fully_qualified_path(name: &str) -> bool {
     // Check for path separators that indicate a fully-qualified path
     name.contains("::") || name.starts_with("crate::")

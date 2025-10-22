@@ -111,7 +111,7 @@
     - Test error cases and conflict detection
     - _Requirements: 3.1, 3.2, 3.3, 4.1, 4.2, 4.3, 6.1, 6.2, 6.3, 6.4, 6.5_
 
-- [ ] 10. Documentation and polish
+- [x] 10. Documentation and polish
   - Add inline documentation for new public APIs
   - Update existing rename documentation to mention move capability
   - Add examples of fully-qualified path usage in comments
