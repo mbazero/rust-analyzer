@@ -132,7 +132,7 @@ fn extract_module_path(path: &ModPath) -> Result<ModPath> {
 
 /// Try to resolve a module path to an actual Module.
 /// Returns None if the module doesn't exist yet (needs to be created).
-fn try_resolve_module(
+pub fn try_resolve_module(
     sema: &Semantics<'_, RootDatabase>,
     from_module: &Module,
     path: &ModPath,

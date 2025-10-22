@@ -29,7 +29,9 @@ pub use move_item::{
     MoveOperation, RenameTarget, parse_rename_target, update_external_references,
     update_internal_references, validate_external_visibility, calculate_required_visibility,
     update_item_visibility, validate_destination_no_conflicts, validate_item_is_movable,
-    validate_no_circular_dependencies, validate_move_operation,
+    validate_no_circular_dependencies, validate_move_operation, try_resolve_module,
+    create_module_tree, extract_item_with_attrs, find_associated_impl_blocks,
+    generate_item_removal_edit, insert_module_declaration,
 };
 
 use crate::{
@@ -336,31 +338,52 @@ fn rename_to_move(
         _ => bail!("Unsupported item type for move operation"),
     };
 
-    // Find associated impl blocks
-    let _impl_blocks = find_associated_impl_blocks(sema, def);
-
-    // For now, create a minimal implementation that demonstrates the integration
-    // Full implementation will require:
-    // 1. Creating destination module files if they don't exist
-    // 2. Adding module declarations to parent modules
-    // 3. Moving the item definition
-    // 4. Updating all references (external and internal)
-
-    // This is a placeholder that will be fully implemented in integration testing
-    // For now, just bail with a descriptive message
+    // For now, bail with a more descriptive message indicating this is a work in progress
+    // The full implementation requires coordination between:
+    // 1. File system operations (creating modules)
+    // 2. Text edits (moving definitions)
+    // 3. Reference updates (both internal and external)
+    // 4. Visibility updates
+    //
+    // This will be implemented incrementally through integration testing
     let item_type = match def {
-        Definition::Adt(_) => "ADT",
-        Definition::Function(_) => "Function",
-        Definition::Const(_) => "Const",
-        Definition::Static(_) => "Static",
-        Definition::Trait(_) => "Trait",
-        Definition::TypeAlias(_) => "TypeAlias",
-        _ => "Unknown",
+        Definition::Adt(hir::Adt::Struct(_)) => "struct",
+        Definition::Adt(hir::Adt::Enum(_)) => "enum",
+        Definition::Adt(hir::Adt::Union(_)) => "union",
+        Definition::Function(_) => "function",
+        Definition::Const(_) => "const",
+        Definition::Static(_) => "static",
+        Definition::Trait(_) => "trait",
+        Definition::TypeAlias(_) => "type alias",
+        _ => "item",
     };
 
+    // Format the module path
+    let mut path_str = String::new();
+    match move_op.dest_module_path.kind {
+        hir::PathKind::Crate => path_str.push_str("crate"),
+        hir::PathKind::Super(0) => path_str.push_str("self"),
+        hir::PathKind::Super(n) => {
+            for _ in 0..n {
+                if !path_str.is_empty() {
+                    path_str.push_str("::");
+                }
+                path_str.push_str("super");
+            }
+        }
+        _ => {}
+    }
+    for segment in move_op.dest_module_path.segments() {
+        if !path_str.is_empty() {
+            path_str.push_str("::");
+        }
+        path_str.push_str(segment.as_str());
+    }
+
     bail!(
-        "Move operation detected: {} to {}. Full implementation pending.",
+        "Rename-to-move detected: moving {} to module {}::{}. Full implementation in progress.",
         item_type,
+        path_str,
         new_name
     )
 }
