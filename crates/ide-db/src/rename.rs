@@ -28,7 +28,8 @@ use std::fmt::{self, Display};
 pub use move_item::{
     MoveOperation, RenameTarget, parse_rename_target, update_external_references,
     update_internal_references, validate_external_visibility, calculate_required_visibility,
-    update_item_visibility,
+    update_item_visibility, validate_destination_no_conflicts, validate_item_is_movable,
+    validate_no_circular_dependencies, validate_move_operation,
 };
 
 use crate::{

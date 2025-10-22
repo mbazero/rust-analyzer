@@ -1259,6 +1259,101 @@ pub fn update_item_visibility(
     Ok(result)
 }
 
+/// Validate that the destination module doesn't have conflicting item names.
+pub fn validate_destination_no_conflicts(
+    sema: &Semantics<'_, RootDatabase>,
+    dest_module: &Module,
+    new_name: &str,
+) -> Result<()> {
+    // Get all items in the destination module
+    let scope = dest_module.scope(sema.db, None);
+
+    // Check if there's already an item with this name
+    for (name, _def) in scope.iter() {
+        if name.display_no_db(span::Edition::LATEST).to_string() == new_name {
+            bail!("Item '{}' already exists in destination module", new_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate that the item can be moved (not a local, not from external crate).
+pub fn validate_item_is_movable(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+) -> Result<()> {
+    // Check if this is a local variable or parameter
+    if matches!(def, Definition::Local(_)) {
+        bail!("Cannot move local items");
+    }
+
+    // Check if this is from an external crate
+    if let Some(krate) = def.krate(sema.db) {
+        if !krate.origin(sema.db).is_local() {
+            bail!("Cannot move items from external crates");
+        }
+    }
+
+    // Check for other non-movable types
+    match def {
+        Definition::BuiltinType(_) => bail!("Cannot move builtin types"),
+        Definition::BuiltinAttr(_) => bail!("Cannot move builtin attributes"),
+        Definition::BuiltinLifetime(_) => bail!("Cannot move builtin lifetimes"),
+        Definition::ToolModule(_) => bail!("Cannot move tool modules"),
+        Definition::SelfType(_) => bail!("Cannot move Self type"),
+        Definition::Label(_) => bail!("Cannot move labels"),
+        Definition::DeriveHelper(_) => bail!("Cannot move derive helpers"),
+        Definition::GenericParam(_) => bail!("Cannot move generic parameters"),
+        _ => Ok(()),
+    }
+}
+
+/// Validate that moving to the destination won't create circular dependencies.
+///
+/// For now, this is a simplified check. A full implementation would need to
+/// analyze the dependency graph of modules.
+pub fn validate_no_circular_dependencies(
+    _sema: &Semantics<'_, RootDatabase>,
+    _source_module: &Module,
+    _dest_module: &Module,
+) -> Result<()> {
+    // Simplified: We don't check for circular dependencies yet
+    // A full implementation would need to:
+    // 1. Build a dependency graph of modules
+    // 2. Check if adding an edge from dest_module to source_module would create a cycle
+    // 3. This is complex because it requires analyzing all imports and uses
+
+    // For now, we allow all moves and let the compiler catch circular dependencies
+    Ok(())
+}
+
+/// Comprehensive validation for a move operation.
+///
+/// This function performs all necessary validation checks before attempting to move an item.
+pub fn validate_move_operation(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    item_syntax: &syntax::SyntaxNode,
+    source_module: &Module,
+    dest_module: &Module,
+    new_name: &str,
+) -> Result<()> {
+    // 1. Validate the item is movable
+    validate_item_is_movable(sema, def)?;
+
+    // 2. Validate destination doesn't have conflicts
+    validate_destination_no_conflicts(sema, dest_module, new_name)?;
+
+    // 3. Validate external visibility (referenced items will remain accessible)
+    validate_external_visibility(sema, item_syntax, source_module, dest_module)?;
+
+    // 4. Check for circular dependencies
+    validate_no_circular_dependencies(sema, source_module, dest_module)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
