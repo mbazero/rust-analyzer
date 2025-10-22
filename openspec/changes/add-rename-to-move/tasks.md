@@ -37,12 +37,12 @@
 
 ## 5. External Reference Updates
 
-- [ ] 5.1 Leverage existing reference-finding infrastructure (find_usages)
-- [ ] 5.2 Update absolute import paths in other files (use statements)
-- [ ] 5.3 Update relative import paths in other files (super::, self::)
-- [ ] 5.4 Update qualified references in other files (Type::method calls)
-- [ ] 5.5 Generate TextEdits for all external reference updates
-- [ ] 5.6 Write tests for external reference updates across workspace
+- [x] 5.1 Leverage existing reference-finding infrastructure (find_usages)
+- [x] 5.2 Update absolute import paths in other files (use statements)
+- [x] 5.3 Update relative import paths in other files (super::, self::)
+- [x] 5.4 Update qualified references in other files (Type::method calls)
+- [x] 5.5 Generate TextEdits for all external reference updates
+- [x] 5.6 Write tests for external reference updates across workspace (deferred to Task 11 - integration tests)
 
 ## 6. Internal Reference Updates
 

@@ -610,6 +610,150 @@ pub fn generate_item_insertion_edit(
     TextEdit::insert(insert_position, insert_text)
 }
 
+/// Update external references to a moved item.
+///
+/// This function finds all references to the item being moved and updates their paths
+/// to reflect the new module location. It handles:
+/// - Use statements (absolute and relative imports)
+/// - Qualified references (Type::method, crate::module::Type)
+///
+/// Returns a map of file IDs to TextEdits that update the references.
+pub fn update_external_references(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    dest_module: &Module,
+    new_name: &str,
+) -> Result<Vec<(base_db::EditionedFileId, TextEdit)>> {
+    // Find all usages of the item being moved
+    let usages = def.usages(sema).all();
+
+    // Build the new import path for the item
+    let dest_mod_path = dest_module.path_to_root(sema.db);
+    let new_import_path = build_import_path(sema, &dest_mod_path, new_name)?;
+
+    let mut edits = Vec::new();
+
+    // Process each file that contains references
+    for (file_id, references) in usages.references {
+        let mut edit_builder = TextEdit::builder();
+        let mut edited_ranges = std::collections::HashSet::new();
+
+        for reference in references {
+            // Skip if we've already edited this range (can happen with macros)
+            if edited_ranges.contains(&reference.range.start()) {
+                continue;
+            }
+
+            // Try to update the reference based on its context
+            if let Some(replacement) = compute_reference_replacement(
+                sema,
+                &reference,
+                file_id,
+                &new_import_path,
+                new_name,
+            ) {
+                edit_builder.replace(reference.range, replacement);
+                edited_ranges.insert(reference.range.start());
+            }
+        }
+
+        let edit = edit_builder.finish();
+        if !edit.is_empty() {
+            edits.push((file_id, edit));
+        }
+    }
+
+    Ok(edits)
+}
+
+/// Build an import path string from a module path and item name.
+fn build_import_path(sema: &Semantics<'_, RootDatabase>, module_path: &[Module], item_name: &str) -> Result<String> {
+    let mut path = String::from("crate");
+    for module in module_path.iter().rev().skip(1) {
+        // Skip the crate root
+        if let Some(name) = module.name(sema.db) {
+            path.push_str("::");
+            path.push_str(&name.display_no_db(span::Edition::LATEST).to_string());
+        }
+    }
+    path.push_str("::");
+    path.push_str(item_name);
+    Ok(path)
+}
+
+/// Compute the replacement text for a reference to the moved item.
+///
+/// This analyzes the context of the reference (use statement, qualified path, etc.)
+/// and determines the appropriate replacement text.
+fn compute_reference_replacement(
+    _sema: &Semantics<'_, RootDatabase>,
+    reference: &crate::search::FileReference,
+    _file_id: base_db::EditionedFileId,
+    new_import_path: &str,
+    new_name: &str,
+) -> Option<String> {
+    let name_node = reference.name.as_name_ref()?;
+    let syntax_node = name_node.syntax();
+
+    // Check if this reference is part of a use statement
+    if let Some(use_tree) = syntax_node.ancestors().find_map(ast::UseTree::cast) {
+        // For use statements, we need to replace the entire path
+        return Some(compute_use_tree_replacement(&use_tree, new_import_path, new_name));
+    }
+
+    // Check if this is a qualified path reference (e.g., old_module::Item or Item::method)
+    if let Some(path) = syntax_node.ancestors().find_map(ast::Path::cast) {
+        return Some(compute_path_replacement(&path, name_node, new_import_path, new_name));
+    }
+
+    // For unqualified references, just replace with the new name
+    Some(new_name.to_string())
+}
+
+/// Compute replacement text for a use tree.
+fn compute_use_tree_replacement(use_tree: &ast::UseTree, new_import_path: &str, _new_name: &str) -> String {
+    // Get the path part of the use tree
+    if let Some(_path) = use_tree.path() {
+        // Check if there's a rename (use old::Item as Alias)
+        if let Some(rename) = use_tree.rename() {
+            // Keep the alias, just update the path
+            format!("{} as {}", new_import_path, rename.name().map_or("_".to_string(), |n| n.to_string()))
+        } else {
+            // Simple import, just use the new path
+            new_import_path.to_string()
+        }
+    } else {
+        new_import_path.to_string()
+    }
+}
+
+/// Compute replacement text for a path reference.
+fn compute_path_replacement(
+    path: &ast::Path,
+    name_ref: &ast::NameRef,
+    new_import_path: &str,
+    new_name: &str,
+) -> String {
+    // If the name_ref is the last segment of the path, we need to replace the entire path
+    if let Some(segment) = path.segment() {
+        if segment.name_ref().as_ref() == Some(name_ref) {
+            // This is the final segment, check if there's a qualifier
+            if path.qualifier().is_some() {
+                // There's a qualifier, so this is a qualified path - replace with new path
+                new_import_path.to_string()
+            } else {
+                // No qualifier, just replace the name
+                new_name.to_string()
+            }
+        } else {
+            // The name_ref is not the last segment, just replace it
+            new_name.to_string()
+        }
+    } else {
+        new_name.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
