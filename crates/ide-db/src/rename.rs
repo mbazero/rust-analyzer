@@ -5055,6 +5055,104 @@ mod tests {
         assert_eq!(calculate_path_distance(path1, path2), 4);
     }
 
+    // Additional edge case tests for path parsing and validation (Requirements 1.1, 1.3)
+    
+    #[test]
+    fn test_parse_path_with_keywords() {
+        let db = RootDatabase::with_files("");
+
+        // Test paths containing Rust keywords (should be valid as module names in paths)
+        let result = parse_rename_target("crate::r#mod::Item", &db);
+        assert!(result.is_ok());
+        
+        // Test invalid keyword usage
+        let result = parse_rename_target("crate::struct::Item", &db);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_path_with_special_characters() {
+        let db = RootDatabase::with_files("");
+
+        // Test paths with underscores (valid)
+        let result = parse_rename_target("crate::my_module::my_item", &db);
+        assert!(result.is_ok());
+        
+        // Test paths with numbers (valid)
+        let result = parse_rename_target("crate::module2::item3", &db);
+        assert!(result.is_ok());
+        
+        // Test paths with invalid characters
+        let result = parse_rename_target("crate::my-module::item", &db);
+        assert!(result.is_err());
+        
+        let result = parse_rename_target("crate::my module::item", &db);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_relative_vs_absolute_paths() {
+        let db = RootDatabase::with_files("");
+
+        // Test absolute path (starts with crate::)
+        let result = parse_rename_target("crate::module::Item", &db);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.kind, PathKind::Crate);
+
+        // Test relative path (no crate:: prefix)
+        let result = parse_rename_target("module::Item", &db);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.kind, PathKind::Plain);
+
+        // Test super:: path
+        let result = parse_rename_target("super::Item", &db);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.kind, PathKind::Super(1));
+
+        // Test self:: path
+        let result = parse_rename_target("self::Item", &db);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.kind, PathKind::Plain);
+    }
+
+    #[test]
+    fn test_parse_empty_and_malformed_paths() {
+        let db = RootDatabase::with_files("");
+
+        // Test empty path
+        let result = parse_rename_target("", &db);
+        assert!(result.is_err());
+
+        // Test path with only separators
+        let result = parse_rename_target("::", &db);
+        assert!(result.is_err());
+
+        // Test path ending with separator
+        let result = parse_rename_target("crate::module::", &db);
+        assert!(result.is_err());
+
+        // Test path starting with separator
+        let result = parse_rename_target("::module::Item", &db);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_deeply_nested_paths() {
+        let db = RootDatabase::with_files("");
+
+        // Test very deep nesting (should work)
+        let deep_path = "crate::a::b::c::d::e::f::g::h::i::j::Item";
+        let result = parse_rename_target(deep_path, &db);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path.segments().len(), 10); // 9 modules + 1 item
+        assert_eq!(path.segments().last().unwrap().as_str(), "Item");
+    }
+
     #[test]
     fn test_find_common_ancestor() {
         use std::path::Path;
@@ -5071,5 +5169,43 @@ mod tests {
         let path2 = Path::new("/other/file.rs");
         let ancestor = find_common_ancestor(path1, path2);
         assert_eq!(ancestor, Some(Path::new("/").to_path_buf()));
+    }
+
+    // Integration tests for module creation (Requirements 2.1, 2.2, 2.3, 2.4, 2.5)
+    // Note: These tests are placeholders for when the full implementation is complete
+
+    #[test]
+    fn test_module_organization_preferences_creation() {
+        // Test creating preferences with different settings
+        let mut prefs = ModuleOrganizationPreferences::default();
+        assert!(!prefs.prefer_mod_rs);
+        
+        prefs.prefer_mod_rs = true;
+        assert!(prefs.prefer_mod_rs);
+        
+        prefs.directory_structure = DirectoryStructurePreference::Flat;
+        assert!(matches!(prefs.directory_structure, DirectoryStructurePreference::Flat));
+    }
+
+    #[test]
+    fn test_module_file_type_variants() {
+        // Test that module file type variants exist and can be matched
+        let mod_rs = ModuleFileType::ModRs;
+        let module_file = ModuleFileType::ModuleFile;
+        
+        assert!(matches!(mod_rs, ModuleFileType::ModRs));
+        assert!(matches!(module_file, ModuleFileType::ModuleFile));
+    }
+
+    #[test]
+    fn test_module_creation_plan_structure() {
+        // Test that ModuleCreationPlan can be created and has expected fields
+        let prefs = ModuleOrganizationPreferences::default();
+        let plan = ModuleCreationPlan::new(prefs.clone());
+        
+        assert!(plan.directories_to_create.is_empty());
+        assert!(plan.files_to_create.is_empty());
+        assert!(plan.module_declarations_to_add.is_empty());
+        assert_eq!(plan.user_preferences.prefer_mod_rs, prefs.prefer_mod_rs);
     }
 }

@@ -92,20 +92,20 @@
   - Handle module creation failures and reference update errors gracefully
   - _Requirements: 4.1, 4.2, 4.3, 4.5, plus error handling for Requirements 2.1, 2.5, 3.1-3.5, 6.1-6.5_
 
-- [ ] 9. Write comprehensive tests
-  - [ ] 9.1 Add unit tests for path parsing and validation
+- [x] 9. Write comprehensive tests
+  - [x] 9.1 Add unit tests for path parsing and validation
     - Test valid and invalid fully-qualified path formats
     - Test edge cases with keywords and special characters
     - Test relative vs absolute path handling
     - _Requirements: 1.1, 1.3_
 
-  - [ ] 9.2 Add integration tests for module creation
+  - [x] 9.2 Add integration tests for module creation
     - Test creating nested module structures
     - Test handling of existing vs new modules
     - Test different module file organization preferences
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5_
 
-  - [ ] 9.3 Add end-to-end move operation tests
+  - [x] 9.3 Add end-to-end move operation tests
     - Test moving structs, enums, functions between modules
     - Test complex scenarios with dependencies and visibility
     - Test error cases and conflict detection

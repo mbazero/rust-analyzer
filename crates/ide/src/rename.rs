@@ -3772,4 +3772,412 @@ fn bar(v: Foo) {
         "#,
         );
     }
+
+    // End-to-end move operation tests (Requirements 3.1, 3.2, 3.3, 4.1, 4.2, 4.3, 6.1, 6.2, 6.3, 6.4, 6.5)
+
+    #[test]
+    fn test_move_struct_between_modules() {
+        check_expect(
+            "crate::target_module::MovedStruct",
+            r#"
+//- /lib.rs
+mod source_module {
+    pub struct TestStruct$0 {
+        pub field: i32,
+    }
+    
+    impl TestStruct {
+        pub fn new() -> Self {
+            Self { field: 0 }
+        }
+    }
+}
+
+mod target_module {
+    // Target module exists but is empty
+}
+
+fn main() {
+    let instance = source_module::TestStruct::new();
+    println!("{}", instance.field);
+}
+"#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(0),
+                        [
+                            Indel {
+                                insert: "MovedStruct",
+                                delete: 45..55,
+                            },
+                            Indel {
+                                insert: "MovedStruct",
+                                delete: 89..99,
+                            },
+                            Indel {
+                                insert: "target_module::MovedStruct",
+                                delete: 200..226,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_move_function_between_modules() {
+        check_expect(
+            "crate::utils::helper_function",
+            r#"
+//- /lib.rs
+mod source {
+    pub fn test_function$0(x: i32) -> i32 {
+        x * 2
+    }
+}
+
+mod utils {
+    // Target module exists
+}
+
+fn main() {
+    let result = source::test_function(5);
+    println!("{}", result);
+}
+"#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(0),
+                        [
+                            Indel {
+                                insert: "helper_function",
+                                delete: 25..38,
+                            },
+                            Indel {
+                                insert: "utils::helper_function",
+                                delete: 130..152,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_move_enum_with_dependencies() {
+        check_expect(
+            "crate::types::Status",
+            r#"
+//- /lib.rs
+mod source {
+    #[derive(Debug, Clone)]
+    pub enum TestEnum$0 {
+        Variant1,
+        Variant2(i32),
+    }
+    
+    pub fn process_enum(e: TestEnum) -> TestEnum {
+        match e {
+            TestEnum::Variant1 => TestEnum::Variant2(42),
+            TestEnum::Variant2(x) => TestEnum::Variant1,
+        }
+    }
+}
+
+mod types {
+    // Target module
+}
+
+fn main() {
+    use source::TestEnum;
+    let e = TestEnum::Variant1;
+    let processed = source::process_enum(e);
+    println!("{:?}", processed);
+}
+"#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(0),
+                        [
+                            Indel {
+                                insert: "Status",
+                                delete: 58..66,
+                            },
+                            Indel {
+                                insert: "Status",
+                                delete: 149..157,
+                            },
+                            Indel {
+                                insert: "Status",
+                                delete: 167..175,
+                            },
+                            Indel {
+                                insert: "Status::Variant1",
+                                delete: 198..216,
+                            },
+                            Indel {
+                                insert: "Status::Variant2(42)",
+                                delete: 219..240,
+                            },
+                            Indel {
+                                insert: "Status::Variant1",
+                                delete: 264..282,
+                            },
+                            Indel {
+                                insert: "types::Status",
+                                delete: 340..357,
+                            },
+                            Indel {
+                                insert: "Status::Variant1",
+                                delete: 370..388,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_move_operation_name_conflict_error() {
+        check(
+            "crate::target::ExistingStruct",
+            r#"
+//- /lib.rs
+mod source {
+    pub struct TestStruct$0 {
+        field: i32,
+    }
+}
+
+mod target {
+    pub struct ExistingStruct {
+        other_field: String,
+    }
+}
+"#,
+            "error: Name conflict: item 'ExistingStruct' already exists in target module",
+        );
+    }
+
+    #[test]
+    fn test_move_operation_visibility_validation() {
+        check_expect(
+            "crate::private_module::PublicStruct",
+            r#"
+//- /lib.rs
+pub struct TestStruct$0 {
+    pub field: i32,
+}
+
+mod private_module {
+    // Private module - moving public struct here should work
+    // but may affect accessibility
+}
+
+pub fn use_struct() -> TestStruct {
+    TestStruct { field: 42 }
+}
+"#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(0),
+                        [
+                            Indel {
+                                insert: "PublicStruct",
+                                delete: 11..21,
+                            },
+                            Indel {
+                                insert: "private_module::PublicStruct",
+                                delete: 156..166,
+                            },
+                            Indel {
+                                insert: "private_module::PublicStruct",
+                                delete: 172..182,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_move_with_internal_references_update() {
+        check_expect(
+            "crate::new_location::MovedStruct",
+            r#"
+//- /lib.rs
+mod original {
+    pub struct TestStruct$0 {
+        field: i32,
+    }
+    
+    impl TestStruct {
+        pub fn new() -> Self {
+            Self { field: 0 }
+        }
+        
+        pub fn get_field(&self) -> i32 {
+            self.field
+        }
+    }
+}
+
+mod new_location {
+    // Target module
+}
+
+fn main() {
+    let s = original::TestStruct::new();
+    println!("{}", s.get_field());
+}
+"#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(0),
+                        [
+                            Indel {
+                                insert: "MovedStruct",
+                                delete: 29..39,
+                            },
+                            Indel {
+                                insert: "MovedStruct",
+                                delete: 73..83,
+                            },
+                            Indel {
+                                insert: "new_location::MovedStruct",
+                                delete: 244..266,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_move_creates_missing_module_structure() {
+        check_expect(
+            "crate::deeply::nested::new_module::MovedItem",
+            r#"
+//- /lib.rs
+pub fn test_function$0() -> i32 {
+    42
+}
+
+fn main() {
+    println!("{}", test_function());
+}
+"#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(0),
+                        [
+                            Indel {
+                                insert: "MovedItem",
+                                delete: 7..20,
+                            },
+                            Indel {
+                                insert: "deeply::nested::new_module::MovedItem",
+                                delete: 59..72,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: [
+                    CreateFile {
+                        dst: AnchoredPathBuf {
+                            anchor: FileId(0),
+                            path: "deeply.rs",
+                        },
+                        initial_contents: "//! The `deeply` module\n//!\n//! TODO: Add module documentation\n",
+                    },
+                    CreateFile {
+                        dst: AnchoredPathBuf {
+                            anchor: FileId(0),
+                            path: "deeply/nested.rs",
+                        },
+                        initial_contents: "//! The `nested` module\n//!\n//! TODO: Add module documentation\n",
+                    },
+                    CreateFile {
+                        dst: AnchoredPathBuf {
+                            anchor: FileId(0),
+                            path: "deeply/nested/new_module.rs",
+                        },
+                        initial_contents: "//! The `new_module` module\n//!\n//! TODO: Add module documentation\n",
+                    },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_move_circular_dependency_detection() {
+        check(
+            "crate::child::Parent",
+            r#"
+//- /lib.rs
+mod parent {
+    use super::child::Child;
+    
+    pub struct Parent$0 {
+        child: Child,
+    }
+}
+
+mod child {
+    use super::parent::Parent;
+    
+    pub struct Child {
+        parent_ref: *const Parent,
+    }
+}
+"#,
+            "error: Move would create circular dependency",
+        );
+    }
+
+    #[test]
+    fn test_move_relative_path_same_module() {
+        check(
+            "NewName",
+            r#"
+//- /lib.rs
+mod test_module {
+    pub struct OldName$0 {
+        field: i32,
+    }
+    
+    pub fn use_struct() -> OldName {
+        OldName { field: 42 }
+    }
+}
+"#,
+            r#"
+mod test_module {
+    pub struct NewName {
+        field: i32,
+    }
+    
+    pub fn use_struct() -> NewName {
+        NewName { field: 42 }
+    }
+}
+"#,
+        );
+    }
 }
