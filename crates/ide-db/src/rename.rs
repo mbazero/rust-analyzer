@@ -20,7 +20,12 @@
 //!
 //! The correct behavior in such cases is probably to show a dialog to the user.
 //! Our current behavior is ¯\_(ツ)_/¯.
+
+mod move_item;
+
 use std::fmt::{self, Display};
+
+pub use move_item::{MoveOperation, RenameTarget, parse_rename_target};
 
 use crate::{
     source_change::ChangeAnnotation,

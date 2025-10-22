@@ -2,11 +2,11 @@
 
 ## 1. Path Parsing and Move Detection
 
-- [ ] 1.1 Add path parsing logic to detect fully-qualified paths in rename requests
-- [ ] 1.2 Implement comparison between current item path and target path
-- [ ] 1.3 Create `MoveOperation` struct to represent source/destination modules and item names
-- [ ] 1.4 Add validation for module path components (valid identifiers, no keywords)
-- [ ] 1.5 Write unit tests for path parsing and move detection
+- [x] 1.1 Add path parsing logic to detect fully-qualified paths in rename requests
+- [x] 1.2 Implement comparison between current item path and target path
+- [x] 1.3 Create `MoveOperation` struct to represent source/destination modules and item names
+- [x] 1.4 Add validation for module path components (valid identifiers, no keywords)
+- [x] 1.5 Write unit tests for path parsing and move detection
 
 ## 2. Module File System Operations
 
