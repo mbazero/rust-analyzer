@@ -12,6 +12,7 @@ use ide_db::{
     source_change::SourceChangeBuilder,
 };
 use itertools::Itertools;
+use span::Edition;
 use std::fmt::Write;
 use stdx::{always, format_to, never};
 use syntax::{
@@ -49,7 +50,7 @@ fn ok_if_any<T, E>(iter: impl Iterator<Item = Result<T, E>>) -> Result<Vec<T>, E
 }
 
 /// Prepares a rename. The sole job of this function is to return the TextRange of the thing that is
-/// being targeted for a rename.
+/// being targeted for a rename. Extended to handle fully-qualified path validation for move operations.
 pub(crate) fn prepare_rename(
     db: &RootDatabase,
     position: FilePosition,
@@ -59,12 +60,27 @@ pub(crate) fn prepare_rename(
     let syntax = source_file.syntax();
 
     let res = find_definitions(&sema, syntax, position, &Name::new_symbol_root(sym::underscore))?
-        .filter(|(_, _, def, _, _)| def.range_for_rename(&sema).is_some())
-        .map(|(frange, kind, _, _, _)| {
+        .filter(|(_, _, def, _, _)| {
+            // Check if definition can be renamed (existing logic)
+            if def.range_for_rename(&sema).is_some() {
+                return true;
+            }
+            
+            // For move operations, also check if the definition supports moving
+            // (Requirement 5.4)
+            can_be_moved(&sema, *def)
+        })
+        .map(|(frange, kind, def, _, _)| {
             always!(
                 frange.range.contains_inclusive(position.offset)
                     && frange.file_id == position.file_id
             );
+
+            // Validate that move operations are supported for this definition type
+            // (Requirement 5.4)
+            if !supports_move_operation(&sema, def) {
+                return Err(format_err!("Move operations not supported for this item type"));
+            }
 
             Ok(match kind {
                 SyntaxKind::LIFETIME => {
@@ -85,6 +101,56 @@ pub(crate) fn prepare_rename(
         Some(res) => res.map(|range| RangeInfo::new(range, ())),
         None => bail!("No references found at position"),
     }
+}
+
+/// Check if a definition can be moved to another module
+/// (Requirement 5.4)
+fn can_be_moved(_sema: &Semantics<'_, RootDatabase>, def: Definition) -> bool {
+    match def {
+        // Items that can be moved between modules
+        Definition::Function(_) |
+        Definition::Adt(_) |
+        Definition::Variant(_) |
+        Definition::Const(_) |
+        Definition::Static(_) |
+        Definition::Trait(_) |
+        Definition::TypeAlias(_) |
+        Definition::Macro(_) => true,
+        
+        // Module moves are handled separately
+        Definition::Module(_) => true,
+        
+        // Items that cannot be moved
+        Definition::Local(_) |
+        Definition::GenericParam(_) |
+        Definition::Label(_) |
+        Definition::Field(_) |
+        Definition::SelfType(_) |
+        Definition::BuiltinType(_) |
+        Definition::BuiltinLifetime(_) |
+        Definition::BuiltinAttr(_) |
+        Definition::ToolModule(_) |
+        Definition::TupleField(_) |
+        Definition::DeriveHelper(_) |
+        Definition::ExternCrateDecl(_) |
+        Definition::InlineAsmOperand(_) |
+        Definition::InlineAsmRegOrRegClass(_) |
+        Definition::Crate(_) => false,
+    }
+}
+
+/// Check if move operations are supported for this definition type
+/// (Requirement 5.4)
+fn supports_move_operation(sema: &Semantics<'_, RootDatabase>, def: Definition) -> bool {
+    // Check if the definition is in a local crate (can't move external items)
+    if let Some(krate) = def.krate(sema.db) {
+        if !krate.origin(sema.db).is_local() {
+            return false;
+        }
+    }
+    
+    // Check if the definition type supports moving
+    can_be_moved(sema, def)
 }
 
 // Feature: Rename
@@ -109,9 +175,65 @@ pub(crate) fn rename(
     let syntax = source_file.syntax();
 
     let edition = file_id.edition(db);
+
+    // Check if new_name is a fully-qualified path (Requirements 5.3, 5.4, 5.5)
+    if is_fully_qualified_path(new_name) {
+        // Parse the fully-qualified path to detect FQP input (Requirement 1.1)
+        match ide_db::rename::parse_fully_qualified_path(new_name, db) {
+            Ok((target_module_path, new_item_name)) => {
+                // Find the definition at the current position
+                let defs: Vec<_> = find_definitions(&sema, syntax, position, &new_item_name)?.collect();
+                if let Some((_, _, def, _, _)) = defs.first() {
+                    // Determine operation type (Requirement 1.2)
+                    match ide_db::rename::determine_operation_type(&sema, *def, &target_module_path, &new_item_name) {
+                        Ok(operation_type) => {
+                            match operation_type {
+                                ide_db::rename::RenameOperationType::SimpleRename => {
+                                    // Same module - use existing rename logic (Requirement 5.4, 5.5)
+                                    return execute_standard_rename(db, &sema, file_id, syntax, position, &new_item_name.display(db, edition).to_string(), edition);
+                                }
+                                ide_db::rename::RenameOperationType::MoveOnly | 
+                                ide_db::rename::RenameOperationType::MoveAndRename => {
+                                    // Different module - execute move operation (Requirement 1.2)
+                                    return execute_move_operation(&sema, *def, target_module_path, new_item_name);
+                                }
+                                ide_db::rename::RenameOperationType::RelativeMove => {
+                                    // Relative move within same module (Requirement 5.2, 5.3)
+                                    return execute_move_operation(&sema, *def, target_module_path, new_item_name);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            return Err(RenameError(err.to_string()));
+                        }
+                    }
+                } else {
+                    return Err(format_err!("No definition found at position"));
+                }
+            }
+            Err(_) => {
+                // Invalid FQP - fall through to standard rename with error handling
+            }
+        }
+    }
+
+    // Standard rename logic (maintain backward compatibility - Requirement 5.5)
+    execute_standard_rename(db, &sema, file_id, syntax, position, new_name, edition)
+}
+
+/// Execute standard rename operation (extracted for reuse)
+fn execute_standard_rename(
+    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
+    file_id: ide_db::EditionedFileId,
+    syntax: &SyntaxNode,
+    position: FilePosition,
+    new_name: &str,
+    edition: Edition,
+) -> RenameResult<SourceChange> {
     let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
 
-    let defs = find_definitions(&sema, syntax, position, &new_name)?;
+    let defs = find_definitions(sema, syntax, position, &new_name)?;
     let alias_fallback =
         alias_fallback(syntax, position, &new_name.display(db, edition).to_string());
 
@@ -131,7 +253,7 @@ pub(crate) fn rename(
                             bail!("Cannot rename alias reference to `self`")
                         }
                     };
-                    let mut usages = def.usages(&sema).all();
+                    let mut usages = def.usages(sema).all();
 
                     // FIXME: hack - removes the usage that triggered this rename operation.
                     match usages.references.get_mut(&file_id).and_then(|refs| {
@@ -158,14 +280,14 @@ pub(crate) fn rename(
             if let Definition::Local(local) = def {
                 if let Some(self_param) = local.as_self_param(sema.db) {
                     cov_mark::hit!(rename_self_to_param);
-                    return rename_self_to_param(&sema, local, self_param, &new_name, kind);
+                    return rename_self_to_param(sema, local, self_param, &new_name, kind);
                 }
                 if kind == IdentifierKind::LowercaseSelf {
                     cov_mark::hit!(rename_to_self);
-                    return rename_to_self(&sema, local);
+                    return rename_to_self(sema, local);
                 }
             }
-            def.rename(&sema, new_name.as_str(), rename_def)
+            def.rename(sema, new_name.as_str(), rename_def)
         })),
     };
 
@@ -173,6 +295,67 @@ pub(crate) fn rename(
         .chain(alias_fallback)
         .reduce(|acc, elem| acc.merge(elem))
         .ok_or_else(|| format_err!("No references found at position"))
+}
+
+/// Check if a string represents a fully-qualified path
+/// (Requirements 5.3, 5.4)
+fn is_fully_qualified_path(name: &str) -> bool {
+    // Check for path separators that indicate a fully-qualified path
+    name.contains("::") || name.starts_with("crate::")
+}
+
+/// Execute move operation using the implemented move functionality
+/// (Requirement 1.2)
+fn execute_move_operation(
+    sema: &Semantics<'_, RootDatabase>,
+    def: Definition,
+    target_module_path: hir::ModPath,
+    new_item_name: hir::Name,
+) -> RenameResult<SourceChange> {
+    // Find the target module
+    let current_module = def.module(sema.db)
+        .ok_or_else(|| format_err!("Cannot determine current module for definition"))?;
+    
+    let target_module = resolve_target_module(sema, current_module, &target_module_path)
+        .map_err(|e| format_err!("Cannot resolve target module: {}", e))?;
+
+    // Validate the move operation (Requirements 4.1, 4.2, 4.3, 4.4, 4.5)
+    ide_db::rename::validate_move_operation(sema, def, &target_module_path, &new_item_name, target_module)
+        .map_err(|e| RenameError(e.to_string()))?;
+
+    // Execute the move operation
+    ide_db::rename::move_item_to_module(sema, def, target_module, &new_item_name)
+        .map_err(|e| RenameError(e.to_string()))
+}
+
+/// Resolve target module from ModPath
+fn resolve_target_module(
+    sema: &Semantics<'_, RootDatabase>,
+    current_module: hir::Module,
+    target_path: &hir::ModPath,
+) -> Result<hir::Module, String> {
+    let mut current = match target_path.kind {
+        hir::PathKind::Crate => current_module.crate_root(sema.db),
+        hir::PathKind::Super(n) => {
+            let mut module = current_module;
+            for _ in 0..n {
+                module = module.parent(sema.db)
+                    .ok_or_else(|| "Cannot resolve super:: path - not enough parent modules".to_string())?;
+            }
+            module
+        }
+        hir::PathKind::Plain => current_module,
+        _ => return Err("Unsupported path kind for module resolution".to_string()),
+    };
+
+    // Traverse each segment in the target path
+    for segment in target_path.segments() {
+        current = current.children(sema.db)
+            .find(|child| child.name(sema.db) == Some(segment.clone()))
+            .ok_or_else(|| format!("Module '{}' not found", segment.display(sema.db, Edition::CURRENT)))?;
+    }
+
+    Ok(current)
 }
 
 /// Called by the client when it is about to rename a file.

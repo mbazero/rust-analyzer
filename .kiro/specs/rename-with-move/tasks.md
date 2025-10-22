@@ -72,14 +72,14 @@
     - Validate that move won't violate Rust's module privacy rules
     - _Requirements: 4.2, 4.3, 4.4, 4.5_
 
-- [ ] 7. Integrate move functionality into existing rename system
-  - [ ] 7.1 Modify main rename entry point
+- [x] 7. Integrate move functionality into existing rename system
+  - [x] 7.1 Modify main rename entry point
     - Update `rename` function in `crates/ide/src/rename.rs` to detect FQP input
     - Add routing logic between simple rename and move operations
     - Maintain backward compatibility with existing rename behavior
     - _Requirements: 5.3, 5.4, 5.5_
 
-  - [ ] 7.2 Update prepare_rename for move operations
+  - [x] 7.2 Update prepare_rename for move operations
     - Extend `prepare_rename` to handle fully-qualified path validation
     - Add preview information for move operations
     - Ensure consistent behavior with existing rename preparation
