@@ -4,7 +4,7 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, InFile, Name, Semantics, sym};
+use hir::{AsAssocItem, InFile, Module, Name, Semantics, sym};
 use ide_db::{
     FileId, FileRange, RootDatabase,
     defs::{Definition, NameClass, NameRefClass},
@@ -16,8 +16,10 @@ use std::fmt::Write;
 use stdx::{always, format_to, never};
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
-    ast::{self, HasArgList, prec::ExprPrecedence},
+    ast::{self, HasArgList, HasGenericArgs, PathSegmentKind, prec::ExprPrecedence},
 };
+
+use span::Edition;
 
 use ide_db::text_edit::TextEdit;
 
@@ -26,6 +28,175 @@ use crate::{FilePosition, RangeInfo, SourceChange};
 pub use ide_db::rename::RenameError;
 
 type RenameResult<T> = Result<T, RenameError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MoveOperation {
+    source_module_path: Vec<Name>,
+    dest_module_path: Vec<Name>,
+    source_item_name: Name,
+    dest_item_name: Name,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedRenameTarget {
+    final_name_text: String,
+    move_target: Option<MoveTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MoveTarget {
+    kind: MovePathHead,
+    module_path: Vec<Name>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MovePathHead {
+    Crate,
+}
+
+impl ParsedRenameTarget {
+    fn parse(edition: Edition, raw: &str) -> RenameResult<Self> {
+        if !raw.contains("::") {
+            return Ok(Self { final_name_text: raw.to_string(), move_target: None });
+        }
+
+        let path = ast::make::path_from_text_with_edition(raw, edition);
+        if path.syntax().descendants().any(|node| node.kind() == SyntaxKind::ERROR) {
+            bail!("Invalid path `{raw}` for rename-to-move");
+        }
+
+        let segments: Vec<_> = path.segments().collect();
+        if segments.is_empty() {
+            bail!("Invalid path `{raw}` for rename-to-move");
+        }
+
+        let (kind, start_idx) = match segments[0].kind() {
+            Some(PathSegmentKind::CrateKw) => (MovePathHead::Crate, 1),
+            Some(PathSegmentKind::SelfKw | PathSegmentKind::SuperKw | PathSegmentKind::SelfTypeKw) => {
+                bail!("Rename-to-move paths must start with `crate::`")
+            }
+            Some(PathSegmentKind::Name(_)) => bail!("Rename-to-move paths must start with `crate::`"),
+            Some(PathSegmentKind::Type { .. }) | None => {
+                bail!("Rename-to-move path segments cannot contain generics or type arguments")
+            }
+        };
+
+        if start_idx >= segments.len() {
+            bail!("Rename-to-move requires a destination item name");
+        }
+
+        let mut module_path = Vec::new();
+        for segment in &segments[start_idx..segments.len() - 1] {
+            let Some(PathSegmentKind::Name(name_ref)) = segment.kind() else {
+                bail!("Invalid module path segment in `{raw}`");
+            };
+
+            if segment.generic_arg_list().is_some()
+                || segment.parenthesized_arg_list().is_some()
+                || segment.type_anchor().is_some()
+                || segment.ret_type().is_some()
+            {
+                bail!(
+                    "Rename-to-move path segment `{}` contains unsupported syntax",
+                    name_ref.text()
+                );
+            }
+
+            let segment_text = name_ref.text().to_string();
+            let (segment_name, ident_kind) = IdentifierKind::classify(edition, &segment_text)?;
+            if ident_kind != IdentifierKind::Ident {
+                bail!("Invalid module path segment `{segment_text}`");
+            }
+            module_path.push(segment_name);
+        }
+
+        let Some(PathSegmentKind::Name(name_ref)) = segments
+            .last()
+            .and_then(|segment| segment.kind())
+        else {
+            bail!("Rename-to-move requires a destination item name");
+        };
+
+        let last_segment = segments.last().unwrap();
+        if last_segment.generic_arg_list().is_some()
+            || last_segment.parenthesized_arg_list().is_some()
+            || last_segment.type_anchor().is_some()
+            || last_segment.ret_type().is_some()
+        {
+            bail!(
+                "Rename-to-move path segment `{}` contains unsupported syntax",
+                name_ref.text()
+            );
+        }
+
+        let final_name_text = name_ref.text().to_string();
+        if final_name_text.is_empty() {
+            bail!("Rename-to-move requires a destination item name");
+        }
+
+        Ok(Self {
+            final_name_text,
+            move_target: Some(MoveTarget { kind, module_path }),
+        })
+    }
+
+    fn final_name_text(&self) -> &str {
+        &self.final_name_text
+    }
+
+    fn move_target(&self) -> Option<&MoveTarget> {
+        self.move_target.as_ref()
+    }
+}
+
+impl MoveTarget {
+    fn module_path(&self) -> &[Name] {
+        &self.module_path
+    }
+
+    fn requires_move_from(&self, source_module_path: &[Name]) -> bool {
+        self.module_path != source_module_path
+    }
+}
+
+fn module_path_from_root(module: Module, db: &RootDatabase) -> Vec<Name> {
+    module
+        .path_to_root(db)
+        .into_iter()
+        .rev()
+        .filter_map(|module| module.name(db))
+        .collect()
+}
+
+fn detect_move_operation(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    resolved_name: &Name,
+    move_target: &MoveTarget,
+) -> RenameResult<Option<MoveOperation>> {
+    if move_target.kind != MovePathHead::Crate {
+        return Ok(None);
+    }
+
+    let Some(source_module) = def.module(sema.db) else {
+        return Ok(None);
+    };
+    let source_module_path = module_path_from_root(source_module, sema.db);
+    if !move_target.requires_move_from(&source_module_path) {
+        return Ok(None);
+    }
+
+    let Some(source_item_name) = def.name(sema.db) else {
+        return Ok(None);
+    };
+
+    Ok(Some(MoveOperation {
+        source_module_path,
+        dest_module_path: move_target.module_path.clone(),
+        source_item_name,
+        dest_item_name: resolved_name.clone(),
+    }))
+}
 
 /// This is similar to `collect::<Result<Vec<_>, _>>`, but unlike it, it succeeds if there is *any* `Ok` item.
 fn ok_if_any<T, E>(iter: impl Iterator<Item = Result<T, E>>) -> Result<Vec<T>, E> {
@@ -109,18 +280,25 @@ pub(crate) fn rename(
     let syntax = source_file.syntax();
 
     let edition = file_id.edition(db);
-    let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
+    let parsed_target = ParsedRenameTarget::parse(edition, new_name)?;
+    let final_name_text = parsed_target.final_name_text();
+    let (final_name, kind) = IdentifierKind::classify(edition, final_name_text)?;
 
-    let defs = find_definitions(&sema, syntax, position, &new_name)?;
-    let alias_fallback =
-        alias_fallback(syntax, position, &new_name.display(db, edition).to_string());
+    let defs = find_definitions(&sema, syntax, position, &final_name)?;
+    let move_target_opt = parsed_target.move_target().cloned();
+    let alias_fallback = if move_target_opt.is_some() {
+        None
+    } else {
+        alias_fallback(syntax, position, &final_name.display(db, edition).to_string())
+    };
+    let move_target_ref = move_target_opt.as_ref();
 
     let ops: RenameResult<Vec<SourceChange>> = match alias_fallback {
         Some(_) => ok_if_any(
             defs
                 // FIXME: This can use the `ide_db::rename_reference` (or def.rename) method once we can
                 // properly find "direct" usages/references.
-                .map(|(.., def, new_name, _)| {
+                .map(|(.., def, resolved_name, _)| {
                     match kind {
                         IdentifierKind::Ident => (),
                         IdentifierKind::Lifetime => {
@@ -147,25 +325,34 @@ pub(crate) fn rename(
                     source_change.extend(usages.references.get_mut(&file_id).iter().map(|refs| {
                         (
                             position.file_id,
-                            source_edit_from_references(db, refs, def, &new_name, edition),
+                            source_edit_from_references(db, refs, def, &resolved_name, edition),
                         )
                     }));
 
                     Ok(source_change)
                 }),
         ),
-        None => ok_if_any(defs.map(|(.., def, new_name, rename_def)| {
+        None => ok_if_any(defs.map(|(.., def, resolved_name, rename_def)| {
+            if let Some(move_target) = move_target_ref {
+                if rename_def == RenameDefinition::Yes {
+                    if let Some(_move_operation) =
+                        detect_move_operation(&sema, &def, &resolved_name, move_target)?
+                    {
+                        bail!("rename-to-move is not implemented yet");
+                    }
+                }
+            }
             if let Definition::Local(local) = def {
                 if let Some(self_param) = local.as_self_param(sema.db) {
                     cov_mark::hit!(rename_self_to_param);
-                    return rename_self_to_param(&sema, local, self_param, &new_name, kind);
+                    return rename_self_to_param(&sema, local, self_param, &resolved_name, kind);
                 }
                 if kind == IdentifierKind::LowercaseSelf {
                     cov_mark::hit!(rename_to_self);
                     return rename_to_self(&sema, local);
                 }
             }
-            def.rename(&sema, new_name.as_str(), rename_def)
+            def.rename(&sema, resolved_name.as_str(), rename_def)
         })),
     };
 
@@ -587,7 +774,10 @@ mod tests {
 
     use crate::fixture;
 
-    use super::{RangeInfo, RenameError};
+    use hir::Name;
+    use span::Edition;
+
+    use super::{ParsedRenameTarget, RangeInfo, RenameError};
 
     #[track_caller]
     fn check(
@@ -705,6 +895,42 @@ mod tests {
             "source_file_edits: {:#?}\nfile_system_edits: {:#?}\n",
             source_file_edits, source_change.file_system_edits
         )
+    }
+
+    #[test]
+    fn parse_move_target_from_crate_path() {
+        let parsed = ParsedRenameTarget::parse(
+            Edition::Edition2021,
+            "crate::mod_one::finish::Final",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.final_name_text(), "Final");
+        let target = parsed.move_target().expect("expected move target");
+        let segments: Vec<_> =
+            target.module_path().iter().map(|name| name.as_str()).collect();
+        assert_eq!(segments, ["mod_one", "finish"]);
+
+        let source_path = vec![Name::new_root("mod_one")];
+        assert!(target.requires_move_from(&source_path));
+    }
+
+    #[test]
+    fn parse_move_target_same_module_is_simple_rename() {
+        let parsed =
+            ParsedRenameTarget::parse(Edition::Edition2021, "crate::alpha::NewName").unwrap();
+
+        assert_eq!(parsed.final_name_text(), "NewName");
+        let target = parsed.move_target().expect("expected move target");
+        let source_path = vec![Name::new_root("alpha")];
+        assert!(!target.requires_move_from(&source_path));
+    }
+
+    #[test]
+    fn parse_move_target_requires_crate_prefix() {
+        let err =
+            ParsedRenameTarget::parse(Edition::Edition2021, "alpha::beta::Item").unwrap_err();
+        assert_eq!(err.to_string(), "Rename-to-move paths must start with `crate::`");
     }
 
     #[test]
