@@ -60,27 +60,12 @@ pub(crate) fn prepare_rename(
     let syntax = source_file.syntax();
 
     let res = find_definitions(&sema, syntax, position, &Name::new_symbol_root(sym::underscore))?
-        .filter(|(_, _, def, _, _)| {
-            // Check if definition can be renamed (existing logic)
-            if def.range_for_rename(&sema).is_some() {
-                return true;
-            }
-            
-            // For move operations, also check if the definition supports moving
-            // (Requirement 5.4)
-            can_be_moved(&sema, *def)
-        })
-        .map(|(frange, kind, def, _, _)| {
+        .filter(|(_, _, def, _, _)| def.range_for_rename(&sema).is_some())
+        .map(|(frange, kind, _def, _, _)| {
             always!(
                 frange.range.contains_inclusive(position.offset)
                     && frange.file_id == position.file_id
             );
-
-            // Validate that move operations are supported for this definition type
-            // (Requirement 5.4)
-            if !supports_move_operation(&sema, def) {
-                return Err(format_err!("Move operations not supported for this item type"));
-            }
 
             Ok(match kind {
                 SyntaxKind::LIFETIME => {
