@@ -1010,6 +1010,255 @@ fn find_import_insertion_point(_item: &ast::Item) -> usize {
     0
 }
 
+/// Validate that all items referenced within the moved code will remain accessible
+/// from the destination module.
+pub fn validate_external_visibility(
+    sema: &Semantics<'_, RootDatabase>,
+    item_syntax: &syntax::SyntaxNode,
+    source_module: &Module,
+    dest_module: &Module,
+) -> Result<()> {
+    // Find all path references in the item
+    for path_node in item_syntax.descendants().filter_map(ast::Path::cast) {
+        if let Some(resolution) = sema.resolve_path(&path_node) {
+            if let Some(def) = path_resolution_to_definition(resolution) {
+                // Check if this is an item from the source module
+                if is_item_in_module(sema, &def, source_module) {
+                    // Check if it will be visible from destination
+                    if !is_visible_from(sema, &def, dest_module)? {
+                        let item_name = def.name(sema.db)
+                            .map(|n| n.display_no_db(span::Edition::LATEST).to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string());
+
+                        bail!(
+                            "Cannot move item: references private item '{}' which will not be visible from destination module",
+                            item_name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a definition is visible from a given module.
+fn is_visible_from(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    from_module: &Module,
+) -> Result<bool> {
+    // Get the visibility of the definition
+    let visibility = get_visibility(sema, def)?;
+
+    // Get the module where the definition is located
+    let def_module = def.module(sema.db).ok_or_else(|| format_err!("No module for definition"))?;
+
+    // Check visibility rules
+    match visibility {
+        Visibility::Public => Ok(true), // pub - visible everywhere
+        Visibility::Crate => {
+            // pub(crate) - visible within same crate
+            Ok(def_module.krate() == from_module.krate())
+        }
+        Visibility::Private => {
+            // private - only visible in same module
+            Ok(def_module == *from_module)
+        }
+        Visibility::Super => {
+            // pub(super) - visible in parent module and siblings
+            // Check if from_module is the parent or a sibling
+            if let Some(def_parent) = def_module.parent(sema.db) {
+                Ok(*from_module == def_parent ||
+                   from_module.parent(sema.db).as_ref() == Some(&def_parent))
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// Simplified visibility representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    Public,      // pub
+    Crate,       // pub(crate)
+    Super,       // pub(super)
+    Private,     // no modifier
+}
+
+/// Get the visibility of a definition.
+fn get_visibility(sema: &Semantics<'_, RootDatabase>, def: &Definition) -> Result<Visibility> {
+    // Get the syntax node for the definition
+    let syntax = match def {
+        Definition::Adt(adt) => match adt {
+            hir::Adt::Struct(s) => {
+                sema.source(*s).map(|src| src.value.syntax().clone())
+            }
+            hir::Adt::Enum(e) => {
+                sema.source(*e).map(|src| src.value.syntax().clone())
+            }
+            hir::Adt::Union(u) => {
+                sema.source(*u).map(|src| src.value.syntax().clone())
+            }
+        },
+        Definition::Function(f) => {
+            sema.source(*f).map(|src| src.value.syntax().clone())
+        }
+        Definition::Const(c) => {
+            sema.source(*c).map(|src| src.value.syntax().clone())
+        }
+        Definition::Static(s) => {
+            sema.source(*s).map(|src| src.value.syntax().clone())
+        }
+        _ => None,
+    }.ok_or_else(|| format_err!("No source for definition"))?;
+
+    // Parse visibility from syntax
+    parse_visibility_from_syntax(&syntax)
+}
+
+/// Parse visibility modifier from a syntax node.
+fn parse_visibility_from_syntax(node: &syntax::SyntaxNode) -> Result<Visibility> {
+    use syntax::ast::HasVisibility;
+
+    // Try different item types that have visibility
+    macro_rules! try_has_vis {
+        ($($ty:ty),*) => {
+            $(
+                if let Some(item) = <$ty>::cast(node.clone()) {
+                    if let Some(vis) = item.visibility() {
+                        return Ok(parse_visibility_ast(&vis));
+                    }
+                }
+            )*
+        };
+    }
+
+    try_has_vis!(
+        ast::Struct, ast::Enum, ast::Union, ast::Fn,
+        ast::Const, ast::Static, ast::Trait, ast::TypeAlias
+    );
+
+    // Default to private if no visibility modifier
+    Ok(Visibility::Private)
+}
+
+/// Parse an AST visibility node.
+fn parse_visibility_ast(vis: &ast::Visibility) -> Visibility {
+    let text = vis.to_string();
+
+    if text.starts_with("pub(crate)") {
+        Visibility::Crate
+    } else if text.starts_with("pub(super)") {
+        Visibility::Super
+    } else if text.starts_with("pub") {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
+}
+
+/// Calculate the required visibility for a moved item based on its usages.
+pub fn calculate_required_visibility(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    dest_module: &Module,
+) -> Result<Visibility> {
+    // Find all usages of the item
+    let usages = def.usages(sema).all();
+
+    let mut required = Visibility::Private;
+
+    // Check each usage location
+    for (file_id, _references) in usages.references {
+        // Get the module for this file by finding a module definition in the file
+        // We use the crate's module tree to find the module containing this file
+        let krate = dest_module.krate();
+        let modules = krate.modules(sema.db);
+
+        let mut usage_module = None;
+        for module in modules {
+            if let Some(module_file_id) = module.as_source_file_id(sema.db) {
+                if module_file_id.file_id(sema.db) == file_id.file_id(sema.db) {
+                    usage_module = Some(module);
+                    break;
+                }
+            }
+        }
+
+        if let Some(usage_module) = usage_module {
+            // Determine required visibility based on module relationship
+            if usage_module == *dest_module {
+                // Same module - private is fine
+                continue;
+            } else if usage_module.krate() == dest_module.krate() {
+                // Same crate, different module - need at least pub(crate)
+                if required == Visibility::Private {
+                    required = Visibility::Crate;
+                }
+            } else {
+                // Different crate - need pub
+                required = Visibility::Public;
+                break; // Can't get more public than this
+            }
+        }
+    }
+
+    Ok(required)
+}
+
+/// Update the visibility of an item to the required level.
+pub fn update_item_visibility(
+    item_text: &str,
+    current_vis: Visibility,
+    required_vis: Visibility,
+) -> Result<String> {
+    // Never downgrade visibility
+    let new_vis = match (current_vis, required_vis) {
+        // Already pub - keep it
+        (Visibility::Public, _) => return Ok(item_text.to_string()),
+
+        // Already pub(crate) and need pub - upgrade
+        (Visibility::Crate, Visibility::Public) => Visibility::Public,
+
+        // Already pub(crate) and need pub(crate) or less - keep it
+        (Visibility::Crate, _) => return Ok(item_text.to_string()),
+
+        // Private - upgrade to required
+        (Visibility::Private, req) => req,
+
+        // Super is treated like private for this simplified model
+        (Visibility::Super, req) => req,
+    };
+
+    // Generate new visibility modifier text
+    let vis_text = match new_vis {
+        Visibility::Public => "pub ",
+        Visibility::Crate => "pub(crate) ",
+        Visibility::Private => "",
+        Visibility::Super => "pub(super) ",
+    };
+
+    // Replace or add visibility modifier
+    // This is simplified - a full implementation would parse the AST
+    let result = if item_text.trim_start().starts_with("pub") {
+        // Replace existing visibility
+        let after_vis = item_text.trim_start()
+            .strip_prefix("pub(crate)")
+            .or_else(|| item_text.trim_start().strip_prefix("pub(super)"))
+            .or_else(|| item_text.trim_start().strip_prefix("pub"))
+            .unwrap_or(item_text.trim_start());
+        format!("{}{}", vis_text, after_vis.trim_start())
+    } else {
+        // Add visibility modifier
+        format!("{}{}", vis_text, item_text.trim_start())
+    };
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
