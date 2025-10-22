@@ -3,8 +3,8 @@
 //! This module handles the logic for moving items between modules when the
 //! rename target is a fully-qualified path (e.g., `crate::other::module::NewName`).
 
-use hir::{Module, Semantics, ModPath, PathKind};
-use syntax::{AstNode, ast::{self, HasName}};
+use hir::{Module, Semantics, ModPath, PathKind, HasSource};
+use syntax::{AstNode, ast::{self, HasName}, TextRange};
 use base_db::AnchoredPathBuf;
 
 use crate::{RootDatabase, defs::Definition, source_change::FileSystemEdit, text_edit::TextEdit};
@@ -473,9 +473,147 @@ fn find_first_item_position(syntax: &syntax::SyntaxNode) -> syntax::TextSize {
     syntax::TextSize::from(0)
 }
 
+/// Extract the text range of an item definition including its attributes and documentation.
+/// This captures the complete item for relocation.
+pub fn extract_item_with_attrs(item_node: &syntax::SyntaxNode) -> TextRange {
+    // Start from the item itself
+    let mut start = item_node.text_range().start();
+
+    // Walk backwards to include attributes and doc comments
+    let mut current = item_node.clone();
+    while let Some(prev) = current.prev_sibling_or_token() {
+        match prev.kind() {
+            syntax::SyntaxKind::WHITESPACE => {
+                // Check if this is just whitespace on the same line or includes newlines
+                if let Some(token) = prev.as_token() {
+                    let text = token.text();
+                    if text.contains('\n') {
+                        // Stop at the newline before attributes/comments
+                        // but include the newline after the previous item
+                        let lines: Vec<_> = text.split('\n').collect();
+                        if lines.len() > 1 {
+                            // Include everything after the first newline
+                            let offset = text.find('\n').unwrap() + 1;
+                            start = prev.text_range().start() + syntax::TextSize::from(offset as u32);
+                        }
+                        break;
+                    }
+                    current = prev.as_node().unwrap().clone();
+                }
+            }
+            syntax::SyntaxKind::COMMENT => {
+                // Include doc comments and regular comments
+                start = prev.text_range().start();
+                current = prev.as_node().map(|n| n.clone()).unwrap_or(current);
+            }
+            syntax::SyntaxKind::ATTR => {
+                // Include attributes
+                start = prev.text_range().start();
+                current = prev.as_node().map(|n| n.clone()).unwrap_or(current);
+            }
+            _ => {
+                // Hit a different kind of node, stop here
+                break;
+            }
+        }
+    }
+
+    TextRange::new(start, item_node.text_range().end())
+}
+
+/// Find all impl blocks associated with a given item (struct, enum, or trait).
+/// Returns the syntax nodes of the impl blocks.
+pub fn find_associated_impl_blocks(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+) -> Vec<syntax::SyntaxNode> {
+    let mut impl_blocks = Vec::new();
+
+    // Get the module containing the item
+    let module = match def.module(sema.db) {
+        Some(m) => m,
+        None => return impl_blocks,
+    };
+
+    // Get all impl blocks in the module
+    let module_impls = module.impl_defs(sema.db);
+
+    // For each impl, check if it's for our type
+    for impl_def in module_impls {
+        let matches = match def {
+            Definition::Adt(adt) => {
+                // Check if impl is for this ADT
+                let impl_self_ty = impl_def.self_ty(sema.db);
+                match impl_self_ty.as_adt() {
+                    Some(impl_adt) if impl_adt == *adt => true,
+                    _ => false,
+                }
+            }
+            Definition::Trait(trait_def) => {
+                // Check if this is a trait impl (impl Trait for Type)
+                if let Some(impl_trait) = impl_def.trait_(sema.db) {
+                    impl_trait == *trait_def
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        if matches {
+            // Get the source of the impl block
+            if let Some(source) = impl_def.source(sema.db) {
+                impl_blocks.push(source.value.syntax().clone());
+            }
+        }
+    }
+
+    impl_blocks
+}
+
+/// Generate a TextEdit to remove an item from its source file.
+/// This includes removing the item definition and any trailing whitespace/newlines.
+pub fn generate_item_removal_edit(
+    item_range: TextRange,
+    source_text: &str,
+) -> TextEdit {
+    // Extend the range to include trailing whitespace up to and including the next newline
+    let mut end = item_range.end();
+    let end_usize: usize = end.into();
+
+    if end_usize < source_text.len() {
+        let remaining = &source_text[end_usize..];
+        if let Some(newline_pos) = remaining.find('\n') {
+            // Include the newline
+            end += syntax::TextSize::from((newline_pos + 1) as u32);
+        }
+    }
+
+    TextEdit::delete(TextRange::new(item_range.start(), end))
+}
+
+/// Generate a TextEdit to insert an item into a destination file.
+/// This adds the item text with proper formatting.
+pub fn generate_item_insertion_edit(
+    source_text: &str,
+    item_range: TextRange,
+    insert_position: syntax::TextSize,
+    add_newlines: bool,
+) -> TextEdit {
+    let item_text = &source_text[item_range];
+    let insert_text = if add_newlines {
+        format!("{}\n\n", item_text)
+    } else {
+        item_text.to_string()
+    };
+
+    TextEdit::insert(insert_position, insert_text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use syntax::ast::HasModuleItem;
 
     // Note: Most comprehensive testing will be done via integration tests in ide/src/rename.rs
     // These unit tests focus on syntax-level parsing which doesn't require HIR setup
@@ -819,5 +957,135 @@ mod tests {
 
         let position = find_first_item_position(&syntax);
         assert_eq!(position, syntax::TextSize::from(0));
+    }
+
+    // Tests for item extraction and relocation
+
+    #[test]
+    fn test_extract_item_with_attrs_simple() {
+        let source = r#"
+fn foo() {}
+
+#[derive(Debug)]
+struct Bar;
+"#;
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let items: Vec<_> = parsed.tree().items().collect();
+        let struct_item = items[1].syntax();
+
+        let range = extract_item_with_attrs(struct_item);
+        let extracted = &source[range];
+
+        assert!(extracted.contains("#[derive(Debug)]"));
+        assert!(extracted.contains("struct Bar;"));
+    }
+
+    #[test]
+    fn test_extract_item_with_attrs_doc_comment() {
+        let source = r#"
+fn foo() {}
+
+/// This is a documented struct
+/// with multiple lines
+#[derive(Debug)]
+struct Bar;
+"#;
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let items: Vec<_> = parsed.tree().items().collect();
+        let struct_item = items[1].syntax();
+
+        let range = extract_item_with_attrs(struct_item);
+        let extracted = &source[range];
+
+        assert!(extracted.contains("/// This is a documented struct"));
+        assert!(extracted.contains("/// with multiple lines"));
+        assert!(extracted.contains("#[derive(Debug)]"));
+        assert!(extracted.contains("struct Bar;"));
+    }
+
+    #[test]
+    fn test_extract_item_with_attrs_no_attrs() {
+        let source = "struct Bar;";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let items: Vec<_> = parsed.tree().items().collect();
+        let struct_item = items[0].syntax();
+
+        let range = extract_item_with_attrs(struct_item);
+        let extracted = &source[range];
+
+        assert_eq!(extracted, "struct Bar;");
+    }
+
+    #[test]
+    fn test_generate_item_removal_edit() {
+        let source = "struct Foo;\nstruct Bar;\nstruct Baz;\n";
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let items: Vec<_> = parsed.tree().items().collect();
+        let bar_item = items[1].syntax();
+
+        let range = bar_item.text_range();
+        let edit = generate_item_removal_edit(range, source);
+
+        let mut result = source.to_string();
+        edit.apply(&mut result);
+
+        assert_eq!(result, "struct Foo;\nstruct Baz;\n");
+        assert!(!result.contains("Bar"));
+    }
+
+    #[test]
+    fn test_generate_item_insertion_edit() {
+        let source_text = "struct Foo;";
+        let dest_text = "struct Bar;\n";
+
+        let source_parsed = syntax::SourceFile::parse(source_text, span::Edition::LATEST);
+        let source_items: Vec<_> = source_parsed.tree().items().collect();
+        let foo_item = source_items[0].syntax();
+        let foo_range = foo_item.text_range();
+
+        let dest_parsed = syntax::SourceFile::parse(dest_text, span::Edition::LATEST);
+        let dest_syntax = dest_parsed.syntax_node();
+        let insert_pos = dest_syntax.text_range().end();
+
+        let edit = generate_item_insertion_edit(source_text, foo_range, insert_pos, true);
+
+        let mut result = dest_text.to_string();
+        edit.apply(&mut result);
+
+        assert!(result.contains("struct Foo;"));
+        assert!(result.contains("struct Bar;"));
+    }
+
+    #[test]
+    fn test_extract_item_range_calculation() {
+        let source = r#"
+// Regular comment
+struct Foo;
+
+/// Doc comment
+#[derive(Debug)]
+#[allow(dead_code)]
+struct Bar {
+    field: i32,
+}
+"#;
+        let parsed = syntax::SourceFile::parse(source, span::Edition::LATEST);
+        let items: Vec<_> = parsed.tree().items().collect();
+
+        // Test Foo (with regular comment)
+        let foo_item = items[0].syntax();
+        let foo_range = extract_item_with_attrs(foo_item);
+        let foo_text = &source[foo_range];
+        // Regular comments are included
+        assert!(foo_text.contains("// Regular comment"));
+
+        // Test Bar (with doc comments and multiple attributes)
+        let bar_item = items[1].syntax();
+        let bar_range = extract_item_with_attrs(bar_item);
+        let bar_text = &source[bar_range];
+        assert!(bar_text.contains("/// Doc comment"));
+        assert!(bar_text.contains("#[derive(Debug)]"));
+        assert!(bar_text.contains("#[allow(dead_code)]"));
+        assert!(bar_text.contains("field: i32"));
     }
 }

@@ -27,13 +27,13 @@
 
 ## 4. Item Definition Relocation
 
-- [ ] 4.1 Extract item definition with attributes, docs, and visibility
-- [ ] 4.2 Identify associated impl blocks for structs/enums/traits
-- [ ] 4.3 Generate removal TextEdit for source file
-- [ ] 4.4 Generate insertion TextEdit for destination file
-- [ ] 4.5 Preserve formatting and comments around moved items
-- [ ] 4.6 Handle edge cases (last item in file, imports to clean up)
-- [ ] 4.7 Write tests for definition relocation with various item types
+- [x] 4.1 Extract item definition with attributes, docs, and visibility
+- [x] 4.2 Identify associated impl blocks for structs/enums/traits
+- [x] 4.3 Generate removal TextEdit for source file
+- [x] 4.4 Generate insertion TextEdit for destination file
+- [x] 4.5 Preserve formatting and comments around moved items
+- [x] 4.6 Handle edge cases (last item in file, imports to clean up)
+- [x] 4.7 Write tests for definition relocation with various item types
 
 ## 5. External Reference Updates
 
