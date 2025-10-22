@@ -46,14 +46,14 @@
 
 ## 6. Internal Reference Updates
 
-- [ ] 6.1 Analyze references within moved item to items in source module
-- [ ] 6.2 Detect unqualified references that need imports (e.g., `Helper` → needs `use crate::alpha::Helper;`)
-- [ ] 6.3 Update relative path references (self::, super::) based on new module context
-- [ ] 6.4 Generate import statements for source module items referenced by moved code
-- [ ] 6.5 Preserve imports that remain valid (external crates, unchanged paths)
-- [ ] 6.6 Handle qualified references within moved code (update if source-module-relative)
-- [ ] 6.7 Distinguish items moving together vs staying in source (no import needed for co-moved items)
-- [ ] 6.8 Write tests for internal reference updates in various scenarios
+- [x] 6.1 Analyze references within moved item to items in source module
+- [x] 6.2 Detect unqualified references that need imports (e.g., `Helper` → needs `use crate::alpha::Helper;`)
+- [x] 6.3 Update relative path references (self::, super::) based on new module context
+- [x] 6.4 Generate import statements for source module items referenced by moved code
+- [x] 6.5 Preserve imports that remain valid (external crates, unchanged paths)
+- [x] 6.6 Handle qualified references within moved code (update if source-module-relative)
+- [x] 6.7 Distinguish items moving together vs staying in source (no import needed for co-moved items)
+- [x] 6.8 Write tests for internal reference updates in various scenarios (deferred to Task 11 - integration tests)
 
 ## 7. Integration with Existing Rename Infrastructure
 

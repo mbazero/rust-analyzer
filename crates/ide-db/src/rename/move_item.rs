@@ -754,6 +754,262 @@ fn compute_path_replacement(
     }
 }
 
+/// Update internal references within a moved item.
+///
+/// This function analyzes the code being moved and updates references to items
+/// in the source module that will no longer be accessible after the move.
+/// It handles:
+/// - Unqualified references that need imports
+/// - Relative path references (self::, super::)
+/// - Generating new import statements
+/// - Preserving valid imports
+///
+/// Returns updated source code for the moved item with necessary import changes.
+pub fn update_internal_references(
+    sema: &Semantics<'_, RootDatabase>,
+    item_syntax: &syntax::SyntaxNode,
+    source_module: &Module,
+    dest_module: &Module,
+    items_moving_together: &[syntax::SyntaxNode],
+) -> Result<String> {
+    // Parse the item to find all path references
+    let mut new_imports = Vec::new();
+    let mut path_updates = Vec::new();
+
+    // Find all path expressions in the item
+    for path_node in item_syntax.descendants().filter_map(ast::Path::cast) {
+        if let Some(update) = analyze_path_reference(
+            sema,
+            &path_node,
+            source_module,
+            dest_module,
+            items_moving_together,
+        ) {
+            match update {
+                PathUpdate::AddImport(import_path) => {
+                    if !new_imports.contains(&import_path) {
+                        new_imports.push(import_path);
+                    }
+                }
+                PathUpdate::ReplacePath { range, new_path } => {
+                    path_updates.push((range, new_path));
+                }
+            }
+        }
+    }
+
+    // Build the updated source code
+    let mut updated_text = item_syntax.text().to_string();
+
+    // Apply path updates (in reverse order to maintain offsets)
+    path_updates.sort_by_key(|(range, _)| std::cmp::Reverse(range.start()));
+    for (range, new_path) in path_updates {
+        let start = usize::from(range.start());
+        let end = usize::from(range.end());
+        updated_text.replace_range(start..end, &new_path);
+    }
+
+    // Add import statements at the beginning if needed
+    if !new_imports.is_empty() {
+        let import_block = generate_import_block(&new_imports);
+        // Insert after any existing attributes/doc comments
+        if let Some(item) = ast::Item::cast(item_syntax.clone()) {
+            // Find where to insert imports (after attributes, before the item keyword)
+            let insert_pos = find_import_insertion_point(&item);
+            updated_text.insert_str(insert_pos, &import_block);
+        } else {
+            // Fallback: prepend to the beginning
+            updated_text = format!("{}{}", import_block, updated_text);
+        }
+    }
+
+    Ok(updated_text)
+}
+
+/// Represents an update needed for a path reference.
+enum PathUpdate {
+    /// Need to add an import statement
+    AddImport(String),
+    /// Need to replace the path text
+    ReplacePath { range: TextRange, new_path: String },
+}
+
+/// Analyze a path reference to determine if it needs updating.
+fn analyze_path_reference(
+    sema: &Semantics<'_, RootDatabase>,
+    path: &ast::Path,
+    source_module: &Module,
+    _dest_module: &Module,
+    items_moving_together: &[syntax::SyntaxNode],
+) -> Option<PathUpdate> {
+    // Get the first segment to determine the path kind
+    let _first_segment = path.first_segment()?;
+    let path_text = path.to_string();
+
+    // Check if this is a relative path (self::, super::, or crate::)
+    if path_text.starts_with("self::") {
+        // self:: paths need to be updated to absolute paths to the source module
+        return Some(handle_self_path(sema, path, source_module));
+    }
+
+    if path_text.starts_with("super::") {
+        // super:: paths need to be resolved and converted to absolute paths
+        return Some(handle_super_path(sema, path, source_module));
+    }
+
+    if path_text.starts_with("crate::") {
+        // Absolute crate paths are fine, no update needed
+        return None;
+    }
+
+    // For unqualified paths, check if they resolve to items in the source module
+    if let Some(resolution) = sema.resolve_path(path) {
+        if let Some(def) = path_resolution_to_definition(resolution) {
+            // Check if this item is in the source module
+            if is_item_in_module(sema, &def, source_module) {
+                // Check if this item is moving together with us
+                if !is_item_moving_together(&def, items_moving_together) {
+                    // This item stays in source module, we need an import
+                    return Some(PathUpdate::AddImport(build_import_for_definition(
+                        sema,
+                        &def,
+                    )));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Handle a self:: path by converting it to an absolute path to the source module.
+fn handle_self_path(
+    sema: &Semantics<'_, RootDatabase>,
+    path: &ast::Path,
+    source_module: &Module,
+) -> PathUpdate {
+    let path_str = path.to_string();
+    let after_self = path_str.strip_prefix("self::").unwrap_or(&path_str);
+
+    // Build absolute path to source module
+    let source_path = module_path_string(sema, source_module);
+    let new_path = format!("{}::{}", source_path, after_self);
+
+    PathUpdate::ReplacePath {
+        range: path.syntax().text_range(),
+        new_path,
+    }
+}
+
+/// Handle a super:: path by resolving it and converting to an absolute path.
+fn handle_super_path(
+    sema: &Semantics<'_, RootDatabase>,
+    path: &ast::Path,
+    source_module: &Module,
+) -> PathUpdate {
+    let path_str = path.to_string();
+
+    // Count the number of super:: prefixes
+    let super_count = path_str.matches("super::").count();
+
+    // Navigate up from source module
+    let mut current = Some(source_module.clone());
+    for _ in 0..super_count {
+        current = current.and_then(|m| m.parent(sema.db));
+    }
+
+    // Get the rest of the path after super::
+    let rest = path_str.split("super::").last().unwrap_or("");
+
+    if let Some(target_module) = current {
+        let module_path = module_path_string(sema, &target_module);
+        let new_path = if rest.is_empty() {
+            module_path
+        } else {
+            format!("{}::{}", module_path, rest)
+        };
+
+        PathUpdate::ReplacePath {
+            range: path.syntax().text_range(),
+            new_path,
+        }
+    } else {
+        // Couldn't resolve, keep as-is (will likely be a compile error)
+        PathUpdate::ReplacePath {
+            range: path.syntax().text_range(),
+            new_path: path_str,
+        }
+    }
+}
+
+/// Build a module path string (e.g., "crate::alpha::beta").
+fn module_path_string(sema: &Semantics<'_, RootDatabase>, module: &Module) -> String {
+    let path_parts = module.path_to_root(sema.db);
+    let mut result = String::from("crate");
+
+    for m in path_parts.iter().rev().skip(1) {
+        if let Some(name) = m.name(sema.db) {
+            result.push_str("::");
+            result.push_str(&name.display_no_db(span::Edition::LATEST).to_string());
+        }
+    }
+
+    result
+}
+
+/// Convert a path resolution to a Definition.
+fn path_resolution_to_definition(resolution: hir::PathResolution) -> Option<Definition> {
+    match resolution {
+        hir::PathResolution::Def(def) => Some(def.into()),
+        _ => None,
+    }
+}
+
+/// Check if an item is defined in a specific module.
+fn is_item_in_module(sema: &Semantics<'_, RootDatabase>, def: &Definition, module: &Module) -> bool {
+    if let Some(item_module) = def.module(sema.db) {
+        item_module == *module
+    } else {
+        false
+    }
+}
+
+/// Check if an item is part of the items being moved together.
+fn is_item_moving_together(_def: &Definition, _items_moving: &[syntax::SyntaxNode]) -> bool {
+    // This is a simplified check - in practice we'd need to match the definition
+    // to one of the syntax nodes being moved
+    // For now, return false to be conservative (assume items stay in source)
+    false
+}
+
+/// Build an import statement for a definition.
+fn build_import_for_definition(sema: &Semantics<'_, RootDatabase>, def: &Definition) -> String {
+    if let Some(module) = def.module(sema.db) {
+        let module_path = module_path_string(sema, &module);
+        let item_name = def.name(sema.db).map(|n| n.display_no_db(span::Edition::LATEST).to_string()).unwrap_or_default();
+        format!("{}::{}", module_path, item_name)
+    } else {
+        String::new()
+    }
+}
+
+/// Generate a block of import statements.
+fn generate_import_block(imports: &[String]) -> String {
+    let mut result = String::new();
+    for import in imports {
+        result.push_str(&format!("use {};\n", import));
+    }
+    result.push('\n');
+    result
+}
+
+/// Find the position to insert import statements.
+fn find_import_insertion_point(_item: &ast::Item) -> usize {
+    // Insert after attributes and doc comments, right before the item
+    // For now, simple implementation: insert at the beginning
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

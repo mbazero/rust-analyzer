@@ -25,7 +25,7 @@ mod move_item;
 
 use std::fmt::{self, Display};
 
-pub use move_item::{MoveOperation, RenameTarget, parse_rename_target, update_external_references};
+pub use move_item::{MoveOperation, RenameTarget, parse_rename_target, update_external_references, update_internal_references};
 
 use crate::{
     source_change::ChangeAnnotation,
