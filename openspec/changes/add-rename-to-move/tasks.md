@@ -88,14 +88,14 @@
 
 ## 10. Supported Item Types
 
-- [ ] 10.1 Add support for moving structs
-- [ ] 10.2 Add support for moving enums
-- [ ] 10.3 Add support for moving functions
-- [ ] 10.4 Add support for moving traits
-- [ ] 10.5 Add support for moving type aliases
-- [ ] 10.6 Add support for moving constants and statics
-- [ ] 10.7 Add support for moving unions
-- [ ] 10.8 Explicitly reject unsupported types with clear errors
+- [x] 10.1 Add support for moving structs
+- [x] 10.2 Add support for moving enums
+- [x] 10.3 Add support for moving functions
+- [x] 10.4 Add support for moving traits
+- [x] 10.5 Add support for moving type aliases
+- [x] 10.6 Add support for moving constants and statics
+- [x] 10.7 Add support for moving unions
+- [x] 10.8 Explicitly reject unsupported types with clear errors
 
 ## 11. Testing
 

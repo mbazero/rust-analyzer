@@ -4068,6 +4068,268 @@ mod source {
     }
 
     #[test]
+    fn rename_move_enum_into_new_module() {
+        check_expect(
+            "crate::target::Final",
+            r#"
+//- /lib.rs
+enum ToMove$0 {
+    A,
+    B,
+}
+"#,
+            expect![[r#"source_file_edits: [
+    (
+        FileId(
+            0,
+        ),
+        [
+            Indel {
+                insert: "",
+                delete: 0..29,
+            },
+            Indel {
+                insert: "\nmod target;\n",
+                delete: 30..30,
+            },
+        ],
+    ),
+]
+file_system_edits: [
+    CreateFile {
+        dst: AnchoredPathBuf {
+            anchor: FileId(
+                0,
+            ),
+            path: "target.rs",
+        },
+        initial_contents: "enum Final {\n    A,\n    B,\n}\n",
+    },
+]
+"#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_trait_into_new_module() {
+        check_expect(
+            "crate::target::Final",
+            r#"
+//- /lib.rs
+trait ToMove$0 {
+    fn run(&self);
+}
+"#,
+            expect![[r#"source_file_edits: [
+    (
+        FileId(
+            0,
+        ),
+        [
+            Indel {
+                insert: "",
+                delete: 0..35,
+            },
+            Indel {
+                insert: "\nmod target;\n",
+                delete: 36..36,
+            },
+        ],
+    ),
+]
+file_system_edits: [
+    CreateFile {
+        dst: AnchoredPathBuf {
+            anchor: FileId(
+                0,
+            ),
+            path: "target.rs",
+        },
+        initial_contents: "trait Final {\n    fn run(&self);\n}\n",
+    },
+]
+"#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_type_alias_into_new_module() {
+        check_expect(
+            "crate::target::Final",
+            r#"
+//- /lib.rs
+type ToMove$0 = i32;
+"#,
+            expect![[r#"source_file_edits: [
+    (
+        FileId(
+            0,
+        ),
+        [
+            Indel {
+                insert: "",
+                delete: 0..18,
+            },
+            Indel {
+                insert: "\nmod target;\n",
+                delete: 19..19,
+            },
+        ],
+    ),
+]
+file_system_edits: [
+    CreateFile {
+        dst: AnchoredPathBuf {
+            anchor: FileId(
+                0,
+            ),
+            path: "target.rs",
+        },
+        initial_contents: "type Final = i32;\n",
+    },
+]
+"#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_const_into_new_module() {
+        check_expect(
+            "crate::target::FINAL",
+            r#"
+//- /lib.rs
+const ToMove$0: i32 = 0;
+"#,
+            expect![[r#"source_file_edits: [
+    (
+        FileId(
+            0,
+        ),
+        [
+            Indel {
+                insert: "",
+                delete: 0..22,
+            },
+            Indel {
+                insert: "\nmod target;\n",
+                delete: 23..23,
+            },
+        ],
+    ),
+]
+file_system_edits: [
+    CreateFile {
+        dst: AnchoredPathBuf {
+            anchor: FileId(
+                0,
+            ),
+            path: "target.rs",
+        },
+        initial_contents: "const FINAL: i32 = 0;\n",
+    },
+]
+"#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_static_into_new_module() {
+        check_expect(
+            "crate::target::FINAL",
+            r#"
+//- /lib.rs
+static ToMove$0: i32 = 0;
+"#,
+            expect![[r#"source_file_edits: [
+    (
+        FileId(
+            0,
+        ),
+        [
+            Indel {
+                insert: "",
+                delete: 0..23,
+            },
+            Indel {
+                insert: "\nmod target;\n",
+                delete: 24..24,
+            },
+        ],
+    ),
+]
+file_system_edits: [
+    CreateFile {
+        dst: AnchoredPathBuf {
+            anchor: FileId(
+                0,
+            ),
+            path: "target.rs",
+        },
+        initial_contents: "static FINAL: i32 = 0;\n",
+    },
+]
+"#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_union_into_new_module() {
+        check_expect(
+            "crate::target::Final",
+            r#"
+//- /lib.rs
+union ToMove$0 {
+    int: i32,
+    float: f32,
+}
+"#,
+            expect![[r#"source_file_edits: [
+    (
+        FileId(
+            0,
+        ),
+        [
+            Indel {
+                insert: "",
+                delete: 0..46,
+            },
+            Indel {
+                insert: "\nmod target;\n",
+                delete: 47..47,
+            },
+        ],
+    ),
+]
+file_system_edits: [
+    CreateFile {
+        dst: AnchoredPathBuf {
+            anchor: FileId(
+                0,
+            ),
+            path: "target.rs",
+        },
+        initial_contents: "union Final {\n    int: i32,\n    float: f32,\n}\n",
+    },
+]
+"#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_rejects_macros() {
+        check(
+            "crate::target::m",
+            r#"
+//- /lib.rs
+macro_rules! m$0 {
+    () => {};
+}
+"#,
+            r#"error: Cannot move macros with rename-to-move"#,
+        );
+    }
+
+    #[test]
     fn test_rename_mod_in_use_tree() {
         check_expect(
             "quux",
