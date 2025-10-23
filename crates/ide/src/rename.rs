@@ -9,7 +9,7 @@ use hir::{
 };
 use ide_db::{
     FileId, FileRange, RootDatabase,
-    base_db::{AnchoredPathBuf, RootQueryDb, SourceDatabase, VfsPath},
+    base_db::{AnchoredPath, AnchoredPathBuf, RootQueryDb, SourceDatabase, VfsPath},
     defs::{Definition, NameClass, NameRefClass},
     rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
     search::{FileReference, FileReferenceNode, ReferenceCategory},
@@ -381,6 +381,119 @@ fn detect_move_operation(
     }))
 }
 
+fn ensure_definition_movable(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+) -> RenameResult<()> {
+    if let Some(krate) = def.krate(sema.db) {
+        if !krate.origin(sema.db).is_local() {
+            bail!("Cannot move items defined outside of the current crate")
+        }
+    }
+
+    match def {
+        Definition::Function(_)
+        | Definition::Adt(_)
+        | Definition::Const(_)
+        | Definition::Static(_)
+        | Definition::Trait(_)
+        | Definition::TypeAlias(_) => Ok(()),
+        Definition::Module(_) => {
+            bail!("Cannot move modules; moving a module would create circular module dependencies")
+        }
+        Definition::Macro(_) => bail!("Cannot move macros with rename-to-move"),
+        Definition::Field(_) | Definition::TupleField(_) => {
+            bail!("Cannot move struct or tuple fields with rename-to-move")
+        }
+        Definition::Variant(_) => bail!("Cannot move enum variants with rename-to-move"),
+        Definition::Crate(_) => bail!("Cannot move crates"),
+        Definition::SelfType(_) => bail!("Cannot move `Self`"),
+        Definition::GenericParam(_) => {
+            bail!("Cannot move generic parameters with rename-to-move")
+        }
+        Definition::Local(_) => bail!("Cannot move local bindings with rename-to-move"),
+        Definition::Label(_) => bail!("Cannot move labels with rename-to-move"),
+        Definition::DeriveHelper(_) => {
+            bail!("Cannot move derive helper items with rename-to-move")
+        }
+        Definition::BuiltinType(_)
+        | Definition::BuiltinAttr(_)
+        | Definition::BuiltinLifetime(_) => {
+            bail!("Cannot move builtin items")
+        }
+        Definition::ToolModule(_) => bail!("Cannot move tool modules"),
+        Definition::ExternCrateDecl(_) => {
+            bail!("Cannot move extern crate declarations with rename-to-move")
+        }
+        Definition::InlineAsmRegOrRegClass(_) | Definition::InlineAsmOperand(_) => {
+            bail!("Cannot move inline assembly items with rename-to-move")
+        }
+    }
+}
+
+fn validate_destination_availability(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    move_op: &MoveOperation,
+    module_plan: &ModuleFileSystemPlan,
+) -> RenameResult<()> {
+    let Some(krate) = def.krate(sema.db) else {
+        return Ok(());
+    };
+    let edition = krate.edition(sema.db);
+    let module_path_display = format_crate_module_path(sema.db, edition, &move_op.dest_module_path);
+    let root_module = krate.root_module();
+
+    if let Some(dest_module) = resolve_existing_destination_module(root_module, move_op, sema.db) {
+        let dest_name = &move_op.dest_item_name;
+        let conflicting = dest_module
+            .declarations(sema.db)
+            .into_iter()
+            .find(|module_def| module_def.name(sema.db).is_some_and(|name| name == *dest_name));
+        if conflicting.is_some() {
+            let item_name = dest_name.display(sema.db, edition);
+            bail!(
+                "Cannot move item; destination module `{module_path_display}` already contains an item named `{item_name}`"
+            );
+        }
+    }
+
+    for creation in &module_plan.file_creations {
+        if file_exists_at_anchor(sema.db, module_plan.anchor, &creation.relative_path) {
+            bail!("Cannot move item; destination file `{}` already exists", creation.relative_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_no_circular_dependencies(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    move_op: &MoveOperation,
+    _module_plan: &ModuleFileSystemPlan,
+) -> RenameResult<()> {
+    let source_path = &move_op.source_module_path;
+    let dest_path = &move_op.dest_module_path;
+    let common_prefix =
+        source_path.iter().zip(dest_path.iter()).take_while(|(lhs, rhs)| lhs == rhs).count();
+
+    if common_prefix > 0 {
+        let prefix = &source_path[..common_prefix];
+        let suffix = &dest_path[common_prefix..];
+        if suffix.iter().any(|segment| prefix.contains(segment)) {
+            let edition =
+                def.krate(sema.db).map(|krate| krate.edition(sema.db)).unwrap_or(Edition::LATEST);
+            let module_path_display = format_crate_module_path(sema.db, edition, dest_path);
+            bail!(
+                "Cannot move item; destination module `{module_path_display}` would introduce a circular module dependency"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 impl ModuleFileSystemPlan {
     #[allow(dead_code)]
     fn is_no_op(&self) -> bool {
@@ -620,6 +733,16 @@ fn append_child_declaration_to_new_module(creation: &mut PlannedFileCreation, se
     creation.initial_contents.push_str("pub mod ");
     creation.initial_contents.push_str(segment.as_str());
     creation.initial_contents.push_str(";\n");
+}
+
+fn file_exists_at_anchor(db: &RootDatabase, anchor: FileId, relative_path: &str) -> bool {
+    if relative_path.is_empty() {
+        return false;
+    }
+    if relative_path.ends_with('/') {
+        return false;
+    }
+    db.resolve_path(AnchoredPath { anchor, path: relative_path }).is_some()
 }
 
 fn extract_definition_item(
@@ -1216,7 +1339,10 @@ fn orchestrate_move(
     resolved_name: &Name,
     move_op: &MoveOperation,
 ) -> RenameResult<SourceChange> {
+    ensure_definition_movable(sema, def)?;
     let mut module_plan = plan_module_file_system_ops(sema, def, move_op)?;
+    validate_destination_availability(sema, def, move_op, &module_plan)?;
+    validate_no_circular_dependencies(sema, def, move_op, &module_plan)?;
     let mut relocation_plan = plan_item_relocation(sema, def, move_op, &module_plan)?;
     let external_plan = plan_external_reference_updates(sema, def, move_op, &relocation_plan)?;
     let internal_plan = plan_internal_reference_updates(sema, def, move_op, &relocation_plan)?;
@@ -3879,6 +4005,65 @@ mod other {
         assert!(
             created.contains("pub(crate) fn compute"),
             "created file should upgrade function visibility:\n{created}"
+        );
+    }
+
+    #[test]
+    fn rename_move_rejects_destination_name_conflict() {
+        check(
+            "crate::dest::Final",
+            r#"
+//- /lib.rs
+mod dest {
+    pub struct Final;
+}
+
+struct ToMove$0;
+"#,
+            r#"error: Cannot move item; destination module `crate::dest` already contains an item named `Final`"#,
+        );
+    }
+
+    #[test]
+    fn rename_move_rejects_existing_destination_file() {
+        check(
+            "crate::unused::Thing",
+            r#"
+//- /lib.rs
+struct ToMove$0;
+
+//- /unused.rs
+struct Existing;
+"#,
+            r#"error: Cannot move item; destination file `unused.rs` already exists"#,
+        );
+    }
+
+    #[test]
+    fn rename_move_rejects_module_moves() {
+        check(
+            "crate::dest::Foo",
+            r#"
+//- /lib.rs
+mod foo$0 {
+    pub struct Inside;
+}
+"#,
+            r#"error: Cannot move modules; moving a module would create circular module dependencies"#,
+        );
+    }
+
+    #[test]
+    fn rename_move_rejects_circular_module_dependency() {
+        check(
+            "crate::source::source::Moved",
+            r#"
+//- /lib.rs
+mod source {
+    pub struct Moved$0;
+}
+"#,
+            r#"error: Cannot move item; destination module `crate::source::source` would introduce a circular module dependency"#,
         );
     }
 

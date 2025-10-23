@@ -80,11 +80,11 @@
 
 ## 9. Validation and Error Handling
 
-- [ ] 9.1 Validate destination doesn't have conflicting item names
-- [ ] 9.2 Check for circular module dependencies
-- [ ] 9.3 Validate item types are movable (reject locals, external crate items)
-- [ ] 9.4 Return clear error messages for validation failures
-- [ ] 9.5 Write tests for all error conditions
+- [x] 9.1 Validate destination doesn't have conflicting item names
+- [x] 9.2 Check for circular module dependencies
+- [x] 9.3 Validate item types are movable (reject locals, external crate items)
+- [x] 9.4 Return clear error messages for validation failures
+- [x] 9.5 Write tests for all error conditions
 
 ## 10. Supported Item Types
 
