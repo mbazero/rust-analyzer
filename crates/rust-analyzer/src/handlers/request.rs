@@ -12,7 +12,7 @@ use ide::{
     InlayFieldsToResolve, Query, RangeInfo, ReferenceCategory, Runnable, RunnableKind,
     SingleResolve, SourceChange, TextEdit,
 };
-use ide_db::{FxHashMap, SymbolKind};
+use ide_db::{source_change::FileSystemEdit, FxHashMap, SymbolKind};
 use itertools::Itertools;
 use lsp_server::ErrorCode;
 use lsp_types::{
@@ -1334,7 +1334,10 @@ pub(crate) fn handle_rename(
     // a second identical set of renames, the client will then apply both edits causing incorrect edits
     // with this we only emit source_file_edits in the WillRenameFiles response which will do the rename instead
     // See https://github.com/microsoft/vscode-languageserver-node/issues/752 for more info
-    if !change.file_system_edits.is_empty() && snap.config.will_rename() {
+    let only_move_ops = change.file_system_edits.iter().all(|edit| {
+        matches!(edit, FileSystemEdit::MoveFile { .. } | FileSystemEdit::MoveDir { .. })
+    });
+    if !change.file_system_edits.is_empty() && only_move_ops && snap.config.will_rename() {
         change.source_file_edits.clear();
     }
 

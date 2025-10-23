@@ -73,6 +73,17 @@ pub use _bail as bail;
 pub enum RenameDefinition {
     Yes,
     No,
+    ReferencesOnly,
+}
+
+impl RenameDefinition {
+    pub fn edits_definition(self) -> bool {
+        matches!(self, RenameDefinition::Yes)
+    }
+
+    pub fn involves_definition(self) -> bool {
+        matches!(self, RenameDefinition::Yes | RenameDefinition::ReferencesOnly)
+    }
 }
 
 impl Definition {
@@ -393,7 +404,7 @@ fn rename_reference(
             source_edit_from_references(sema.db, references, def, &new_name, edition),
         )
     }));
-    if rename_definition == RenameDefinition::Yes {
+    if rename_definition.edits_definition() {
         // This needs to come after the references edits, because we change the annotation of existing edits
         // if a conflict is detected.
         let (file_id, edit) = source_edit_from_def(sema, def, &new_name, &mut source_change)?;

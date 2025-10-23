@@ -4,7 +4,7 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, InFile, Module, ModuleSource, Name, Semantics, sym};
+use hir::{attach_db, AsAssocItem, InFile, Module, ModuleSource, Name, Semantics, sym};
 use ide_db::{
     FileId, FileRange, RootDatabase,
     base_db::{AnchoredPathBuf, RootQueryDb, SourceDatabase, VfsPath},
@@ -16,6 +16,7 @@ use ide_db::{
 use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::mem;
 use stdx::{always, format_to, never};
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
@@ -27,7 +28,7 @@ use syntax::{
 
 use span::Edition;
 
-use ide_db::text_edit::TextEdit;
+use ide_db::text_edit::{TextEdit, TextEditBuilder};
 
 use crate::{FilePosition, RangeInfo, SourceChange};
 
@@ -752,77 +753,77 @@ fn plan_item_relocation(
     Ok(ItemRelocationPlan { moved_items, destination })
 }
 
-#[allow(dead_code)]
 fn plan_external_reference_updates(
     sema: &Semantics<'_, RootDatabase>,
     def: &Definition,
     move_op: &MoveOperation,
     relocation_plan: &ItemRelocationPlan,
 ) -> RenameResult<ExternalReferenceUpdatePlan> {
-    let usages = def.usages(sema).all();
-    if usages.is_empty() {
-        return Ok(ExternalReferenceUpdatePlan { edits: Vec::new() });
-    }
+    attach_db(sema.db, || {
+        let usages = def.usages(sema).all();
+        if usages.is_empty() {
+            return Ok(ExternalReferenceUpdatePlan { edits: Vec::new() });
+        }
 
-    let edition = def
-        .krate(sema.db)
-        .map(|krate| krate.edition(sema.db))
-        .unwrap_or(Edition::LATEST);
-    let new_path = format_crate_item_path(
-        sema.db,
-        edition,
-        &move_op.dest_module_path,
-        &move_op.dest_item_name,
-    );
+        let edition = def
+            .krate(sema.db)
+            .map(|krate| krate.edition(sema.db))
+            .unwrap_or(Edition::LATEST);
+        let new_path = format_crate_item_path(
+            sema.db,
+            edition,
+            &move_op.dest_module_path,
+            &move_op.dest_item_name,
+        );
 
-    let mut per_file_replacements: BTreeMap<FileId, Vec<(TextRange, String)>> = BTreeMap::new();
+        let mut per_file_replacements: BTreeMap<FileId, Vec<(TextRange, String)>> = BTreeMap::new();
 
-    for (file_id, references) in usages.iter() {
-        for reference in references {
-            if relocation_plan
-                .moved_items
-                .iter()
-                .any(|item| item.editioned_file_id == file_id && item.range.contains_range(reference.range))
-            {
+        for (file_id, references) in usages.iter() {
+            for reference in references {
+                if relocation_plan
+                    .moved_items
+                    .iter()
+                    .any(|item| item.editioned_file_id == file_id && item.range.contains_range(reference.range))
+                {
+                    continue;
+                }
+
+                let replacement = if reference.category.contains(ReferenceCategory::IMPORT) {
+                    plan_import_reference(reference, &new_path)
+                } else {
+                    plan_non_import_reference(reference, &new_path)
+                };
+                let Some((range, text)) = replacement else { continue };
+
+                let actual_file_id = file_id.file_id(sema.db);
+                let entry = per_file_replacements.entry(actual_file_id).or_default();
+                if entry.iter().any(|(existing, _)| *existing == range) {
+                    continue;
+                }
+                entry.push((range, text));
+            }
+        }
+
+        let mut edits = Vec::new();
+        for (file_id, replacements) in per_file_replacements {
+            if replacements.is_empty() {
                 continue;
             }
-
-            let replacement = if reference.category.contains(ReferenceCategory::IMPORT) {
-                plan_import_reference(reference, &new_path)
-            } else {
-                plan_non_import_reference(reference, &new_path)
-            };
-            let Some((range, text)) = replacement else { continue };
-
-            let actual_file_id = file_id.file_id(sema.db);
-            let entry = per_file_replacements.entry(actual_file_id).or_default();
-            if entry.iter().any(|(existing, _)| *existing == range) {
+            let mut builder = TextEdit::builder();
+            for (range, text) in replacements {
+                builder.replace(range, text);
+            }
+            let edit = builder.finish();
+            if edit.is_empty() {
                 continue;
             }
-            entry.push((range, text));
+            edits.push(ExternalReferenceEditPlan { file_id, edit });
         }
-    }
 
-    let mut edits = Vec::new();
-    for (file_id, replacements) in per_file_replacements {
-        if replacements.is_empty() {
-            continue;
-        }
-        let mut builder = TextEdit::builder();
-        for (range, text) in replacements {
-            builder.replace(range, text);
-        }
-        let edit = builder.finish();
-        if edit.is_empty() {
-            continue;
-        }
-        edits.push(ExternalReferenceEditPlan { file_id, edit });
-    }
-
-    Ok(ExternalReferenceUpdatePlan { edits })
+        Ok(ExternalReferenceUpdatePlan { edits })
+    })
 }
 
-#[allow(dead_code)]
 fn plan_internal_reference_updates(
     sema: &Semantics<'_, RootDatabase>,
     def: &Definition,
@@ -836,73 +837,358 @@ fn plan_internal_reference_updates(
         .map(|krate| krate.edition(sema.db))
         .unwrap_or(Edition::LATEST);
 
-    let moved_ranges: Vec<_> = relocation_plan
-        .moved_items
-        .iter()
-        .map(|item| (item.editioned_file_id, item.range))
-        .collect();
+    attach_db(sema.db, || {
+        let moved_ranges: Vec<_> = relocation_plan
+            .moved_items
+            .iter()
+            .map(|item| (item.editioned_file_id, item.range))
+            .collect();
 
-    let mut import_paths = BTreeSet::new();
-    let mut plan = InternalReferenceUpdatePlan::default();
+        let mut import_paths = BTreeSet::new();
+        let mut plan = InternalReferenceUpdatePlan::default();
 
-    for moved_item in &relocation_plan.moved_items {
-        for path in moved_item.syntax.descendants().filter_map(ast::Path::cast) {
-            if path.syntax().parent().and_then(ast::Path::cast).is_some() {
-                continue;
-            }
-            let path_text = path.syntax().text();
-            if path_text.is_empty() {
-                continue;
-            }
+        for moved_item in &relocation_plan.moved_items {
+            for path in moved_item.syntax.descendants().filter_map(ast::Path::cast) {
+                if path.syntax().parent().and_then(ast::Path::cast).is_some() {
+                    continue;
+                }
+                let path_text = path.syntax().text();
+                if path_text.is_empty() {
+                    continue;
+                }
 
-            let Some(resolution) = sema.resolve_path(&path) else { continue; };
-            let definition = Definition::from(resolution);
-            if definition == *def {
-                continue;
-            }
-            if definition_is_within_moved_items(&definition, &moved_ranges, sema) {
-                continue;
-            }
+                let Some(resolution) = sema.resolve_path(&path) else { continue; };
+                let definition = Definition::from(resolution);
+                if definition == *def {
+                    continue;
+                }
+                if definition_is_within_moved_items(&definition, &moved_ranges, sema) {
+                    continue;
+                }
 
-            let Some(def_module) = definition.module(sema.db) else { continue; };
-            if !module_within_source_tree(def_module, source_module, sema.db) {
-                continue;
-            }
+                let Some(def_module) = definition.module(sema.db) else { continue; };
+                if !module_within_source_tree(def_module, source_module, sema.db) {
+                    continue;
+                }
 
-            if path_text.to_string().starts_with("crate::") {
-                continue;
-            }
+                if path_text.to_string().starts_with("crate::") {
+                    continue;
+                }
 
-            let in_use_tree = path_in_use_tree(&path);
-            let qualifier = path.qualifier();
-            if qualifier.is_none() && !in_use_tree {
+                let in_use_tree = path_in_use_tree(&path);
+                let qualifier = path.qualifier();
+                if qualifier.is_none() && !in_use_tree {
+                    let Some(def_name) = definition.name(sema.db) else { continue; };
+                    let module_path = module_path_from_root(def_module, sema.db);
+                    let import_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
+                    if import_paths.insert(import_path.clone()) {
+                        plan.required_imports.push(RequiredImportPlan { path: import_path });
+                    }
+                    continue;
+                }
+
                 let Some(def_name) = definition.name(sema.db) else { continue; };
                 let module_path = module_path_from_root(def_module, sema.db);
-                let import_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
-                if import_paths.insert(import_path.clone()) {
-                    plan.required_imports.push(RequiredImportPlan { path: import_path });
+                let absolute_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
+                if let Some((range, replacement)) = compute_path_replacement(&path, &absolute_path) {
+                    if !plan.path_rewrites.iter().any(|rewrite| {
+                        rewrite.file_id == moved_item.editioned_file_id && rewrite.range == range
+                    }) {
+                        plan.path_rewrites.push(InternalPathRewrite {
+                            file_id: moved_item.editioned_file_id,
+                            range,
+                            replacement,
+                        });
+                    }
                 }
+            }
+        }
+
+        Ok(plan)
+    })
+}
+
+fn orchestrate_move(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    resolved_name: &Name,
+    move_op: &MoveOperation,
+) -> RenameResult<SourceChange> {
+    let mut module_plan = plan_module_file_system_ops(sema, def, move_op)?;
+    let mut relocation_plan = plan_item_relocation(sema, def, move_op, &module_plan)?;
+    let external_plan = plan_external_reference_updates(sema, def, move_op, &relocation_plan)?;
+    let internal_plan = plan_internal_reference_updates(sema, def, &relocation_plan)?;
+
+    let mut reference_change =
+        def.rename(sema, resolved_name.as_str(), RenameDefinition::ReferencesOnly)?;
+    let mut per_item_edits = extract_reference_edits_for_moved_items(
+        &mut reference_change,
+        &relocation_plan,
+        &external_plan,
+    )?;
+
+    let internal_rewrites = collect_internal_rewrites(&relocation_plan, &internal_plan)?;
+    for (target, additional) in per_item_edits.iter_mut().zip(internal_rewrites) {
+        target.extend(additional);
+    }
+    apply_edits_to_moved_items(&mut relocation_plan.moved_items, per_item_edits)?;
+
+    let def_index = apply_definition_rename(sema, def, resolved_name, &mut relocation_plan)?;
+    let insertion_order = build_insertion_order(relocation_plan.moved_items.len(), def_index);
+
+    let move_change = build_move_change(
+        &mut module_plan,
+        &relocation_plan,
+        &external_plan,
+        &insertion_order,
+    )?;
+
+    Ok(move_change.merge(reference_change))
+}
+
+fn extract_reference_edits_for_moved_items(
+    reference_change: &mut SourceChange,
+    relocation_plan: &ItemRelocationPlan,
+    external_plan: &ExternalReferenceUpdatePlan,
+) -> RenameResult<Vec<Vec<(TextRange, String)>>> {
+    let mut per_item_edits = vec![Vec::new(); relocation_plan.moved_items.len()];
+
+    let mut moved_ranges: BTreeMap<FileId, Vec<(usize, TextRange)>> = BTreeMap::new();
+    for (idx, item) in relocation_plan.moved_items.iter().enumerate() {
+        moved_ranges.entry(item.file_id).or_default().push((idx, item.range));
+    }
+
+    let mut external_ranges: BTreeMap<FileId, Vec<TextRange>> = BTreeMap::new();
+    for plan in &external_plan.edits {
+        for indel in plan.edit.iter() {
+            external_ranges.entry(plan.file_id).or_default().push(indel.delete);
+        }
+    }
+
+    let original_edits = mem::take(&mut reference_change.source_file_edits);
+    let mut filtered = original_edits.clone();
+    filtered.clear();
+
+    for (file_id, (text_edit, snippet)) in original_edits {
+        let mut builder = TextEditBuilder::default();
+        for indel in text_edit.into_iter() {
+            if external_ranges
+                .get(&file_id)
+                .is_some_and(|ranges| ranges.iter().any(|range| ranges_overlap(indel.delete, *range)))
+            {
                 continue;
             }
 
-            let Some(def_name) = definition.name(sema.db) else { continue; };
-            let module_path = module_path_from_root(def_module, sema.db);
-            let absolute_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
-            if let Some((range, replacement)) = compute_path_replacement(&path, &absolute_path) {
-                if !plan.path_rewrites.iter().any(|rewrite| {
-                    rewrite.file_id == moved_item.editioned_file_id && rewrite.range == range
-                }) {
-                    plan.path_rewrites.push(InternalPathRewrite {
-                        file_id: moved_item.editioned_file_id,
-                        range,
-                        replacement,
-                    });
+            if let Some((item_idx, item_range)) = moved_ranges
+                .get(&file_id)
+                .and_then(|ranges| ranges.iter().find(|(_, range)| range.contains_range(indel.delete)))
+            {
+                let relative = to_relative_range(*item_range, indel.delete)?;
+                per_item_edits[*item_idx].push((relative, indel.insert.clone()));
+                continue;
+            }
+
+            builder.indel(indel);
+        }
+        let new_edit = builder.finish();
+        if !new_edit.is_empty() || snippet.is_some() {
+            filtered.insert(file_id, (new_edit, snippet));
+        }
+    }
+
+    reference_change.source_file_edits = filtered;
+    Ok(per_item_edits)
+}
+
+fn collect_internal_rewrites(
+    relocation_plan: &ItemRelocationPlan,
+    internal_plan: &InternalReferenceUpdatePlan,
+) -> RenameResult<Vec<Vec<(TextRange, String)>>> {
+    let mut per_item_edits = vec![Vec::new(); relocation_plan.moved_items.len()];
+    for rewrite in &internal_plan.path_rewrites {
+        let Some((idx, item)) = relocation_plan
+            .moved_items
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.editioned_file_id == rewrite.file_id && item.range.contains_range(rewrite.range))
+        else {
+            continue;
+        };
+        let relative = to_relative_range(item.range, rewrite.range)?;
+        per_item_edits[idx].push((relative, rewrite.replacement.clone()));
+    }
+    Ok(per_item_edits)
+}
+
+fn apply_edits_to_moved_items(
+    moved_items: &mut [PlannedItem],
+    edits: Vec<Vec<(TextRange, String)>>,
+) -> RenameResult<()> {
+    if moved_items.len() != edits.len() {
+        bail!("Mismatch between moved items and planned edits");
+    }
+    for (item, item_edits) in moved_items.iter_mut().zip(edits.into_iter()) {
+        if item_edits.is_empty() {
+            continue;
+        }
+        apply_relative_edits(&mut item.text, item_edits);
+    }
+    Ok(())
+}
+
+fn apply_definition_rename(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    resolved_name: &Name,
+    relocation_plan: &mut ItemRelocationPlan,
+) -> RenameResult<usize> {
+    let def_range = def
+        .range_for_rename(sema)
+        .ok_or_else(|| format_err!("Cannot locate definition for move operation"))?;
+    let edition = def_range.file_id.edition(sema.db);
+    let replacement = resolved_name.display(sema.db, edition).to_string();
+
+    let Some((idx, item)) = relocation_plan
+        .moved_items
+        .iter_mut()
+        .enumerate()
+        .find(|(_, item)| item.editioned_file_id == def_range.file_id && item.range.contains_range(def_range.range))
+    else {
+        bail!("Primary definition not found among moved items");
+    };
+
+    let relative = to_relative_range(item.range, def_range.range)?;
+    apply_relative_edits(&mut item.text, vec![(relative, replacement)]);
+    Ok(idx)
+}
+
+fn build_insertion_order(len: usize, def_index: usize) -> Vec<usize> {
+    let mut order: Vec<_> = (0..len).collect();
+    if def_index < order.len() {
+        order.remove(def_index);
+        order.insert(0, def_index);
+    }
+    order
+}
+
+fn build_move_change(
+    module_plan: &mut ModuleFileSystemPlan,
+    relocation_plan: &ItemRelocationPlan,
+    external_plan: &ExternalReferenceUpdatePlan,
+    insertion_order: &[usize],
+) -> RenameResult<SourceChange> {
+    let mut change = SourceChange::default();
+
+    let mut inserted_text = String::new();
+    for (idx, item_idx) in insertion_order.iter().enumerate() {
+        let item = &relocation_plan.moved_items[*item_idx];
+        if idx > 0 && !inserted_text.ends_with('\n') {
+            inserted_text.push('\n');
+        }
+        inserted_text.push_str(&item.text);
+        if !inserted_text.ends_with('\n') {
+            inserted_text.push('\n');
+        }
+    }
+
+    match &relocation_plan.destination {
+        RelocationDestination::ExistingFile { file_id, insert_offset } => {
+            if !inserted_text.is_empty() {
+                change.insert_source_edit(*file_id, TextEdit::insert(*insert_offset, inserted_text.clone()));
+            }
+        }
+        RelocationDestination::InlineModule { file_id, insert_offset, indent } => {
+            if !inserted_text.is_empty() {
+                let indented = indent_text_block(&inserted_text, &indent.to_string());
+                change.insert_source_edit(*file_id, TextEdit::insert(*insert_offset, indented));
+            }
+        }
+        RelocationDestination::NewFile { relative_path } => {
+            if let Some(creation) = module_plan
+                .file_creations
+                .iter_mut()
+                .find(|creation| creation.relative_path == *relative_path)
+            {
+                if !creation.initial_contents.is_empty() && !creation.initial_contents.ends_with('\n') {
+                    creation.initial_contents.push('\n');
                 }
+                creation.initial_contents.push_str(&inserted_text);
+            } else {
+                bail!("Destination file creation missing for `{relative_path}`");
             }
         }
     }
 
-    Ok(plan)
+    let mut deletions: BTreeMap<FileId, Vec<TextRange>> = BTreeMap::new();
+    for item in &relocation_plan.moved_items {
+        deletions.entry(item.file_id).or_default().push(item.range);
+    }
+    for (file_id, mut ranges) in deletions {
+        ranges.sort_by_key(|range| range.start());
+        let mut builder = TextEditBuilder::default();
+        for range in ranges.into_iter().rev() {
+            builder.delete(range);
+        }
+        let edit = builder.finish();
+        if !edit.is_empty() {
+            change.insert_source_edit(file_id, edit);
+        }
+    }
+
+    change.extend(module_plan.module_declaration_edits());
+
+    for edit_plan in &external_plan.edits {
+        change.insert_source_edit(edit_plan.file_id, edit_plan.edit.clone());
+    }
+
+    for fs_edit in module_plan.file_system_edits() {
+        change.push_file_system_edit(fs_edit);
+    }
+
+    Ok(change)
+}
+
+fn indent_text_block(text: &str, indent: &str) -> String {
+    if indent.is_empty() || text.is_empty() {
+        return text.to_owned();
+    }
+    let mut result = String::with_capacity(text.len() + indent.len());
+    for chunk in text.split_inclusive('\n') {
+        result.push_str(indent);
+        result.push_str(chunk);
+    }
+    result
+}
+
+fn apply_relative_edits(text: &mut String, mut edits: Vec<(TextRange, String)>) {
+    edits.sort_by_key(|(range, _)| range.start());
+    for (range, replacement) in edits.into_iter().rev() {
+        let start: usize = range.start().into();
+        let end: usize = range.end().into();
+        text.replace_range(start..end, &replacement);
+    }
+}
+
+fn ranges_overlap(lhs: TextRange, rhs: TextRange) -> bool {
+    if lhs.start() < rhs.end() && rhs.start() < lhs.end() {
+        return true;
+    }
+    if lhs.is_empty() {
+        return rhs.contains_inclusive(lhs.start());
+    }
+    if rhs.is_empty() {
+        return lhs.contains_inclusive(rhs.start());
+    }
+    false
+}
+
+fn to_relative_range(base: TextRange, range: TextRange) -> RenameResult<TextRange> {
+    if !base.contains_range(range) {
+        bail!("Edit range is not contained within moved item");
+    }
+    let start = range.start() - base.start();
+    let end = range.end() - base.start();
+    Ok(TextRange::new(start, end))
 }
 
 fn definition_is_within_moved_items(
@@ -1349,9 +1635,7 @@ pub(crate) fn rename(
                     if let Some(move_operation) =
                         detect_move_operation(&sema, &def, &resolved_name, move_target)?
                     {
-                        let module_plan = plan_module_file_system_ops(&sema, &def, &move_operation)?;
-                        let _ = plan_item_relocation(&sema, &def, &move_operation, &module_plan)?;
-                        bail!("rename-to-move is not implemented yet");
+                        return orchestrate_move(&sema, &def, &resolved_name, &move_operation);
                     }
                 }
             }
@@ -2284,18 +2568,16 @@ fn f() {
         let edit_plan = &edits[0];
         let mut text = analysis.file_text(edit_plan.file_id).unwrap().to_string();
         edit_plan.edit.apply(&mut text);
-        assert_eq_text!(
-            trim_indent(
-                r#"
+        let expected = trim_indent(
+            r#"
 use crate::beta::Final;
 
 fn f() {
     let _ = crate::beta::Final::default();
 }
 "#
-            ),
-            &text
         );
+        assert_eq_text!(expected.as_str(), text.as_str());
     }
 
     #[test]
@@ -2325,9 +2607,8 @@ pub mod nested {
         let edit_plan = &edits[0];
         let mut text = analysis.file_text(edit_plan.file_id).unwrap().to_string();
         edit_plan.edit.apply(&mut text);
-        assert_eq_text!(
-            trim_indent(
-                r#"
+        let expected = trim_indent(
+            r#"
 pub struct ToMove;
 
 pub mod nested {
@@ -2338,9 +2619,8 @@ pub mod nested {
     }
 }
 "#
-            ),
-            &text
         );
+        assert_eq_text!(expected.as_str(), text.as_str());
     }
 
     #[test]
@@ -2370,18 +2650,16 @@ pub fn make() -> OldAlias {
         let edit_plan = &edits[0];
         let mut text = analysis.file_text(edit_plan.file_id).unwrap().to_string();
         edit_plan.edit.apply(&mut text);
-        assert_eq_text!(
-            trim_indent(
-                r#"
+        let expected = trim_indent(
+            r#"
 use crate::beta::Final as OldAlias;
 
 pub fn make() -> OldAlias {
     OldAlias {}
 }
 "#
-            ),
-            &text
         );
+        assert_eq_text!(expected.as_str(), text.as_str());
     }
 
     #[test]
@@ -2426,7 +2704,7 @@ impl Foo {
                 .collect::<Vec<_>>()
                 .as_slice(),
         );
-        assert_eq_text!(original, &updated);
+        assert_eq_text!(original.as_ref(), updated.as_str());
     }
 
     #[test]
@@ -3031,6 +3309,59 @@ mod foo$0;
                             ),
                             path: "foo2.rs",
                         },
+                    },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_struct_into_new_module() {
+        check_expect(
+            "crate::fresh::Final",
+            r#"
+//- /lib.rs
+struct ToMove$0;
+
+fn make() -> ToMove {
+    ToMove
+}
+"#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(
+                            0,
+                        ),
+                        [
+                            Indel {
+                                insert: "",
+                                delete: 0..14,
+                            },
+                            Indel {
+                                insert: "Final",
+                                delete: 29..35,
+                            },
+                            Indel {
+                                insert: "Final",
+                                delete: 42..48,
+                            },
+                            Indel {
+                                insert: "\nmod fresh;\n",
+                                delete: 51..51,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: [
+                    CreateFile {
+                        dst: AnchoredPathBuf {
+                            anchor: FileId(
+                                0,
+                            ),
+                            path: "fresh.rs",
+                        },
+                        initial_contents: "struct Final;\n",
                     },
                 ]
             "#]],
