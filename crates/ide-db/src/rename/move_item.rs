@@ -5,7 +5,7 @@
 
 use hir::{Module, Semantics, ModPath, PathKind, HasSource};
 use syntax::{AstNode, ast::{self, HasName}, TextRange};
-use base_db::AnchoredPathBuf;
+use base_db::{AnchoredPathBuf, FileId};
 
 use crate::{RootDatabase, defs::Definition, source_change::FileSystemEdit, text_edit::TextEdit};
 
@@ -623,6 +623,8 @@ pub fn update_external_references(
     def: &Definition,
     dest_module: &Module,
     new_name: &str,
+    source_file_id: FileId,
+    exclude_ranges: &[TextRange],
 ) -> Result<Vec<(base_db::EditionedFileId, TextEdit)>> {
     // Find all usages of the item being moved
     let usages = def.usages(sema).all();
@@ -639,12 +641,44 @@ pub fn update_external_references(
         let mut edited_ranges = std::collections::HashSet::new();
 
         for reference in references {
+            // Skip if this reference is in the source file within an excluded range (item being moved)
+            let ref_file_id = file_id.file_id(sema.db);
+            if ref_file_id == source_file_id {
+                if exclude_ranges.iter().any(|range| range.contains_range(reference.range)) {
+                    continue;
+                }
+            }
+
             // Skip if we've already edited this range (can happen with macros)
             if edited_ranges.contains(&reference.range.start()) {
                 continue;
             }
 
             // Try to update the reference based on its context
+            // For use statements, we need to replace the entire path, not just the name
+            let name_node = match reference.name.as_name_ref() {
+                Some(n) => n,
+                None => continue,
+            };
+            let syntax_node = name_node.syntax();
+
+            // Check if this is in a use statement and get the proper range and replacement
+            if let Some(use_tree) = syntax_node.ancestors().find_map(ast::UseTree::cast) {
+                if let Some(path) = use_tree.path() {
+                    // Replace the entire path in the use tree
+                    let path_range = path.syntax().text_range();
+                    let replacement = if let Some(rename) = use_tree.rename() {
+                        format!("{} as {}", new_import_path, rename.name().map_or("_".to_string(), |n| n.to_string()))
+                    } else {
+                        new_import_path.to_string()
+                    };
+                    edit_builder.replace(path_range, replacement);
+                    edited_ranges.insert(path_range.start());
+                    continue;
+                }
+            }
+
+            // For other references, use the standard replacement logic
             if let Some(replacement) = compute_reference_replacement(
                 sema,
                 &reference,

@@ -374,17 +374,7 @@ fn rename_to_move(
         impl_texts.push(source_text[impl_range].to_string());
     }
 
-    // Step 8: Update item name if it differs
-    if let Some(name_node) = item_syntax.descendants().find_map(ast::Name::cast) {
-        let old_name_str = name_node.text().to_string();
-        if old_name_str.as_str() != new_name {
-            // Simple string replacement for the name
-            // This works because we're replacing the item definition name
-            item_text = item_text.replacen(&old_name_str, new_name, 1);
-        }
-    }
-
-    // Step 9: Update internal references
+    // Step 8: Update internal references
     let items_moving: Vec<_> = std::iter::once(item_syntax.clone())
         .chain(impl_blocks.iter().cloned())
         .collect();
@@ -399,6 +389,29 @@ fn rename_to_move(
     // Apply internal reference updates to item text
     if !updated_item_text.is_empty() {
         item_text = updated_item_text;
+    }
+
+    // Step 9: Update item name if it differs
+    // This must be done AFTER update_internal_references because that function
+    // extracts text from the original syntax node
+    if let Some(name_node) = item_syntax.descendants().find_map(ast::Name::cast) {
+        let old_name_str = name_node.text().to_string();
+        if old_name_str.as_str() != new_name {
+            // Simple string replacement for the name in the item definition
+            item_text = item_text.replacen(&old_name_str, new_name, 1);
+
+            // Also update impl block headers that reference the old name
+            for impl_text in &mut impl_texts {
+                // Replace "impl OldName" with "impl NewName"
+                // We need to be careful to only replace in the impl header, not in the body
+                if let Some(impl_start) = impl_text.find(&format!("impl {}", old_name_str)) {
+                    let before = &impl_text[..impl_start];
+                    let after = &impl_text[impl_start..];
+                    let updated_after = after.replacen(&format!("impl {}", old_name_str), &format!("impl {}", new_name), 1);
+                    *impl_text = format!("{}{}", before, updated_after);
+                }
+            }
+        }
     }
 
     // Step 10: Calculate and update visibility if needed
@@ -421,10 +434,10 @@ fn rename_to_move(
 
     let mut dest_edit = TextEdit::builder();
     // Add item with proper spacing
-    dest_edit.insert(insert_pos, format!("\n\n{}", item_text));
-    // Add impl blocks
+    dest_edit.insert(insert_pos, format!("\n\n{}\n", item_text));
+    // Add impl blocks (use single newline prefix since previous item has trailing newline)
     for impl_text in impl_texts {
-        dest_edit.insert(insert_pos, format!("\n\n{}", impl_text));
+        dest_edit.insert(insert_pos, format!("\n{}\n", impl_text));
     }
     source_change.insert_source_edit(dest_file_id.file_id(sema.db), dest_edit.finish());
 
@@ -439,7 +452,13 @@ fn rename_to_move(
     }
 
     // Step 14: Update external references
-    let external_edits = update_external_references(sema, def, &dest_module, new_name)?;
+    // Build list of ranges to exclude (the items being moved)
+    let mut exclude_ranges = vec![item_range];
+    for impl_block in &impl_blocks {
+        let impl_range = extract_item_with_attrs(impl_block);
+        exclude_ranges.push(impl_range);
+    }
+    let external_edits = update_external_references(sema, def, &dest_module, new_name, source_file_id.file_id(sema.db), &exclude_ranges)?;
     for (file_id, edit) in external_edits {
         source_change.insert_source_edit(file_id.file_id(sema.db), edit);
     }

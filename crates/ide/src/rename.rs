@@ -620,7 +620,7 @@ mod tests {
                 let (&file_id, edit) = match source_change.source_file_edits.len() {
                     0 => return,
                     1 => source_change.source_file_edits.iter().next().unwrap(),
-                    _ => panic!(),
+                    _ => panic!("check() only supports single-file edits, use check_multi_file() for rename-to-move tests"),
                 };
                 for indel in edit.0.iter() {
                     text_edit_builder.replace(indel.delete, indel.insert.clone());
@@ -639,6 +639,83 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[track_caller]
+    fn check_multi_file(
+        new_name: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_after: &str,
+    ) {
+        use ide_db::base_db::SourceDatabase;
+        use stdx::format_to;
+
+        let ra_fixture_after = &trim_indent(ra_fixture_after);
+        let (analysis, position) = fixture::position(ra_fixture_before);
+        let rename_result = analysis
+            .rename(position, new_name)
+            .unwrap_or_else(|err| panic!("Rename to '{new_name}' was cancelled: {err}"));
+
+        match rename_result {
+            Ok(source_change) => {
+                // Build output string similar to check_assist
+                let skip_header = source_change.source_file_edits.len() == 1
+                    && source_change.file_system_edits.is_empty();
+
+                let mut buf = String::new();
+                let db = &analysis.db;
+
+                for (&file_id, (edit, snippet_edit)) in &source_change.source_file_edits {
+                    let mut text = db.file_text(file_id).text(db).as_ref().to_owned();
+                    edit.apply(&mut text);
+                    if let Some(snippet_edit) = snippet_edit {
+                        snippet_edit.apply(&mut text);
+                    }
+
+                    if !skip_header {
+                        let source_root_id = db.file_source_root(file_id).source_root_id(db);
+                        let sr = db.source_root(source_root_id).source_root(db);
+                        let path = sr.path_for_file(&file_id).unwrap();
+                        format_to!(buf, "//- {}\n", path);
+                    }
+                    buf.push_str(&text);
+                }
+
+                for file_system_edit in &source_change.file_system_edits {
+                    let (dst, contents) = match file_system_edit {
+                        ide_db::source_change::FileSystemEdit::CreateFile {
+                            dst,
+                            initial_contents,
+                        } => (dst, initial_contents.clone()),
+                        ide_db::source_change::FileSystemEdit::MoveFile { src, dst } => {
+                            (dst, db.file_text(*src).text(db).as_ref().to_owned())
+                        }
+                        ide_db::source_change::FileSystemEdit::MoveDir { src, src_id, dst } => {
+                            (dst, format!("{src_id:?}\n{src:?}"))
+                        }
+                    };
+
+                    let source_root_id = db.file_source_root(dst.anchor).source_root_id(db);
+                    let sr = db.source_root(source_root_id).source_root(db);
+                    let mut base = sr.path_for_file(&dst.anchor).unwrap().clone();
+                    base.pop();
+                    let created_file_path = base.join(&dst.path).unwrap();
+                    format_to!(buf, "//- {}\n", created_file_path);
+                    buf.push_str(&contents);
+                }
+
+                assert_eq_text!(ra_fixture_after, &buf);
+            }
+            Err(err) => {
+                if ra_fixture_after.starts_with("error:") {
+                    let error_message =
+                        ra_fixture_after.chars().skip("error:".len()).collect::<String>();
+                    assert_eq!(error_message.trim(), err.to_string());
+                } else {
+                    panic!("Rename to '{new_name}' failed unexpectedly: {err}")
+                }
+            }
+        }
     }
 
     #[track_caller]
@@ -3770,6 +3847,325 @@ mod other;
 fn foo(x: bool$0) {}
 "#,
             "error: Cannot rename builtin type",
+        );
+    }
+
+    // ============================================================================
+    // Multi-file end-to-end tests using check_multi_file()
+    // ============================================================================
+
+    #[test]
+    fn test_rename_to_move_simple_struct_to_existing_module() {
+        check_multi_file(
+            "crate::module::NewName",
+            r#"
+//- /lib.rs
+mod module;
+
+struct Foo$0;
+//- /module.rs
+"#,
+            r#"
+//- /lib.rs
+mod module;
+
+//- /module.rs
+
+
+struct NewName;
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_struct_with_impl_block() {
+        check_multi_file(
+            "crate::module::Point",
+            r#"
+//- /lib.rs
+mod module;
+
+struct Foo$0 {
+    x: i32,
+    y: i32,
+}
+
+impl Foo {
+    fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+//- /module.rs
+"#,
+            r#"
+//- /lib.rs
+mod module;
+
+
+//- /module.rs
+
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+
+impl Point {
+    fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_with_external_references() {
+        check_multi_file(
+            "crate::types::MyStruct",
+            r#"
+//- /lib.rs
+mod types;
+mod other;
+
+struct Foo$0;
+//- /types.rs
+//- /other.rs
+use crate::Foo;
+
+fn use_foo() -> Foo {
+    Foo
+}
+"#,
+            r#"
+//- /lib.rs
+mod types;
+mod other;
+
+//- /types.rs
+
+
+struct MyStruct;
+//- /other.rs
+use crate::types::MyStruct;
+
+fn use_foo() -> MyStruct {
+    MyStruct
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_function() {
+        check_multi_file(
+            "crate::utils::helper",
+            r#"
+//- /lib.rs
+mod utils;
+
+fn foo$0() -> i32 {
+    42
+}
+//- /utils.rs
+"#,
+            r#"
+//- /lib.rs
+mod utils;
+
+//- /utils.rs
+
+
+fn helper() -> i32 {
+    42
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_enum() {
+        check_multi_file(
+            "crate::types::Status",
+            r#"
+//- /lib.rs
+mod types;
+
+enum MyEnum$0 {
+    Variant1,
+    Variant2,
+}
+//- /types.rs
+"#,
+            r#"
+//- /lib.rs
+mod types;
+
+//- /types.rs
+
+
+enum Status {
+    Variant1,
+    Variant2,
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_trait() {
+        check_multi_file(
+            "crate::traits::Processor",
+            r#"
+//- /lib.rs
+mod traits;
+
+trait MyTrait$0 {
+    fn process(&self);
+}
+//- /traits.rs
+"#,
+            r#"
+//- /lib.rs
+mod traits;
+
+//- /traits.rs
+
+
+trait Processor {
+    fn process(&self);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_type_alias() {
+        check_multi_file(
+            "crate::types::IntAlias",
+            r#"
+//- /lib.rs
+mod types;
+
+type MyType$0 = i32;
+//- /types.rs
+"#,
+            r#"
+//- /lib.rs
+mod types;
+
+//- /types.rs
+
+
+type IntAlias = i32;
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_const() {
+        check_multi_file(
+            "crate::constants::MAX",
+            r#"
+//- /lib.rs
+mod constants;
+
+const FOO$0: i32 = 100;
+//- /constants.rs
+"#,
+            r#"
+//- /lib.rs
+mod constants;
+
+//- /constants.rs
+
+
+const MAX: i32 = 100;
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_static() {
+        check_multi_file(
+            "crate::globals::COUNTER",
+            r#"
+//- /lib.rs
+mod globals;
+
+static FOO$0: i32 = 0;
+//- /globals.rs
+"#,
+            r#"
+//- /lib.rs
+mod globals;
+
+//- /globals.rs
+
+
+static COUNTER: i32 = 0;
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_union() {
+        check_multi_file(
+            "crate::types::Data",
+            r#"
+//- /lib.rs
+mod types;
+
+union MyUnion$0 {
+    int_val: i32,
+    float_val: f32,
+}
+//- /types.rs
+"#,
+            r#"
+//- /lib.rs
+mod types;
+
+//- /types.rs
+
+
+union Data {
+    int_val: i32,
+    float_val: f32,
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_to_move_with_attributes_and_docs() {
+        check_multi_file(
+            "crate::types::Important",
+            r#"
+//- /lib.rs
+mod types;
+
+/// This is a documented struct
+#[derive(Debug, Clone)]
+struct Foo$0 {
+    value: i32,
+}
+//- /types.rs
+"#,
+            r#"
+//- /lib.rs
+mod types;
+
+//- /types.rs
+
+
+/// This is a documented struct
+#[derive(Debug, Clone)]
+struct Important {
+    value: i32,
+}
+"#,
         );
     }
 }
