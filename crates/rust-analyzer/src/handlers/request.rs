@@ -12,7 +12,7 @@ use ide::{
     InlayFieldsToResolve, Query, RangeInfo, ReferenceCategory, Runnable, RunnableKind,
     SingleResolve, SourceChange, TextEdit,
 };
-use ide_db::{source_change::FileSystemEdit, FxHashMap, SymbolKind};
+use ide_db::{FxHashMap, SymbolKind, source_change::FileSystemEdit};
 use itertools::Itertools;
 use lsp_server::ErrorCode;
 use lsp_types::{

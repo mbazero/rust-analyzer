@@ -65,18 +65,18 @@
 
 ## 8. Visibility Analysis and Updates
 
-- [ ] 8.1 Implement external visibility validation
-- [ ] 8.2 Check visibility of all items referenced within moved code
-- [ ] 8.3 Validate `pub`, `pub(crate)`, `pub(super)`, `pub(in path)` accessibility rules
-- [ ] 8.4 Reject moves when private items become inaccessible
-- [ ] 8.5 Implement required visibility calculation for moved item (simplified: private, pub(crate), pub only)
-- [ ] 8.6 Find all usages of moved item to determine visibility requirements
-- [ ] 8.7 Calculate minimum visibility using simple rule: same module → private, same crate → pub(crate), else → pub
-- [ ] 8.8 Update visibility modifiers on moved item definition (never downgrade)
-- [ ] 8.9 Update visibility modifiers on associated items (methods in impl blocks)
-- [ ] 8.10 Handle struct field visibility (preserve or update as needed)
-- [ ] 8.11 Write tests for visibility validation (reject inaccessible references)
-- [ ] 8.12 Write tests for visibility updates (private → pub(crate), private → pub, preserve existing)
+- [x] 8.1 Implement external visibility validation
+- [x] 8.2 Check visibility of all items referenced within moved code
+- [x] 8.3 Validate `pub`, `pub(crate)`, `pub(super)`, `pub(in path)` accessibility rules
+- [x] 8.4 Reject moves when private items become inaccessible
+- [x] 8.5 Implement required visibility calculation for moved item (simplified: private, pub(crate), pub only)
+- [x] 8.6 Find all usages of moved item to determine visibility requirements
+- [x] 8.7 Calculate minimum visibility using simple rule: same module → private, same crate → pub(crate), else → pub
+- [x] 8.8 Update visibility modifiers on moved item definition (never downgrade)
+- [x] 8.9 Update visibility modifiers on associated items (methods in impl blocks)
+- [x] 8.10 Handle struct field visibility (preserve or update as needed)
+- [x] 8.11 Write tests for visibility validation (reject inaccessible references)
+- [x] 8.12 Write tests for visibility updates (private → pub(crate), private → pub, preserve existing)
 
 ## 9. Validation and Error Handling
 

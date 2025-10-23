@@ -4,13 +4,15 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{attach_db, AsAssocItem, InFile, Module, ModuleSource, Name, Semantics, sym};
+use hir::{
+    AsAssocItem, Crate, InFile, Module, ModuleSource, Name, Semantics, Visibility, attach_db, sym,
+};
 use ide_db::{
     FileId, FileRange, RootDatabase,
     base_db::{AnchoredPathBuf, RootQueryDb, SourceDatabase, VfsPath},
     defs::{Definition, NameClass, NameRefClass},
     rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
-    search::{FileReference, ReferenceCategory},
+    search::{FileReference, FileReferenceNode, ReferenceCategory},
     source_change::{FileSystemEdit, SourceChangeBuilder},
 };
 use itertools::Itertools;
@@ -21,8 +23,8 @@ use stdx::{always, format_to, never};
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
     ast::{
-        self, HasArgList, HasGenericArgs, HasModuleItem, HasName, PathSegmentKind, edit::IndentLevel,
-        prec::ExprPrecedence,
+        self, HasArgList, HasGenericArgs, HasModuleItem, HasName, PathSegmentKind,
+        edit::IndentLevel, prec::ExprPrecedence,
     },
 };
 
@@ -114,6 +116,35 @@ struct InternalPathRewrite {
     file_id: ide_db::EditionedFileId,
     range: TextRange,
     replacement: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum VisibilityLevel {
+    Private,
+    PubCrate,
+    Pub,
+}
+
+impl VisibilityLevel {
+    fn insertion_text(self) -> Option<&'static str> {
+        match self {
+            VisibilityLevel::Private => None,
+            VisibilityLevel::PubCrate => Some("pub(crate) "),
+            VisibilityLevel::Pub => Some("pub "),
+        }
+    }
+
+    fn canonical_repr(self) -> Option<&'static str> {
+        match self {
+            VisibilityLevel::Private => None,
+            VisibilityLevel::PubCrate => Some("pub(crate)"),
+            VisibilityLevel::Pub => Some("pub"),
+        }
+    }
+
+    fn replacement_text(self) -> Option<&'static str> {
+        self.canonical_repr()
+    }
 }
 
 impl ExternalReferenceUpdatePlan {
@@ -231,10 +262,14 @@ impl ParsedRenameTarget {
 
         let (kind, start_idx) = match segments[0].kind() {
             Some(PathSegmentKind::CrateKw) => (MovePathHead::Crate, 1),
-            Some(PathSegmentKind::SelfKw | PathSegmentKind::SuperKw | PathSegmentKind::SelfTypeKw) => {
+            Some(
+                PathSegmentKind::SelfKw | PathSegmentKind::SuperKw | PathSegmentKind::SelfTypeKw,
+            ) => {
                 bail!("Rename-to-move paths must start with `crate::`")
             }
-            Some(PathSegmentKind::Name(_)) => bail!("Rename-to-move paths must start with `crate::`"),
+            Some(PathSegmentKind::Name(_)) => {
+                bail!("Rename-to-move paths must start with `crate::`")
+            }
             Some(PathSegmentKind::Type { .. }) | None => {
                 bail!("Rename-to-move path segments cannot contain generics or type arguments")
             }
@@ -269,9 +304,8 @@ impl ParsedRenameTarget {
             module_path.push(segment_name);
         }
 
-        let Some(PathSegmentKind::Name(name_ref)) = segments
-            .last()
-            .and_then(|segment| segment.kind())
+        let Some(PathSegmentKind::Name(name_ref)) =
+            segments.last().and_then(|segment| segment.kind())
         else {
             bail!("Rename-to-move requires a destination item name");
         };
@@ -282,10 +316,7 @@ impl ParsedRenameTarget {
             || last_segment.type_anchor().is_some()
             || last_segment.ret_type().is_some()
         {
-            bail!(
-                "Rename-to-move path segment `{}` contains unsupported syntax",
-                name_ref.text()
-            );
+            bail!("Rename-to-move path segment `{}` contains unsupported syntax", name_ref.text());
         }
 
         let final_name_text = name_ref.text().to_string();
@@ -293,10 +324,7 @@ impl ParsedRenameTarget {
             bail!("Rename-to-move requires a destination item name");
         }
 
-        Ok(Self {
-            final_name_text,
-            move_target: Some(MoveTarget { kind, module_path }),
-        })
+        Ok(Self { final_name_text, move_target: Some(MoveTarget { kind, module_path }) })
     }
 
     fn final_name_text(&self) -> &str {
@@ -320,12 +348,7 @@ impl MoveTarget {
 }
 
 fn module_path_from_root(module: Module, db: &RootDatabase) -> Vec<Name> {
-    module
-        .path_to_root(db)
-        .into_iter()
-        .rev()
-        .filter_map(|module| module.name(db))
-        .collect()
+    module.path_to_root(db).into_iter().rev().filter_map(|module| module.name(db)).collect()
 }
 
 fn detect_move_operation(
@@ -384,12 +407,7 @@ impl ModuleFileSystemPlan {
     fn module_declaration_edits(&self) -> Vec<(FileId, TextEdit)> {
         self.module_declarations
             .iter()
-            .map(|decl| {
-                (
-                    decl.file_id,
-                    TextEdit::insert(decl.insert_offset, decl.text.clone()),
-                )
-            })
+            .map(|decl| (decl.file_id, TextEdit::insert(decl.insert_offset, decl.text.clone())))
             .collect()
     }
 
@@ -400,10 +418,7 @@ impl ModuleFileSystemPlan {
 
     #[cfg(test)]
     fn file_initial_contents(&self) -> Vec<&str> {
-        self.file_creations
-            .iter()
-            .map(|creation| creation.initial_contents.as_str())
-            .collect()
+        self.file_creations.iter().map(|creation| creation.initial_contents.as_str()).collect()
     }
 
     #[cfg(test)]
@@ -454,22 +469,23 @@ fn plan_module_file_system_ops(
         let Some(file_id) = child_module.as_source_file_id(db) else {
             bail!("Destination module `{}` has no associated source file", segment.as_str());
         };
-        let module_path = relative_path_from_anchor(db, root_anchor, file_id.file_id(db), &root_dir)
-            .ok_or_else(|| {
-                format_err!(
-                    "Failed to resolve file path for destination module `{}`",
-                    segment.as_str()
-                )
-            })?;
+        let module_path = relative_path_from_anchor(
+            db,
+            root_anchor,
+            file_id.file_id(db),
+            &root_dir,
+        )
+        .ok_or_else(|| {
+            format_err!("Failed to resolve file path for destination module `{}`", segment.as_str())
+        })?;
         existing_paths.push(module_path.clone());
-        current_parent_dir =
-            module_directory_from_file_path(&module_path, child_module.is_mod_rs(db))
-                .ok_or_else(|| {
-                    format_err!(
-                        "Failed to resolve destination directory for module `{}`",
-                        segment.as_str()
-                    )
-                })?;
+        current_parent_dir = module_directory_from_file_path(
+            &module_path,
+            child_module.is_mod_rs(db),
+        )
+        .ok_or_else(|| {
+            format_err!("Failed to resolve destination directory for module `{}`", segment.as_str())
+        })?;
         current_parent_module = child_module;
         existing_prefix_len += 1;
     }
@@ -534,14 +550,8 @@ fn plan_module_file_system_ops(
     })
 }
 
-fn find_child_module_by_name(
-    parent: Module,
-    db: &RootDatabase,
-    segment: &Name,
-) -> Option<Module> {
-    parent
-        .children(db)
-        .find(|child| child.name(db).is_some_and(|name| name == *segment))
+fn find_child_module_by_name(parent: Module, db: &RootDatabase, segment: &Name) -> Option<Module> {
+    parent.children(db).find(|child| child.name(db).is_some_and(|name| name == *segment))
 }
 
 fn vfs_path(db: &RootDatabase, file_id: FileId) -> Option<VfsPath> {
@@ -585,11 +595,7 @@ fn module_directory_from_file_path(rel_path: &str, is_mod_rs: bool) -> Option<St
     Some(format!("{stripped}/"))
 }
 
-fn build_module_file_path(
-    current_dir: &str,
-    segment: &str,
-    style: ModuleCreationStyle,
-) -> String {
+fn build_module_file_path(current_dir: &str, segment: &str, style: ModuleCreationStyle) -> String {
     match style {
         ModuleCreationStyle::File => format!("{current_dir}{segment}.rs"),
         ModuleCreationStyle::ModRs => format!("{current_dir}{segment}/mod.rs"),
@@ -622,35 +628,44 @@ fn extract_definition_item(
 ) -> RenameResult<PlannedItem> {
     let (editioned_file_id, syntax) = match def {
         Definition::Function(fun) => {
-            let src = sema.source(*fun).ok_or_else(|| format_err!("Cannot find source for function"))?;
+            let src =
+                sema.source(*fun).ok_or_else(|| format_err!("Cannot find source for function"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         Definition::Adt(hir::Adt::Struct(strukt)) => {
-            let src = sema.source(*strukt).ok_or_else(|| format_err!("Cannot find source for struct"))?;
+            let src =
+                sema.source(*strukt).ok_or_else(|| format_err!("Cannot find source for struct"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         Definition::Adt(hir::Adt::Enum(enm)) => {
-            let src = sema.source(*enm).ok_or_else(|| format_err!("Cannot find source for enum"))?;
+            let src =
+                sema.source(*enm).ok_or_else(|| format_err!("Cannot find source for enum"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         Definition::Adt(hir::Adt::Union(union)) => {
-            let src = sema.source(*union).ok_or_else(|| format_err!("Cannot find source for union"))?;
+            let src =
+                sema.source(*union).ok_or_else(|| format_err!("Cannot find source for union"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         Definition::Trait(trait_def) => {
-            let src = sema.source(*trait_def).ok_or_else(|| format_err!("Cannot find source for trait"))?;
+            let src = sema
+                .source(*trait_def)
+                .ok_or_else(|| format_err!("Cannot find source for trait"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         Definition::Const(konst) => {
-            let src = sema.source(*konst).ok_or_else(|| format_err!("Cannot find source for const"))?;
+            let src =
+                sema.source(*konst).ok_or_else(|| format_err!("Cannot find source for const"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         Definition::Static(stat) => {
-            let src = sema.source(*stat).ok_or_else(|| format_err!("Cannot find source for static"))?;
+            let src =
+                sema.source(*stat).ok_or_else(|| format_err!("Cannot find source for static"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         Definition::TypeAlias(ty) => {
-            let src = sema.source(*ty).ok_or_else(|| format_err!("Cannot find source for type alias"))?;
+            let src =
+                sema.source(*ty).ok_or_else(|| format_err!("Cannot find source for type alias"))?;
             (src.file_id.original_file(sema.db), src.value.syntax().clone())
         }
         _ => bail!("Unsupported definition type for relocation"),
@@ -672,7 +687,9 @@ fn collect_associated_impls(
     def: &Definition,
     primary: &PlannedItem,
 ) -> Vec<PlannedItem> {
-    let Some(type_name) = def.name(sema.db).map(|name| name.as_str().trim_start_matches("r#").to_string()) else {
+    let Some(type_name) =
+        def.name(sema.db).map(|name| name.as_str().trim_start_matches("r#").to_string())
+    else {
         return Vec::new();
     };
 
@@ -707,13 +724,19 @@ fn collect_associated_impls(
 }
 
 fn impl_targets_type(impl_block: &ast::Impl, type_name: &str) -> bool {
-    let Some(self_ty) = impl_block.self_ty() else { return false; };
+    let Some(self_ty) = impl_block.self_ty() else {
+        return false;
+    };
     let path_type = match self_ty {
         ast::Type::PathType(path_type) => path_type,
         _ => return false,
     };
-    let Some(path) = path_type.path() else { return false; };
-    let Some(segment) = path_last_segment(&path) else { return false; };
+    let Some(path) = path_type.path() else {
+        return false;
+    };
+    let Some(segment) = path_last_segment(&path) else {
+        return false;
+    };
     segment.text().trim_start_matches("r#") == type_name
 }
 
@@ -747,7 +770,9 @@ fn plan_item_relocation(
             },
         }
     } else {
-        RelocationDestination::NewFile { relative_path: module_plan.destination_relative_path.clone() }
+        RelocationDestination::NewFile {
+            relative_path: module_plan.destination_relative_path.clone(),
+        }
     };
 
     Ok(ItemRelocationPlan { moved_items, destination })
@@ -765,10 +790,8 @@ fn plan_external_reference_updates(
             return Ok(ExternalReferenceUpdatePlan { edits: Vec::new() });
         }
 
-        let edition = def
-            .krate(sema.db)
-            .map(|krate| krate.edition(sema.db))
-            .unwrap_or(Edition::LATEST);
+        let edition =
+            def.krate(sema.db).map(|krate| krate.edition(sema.db)).unwrap_or(Edition::LATEST);
         let new_path = format_crate_item_path(
             sema.db,
             edition,
@@ -780,11 +803,9 @@ fn plan_external_reference_updates(
 
         for (file_id, references) in usages.iter() {
             for reference in references {
-                if relocation_plan
-                    .moved_items
-                    .iter()
-                    .any(|item| item.editioned_file_id == file_id && item.range.contains_range(reference.range))
-                {
+                if relocation_plan.moved_items.iter().any(|item| {
+                    item.editioned_file_id == file_id && item.range.contains_range(reference.range)
+                }) {
                     continue;
                 }
 
@@ -827,15 +848,16 @@ fn plan_external_reference_updates(
 fn plan_internal_reference_updates(
     sema: &Semantics<'_, RootDatabase>,
     def: &Definition,
+    move_op: &MoveOperation,
     relocation_plan: &ItemRelocationPlan,
 ) -> RenameResult<InternalReferenceUpdatePlan> {
     let Some(source_module) = def.module(sema.db) else {
         return Ok(InternalReferenceUpdatePlan::default());
     };
-    let edition = def
-        .krate(sema.db)
-        .map(|krate| krate.edition(sema.db))
-        .unwrap_or(Edition::LATEST);
+    let def_krate = def.krate(sema.db);
+    let edition = def_krate.map(|krate| krate.edition(sema.db)).unwrap_or(Edition::LATEST);
+    let dest_crate = def_krate;
+    let dest_module_path = move_op.dest_module_path.clone();
 
     attach_db(sema.db, || {
         let moved_ranges: Vec<_> = relocation_plan
@@ -857,7 +879,9 @@ fn plan_internal_reference_updates(
                     continue;
                 }
 
-                let Some(resolution) = sema.resolve_path(&path) else { continue; };
+                let Some(resolution) = sema.resolve_path(&path) else {
+                    continue;
+                };
                 let definition = Definition::from(resolution);
                 if definition == *def {
                     continue;
@@ -866,9 +890,31 @@ fn plan_internal_reference_updates(
                     continue;
                 }
 
-                let Some(def_module) = definition.module(sema.db) else { continue; };
+                let Some(def_module) = definition.module(sema.db) else {
+                    continue;
+                };
+                let def_name = definition.name(sema.db);
                 if !module_within_source_tree(def_module, source_module, sema.db) {
                     continue;
+                }
+
+                if let (Some(krate), Some(visibility)) =
+                    (dest_crate, definition.visibility(sema.db))
+                {
+                    if !visibility_allows_access(sema.db, visibility, &dest_module_path, krate) {
+                        let module_path = module_path_from_root(def_module, sema.db);
+                        let dependency_path = def_name
+                            .as_ref()
+                            .map(|name| {
+                                format_crate_item_path(sema.db, edition, &module_path, name)
+                            })
+                            .unwrap_or_else(|| {
+                                format_crate_module_path(sema.db, edition, &module_path)
+                            });
+                        bail!(
+                            "Cannot move item; `{dependency_path}` is not visible from destination module"
+                        );
+                    }
                 }
 
                 if path_text.to_string().starts_with("crate::") {
@@ -878,19 +924,26 @@ fn plan_internal_reference_updates(
                 let in_use_tree = path_in_use_tree(&path);
                 let qualifier = path.qualifier();
                 if qualifier.is_none() && !in_use_tree {
-                    let Some(def_name) = definition.name(sema.db) else { continue; };
+                    let Some(def_name) = def_name.as_ref() else {
+                        continue;
+                    };
                     let module_path = module_path_from_root(def_module, sema.db);
-                    let import_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
+                    let import_path =
+                        format_crate_item_path(sema.db, edition, &module_path, &def_name);
                     if import_paths.insert(import_path.clone()) {
                         plan.required_imports.push(RequiredImportPlan { path: import_path });
                     }
                     continue;
                 }
 
-                let Some(def_name) = definition.name(sema.db) else { continue; };
+                let Some(def_name) = def_name.as_ref() else {
+                    continue;
+                };
                 let module_path = module_path_from_root(def_module, sema.db);
-                let absolute_path = format_crate_item_path(sema.db, edition, &module_path, &def_name);
-                if let Some((range, replacement)) = compute_path_replacement(&path, &absolute_path) {
+                let absolute_path =
+                    format_crate_item_path(sema.db, edition, &module_path, &def_name);
+                if let Some((range, replacement)) = compute_path_replacement(&path, &absolute_path)
+                {
                     if !plan.path_rewrites.iter().any(|rewrite| {
                         rewrite.file_id == moved_item.editioned_file_id && rewrite.range == range
                     }) {
@@ -908,6 +961,255 @@ fn plan_internal_reference_updates(
     })
 }
 
+fn compute_required_visibility(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    relocation_plan: &ItemRelocationPlan,
+    dest_module_path: &[Name],
+) -> RenameResult<VisibilityLevel> {
+    let Some(dest_crate) = def.krate(sema.db) else {
+        return Ok(VisibilityLevel::Private);
+    };
+
+    attach_db(sema.db, || {
+        let usages = def.usages(sema).all();
+        if usages.is_empty() {
+            return Ok(VisibilityLevel::Private);
+        }
+
+        let mut moved_ranges: BTreeMap<ide_db::EditionedFileId, Vec<TextRange>> = BTreeMap::new();
+        for item in &relocation_plan.moved_items {
+            moved_ranges.entry(item.editioned_file_id).or_default().push(item.range);
+        }
+
+        let mut required = VisibilityLevel::Private;
+        for (file_id, references) in usages.iter() {
+            let ranges = moved_ranges.get(&file_id);
+            for reference in references {
+                if ranges
+                    .is_some_and(|rs| rs.iter().any(|range| range.contains_range(reference.range)))
+                {
+                    continue;
+                }
+
+                let Some(module) = reference_module(sema, reference) else {
+                    continue;
+                };
+                if module.krate() != dest_crate {
+                    return Ok(VisibilityLevel::Pub);
+                }
+                let module_path = module_path_from_root(module, sema.db);
+                if module_path != dest_module_path {
+                    required = required.max(VisibilityLevel::PubCrate);
+                }
+                if required == VisibilityLevel::Pub {
+                    return Ok(required);
+                }
+            }
+        }
+
+        Ok(required)
+    })
+}
+
+fn plan_visibility_updates(
+    sema: &Semantics<'_, RootDatabase>,
+    def: &Definition,
+    move_op: &MoveOperation,
+    relocation_plan: &ItemRelocationPlan,
+) -> RenameResult<Vec<Vec<(TextRange, String)>>> {
+    let mut per_item_edits = vec![Vec::new(); relocation_plan.moved_items.len()];
+    let required_level =
+        compute_required_visibility(sema, def, relocation_plan, &move_op.dest_module_path)?;
+
+    if relocation_plan.moved_items.is_empty() {
+        return Ok(per_item_edits);
+    }
+
+    let def_range = def
+        .range_for_rename(sema)
+        .ok_or_else(|| format_err!("Cannot locate definition for move operation"))?;
+
+    attach_db(sema.db, || {
+        let (primary_idx, primary_item) = relocation_plan
+            .moved_items
+            .iter()
+            .enumerate()
+            .find(|(_, item)| {
+                item.editioned_file_id == def_range.file_id
+                    && item.range.contains_range(def_range.range)
+            })
+            .ok_or_else(|| format_err!("Primary definition not found among moved items"))?;
+
+        let current_level = visibility_level_for_definition(def, sema.db);
+        let target_level = current_level.max(required_level);
+
+        let primary_syntax = primary_item.syntax.clone();
+        if let Some(strukt) = ast::Struct::cast(primary_syntax.clone()) {
+            if let Some(edit) = plan_visibility_change_for_owner(
+                &strukt,
+                primary_item,
+                current_level,
+                target_level,
+            )? {
+                per_item_edits[primary_idx].push(edit);
+            }
+            let field_edits =
+                plan_struct_field_visibility_edits(sema, &strukt, primary_item, target_level)?;
+            per_item_edits[primary_idx].extend(field_edits);
+        } else if let Some(enm) = ast::Enum::cast(primary_syntax.clone()) {
+            if let Some(edit) =
+                plan_visibility_change_for_owner(&enm, primary_item, current_level, target_level)?
+            {
+                per_item_edits[primary_idx].push(edit);
+            }
+        } else if let Some(union) = ast::Union::cast(primary_syntax.clone()) {
+            if let Some(edit) =
+                plan_visibility_change_for_owner(&union, primary_item, current_level, target_level)?
+            {
+                per_item_edits[primary_idx].push(edit);
+            }
+        } else if let Some(function) = ast::Fn::cast(primary_syntax.clone()) {
+            if let Some(edit) = plan_visibility_change_for_owner(
+                &function,
+                primary_item,
+                current_level,
+                target_level,
+            )? {
+                per_item_edits[primary_idx].push(edit);
+            }
+        } else if let Some(const_item) = ast::Const::cast(primary_syntax.clone()) {
+            if let Some(edit) = plan_visibility_change_for_owner(
+                &const_item,
+                primary_item,
+                current_level,
+                target_level,
+            )? {
+                per_item_edits[primary_idx].push(edit);
+            }
+        } else if let Some(static_item) = ast::Static::cast(primary_syntax.clone()) {
+            if let Some(edit) = plan_visibility_change_for_owner(
+                &static_item,
+                primary_item,
+                current_level,
+                target_level,
+            )? {
+                per_item_edits[primary_idx].push(edit);
+            }
+        } else if let Some(type_alias) = ast::TypeAlias::cast(primary_syntax.clone()) {
+            if let Some(edit) = plan_visibility_change_for_owner(
+                &type_alias,
+                primary_item,
+                current_level,
+                target_level,
+            )? {
+                per_item_edits[primary_idx].push(edit);
+            }
+        } else if let Some(trait_item) = ast::Trait::cast(primary_syntax.clone()) {
+            if let Some(edit) = plan_visibility_change_for_owner(
+                &trait_item,
+                primary_item,
+                current_level,
+                target_level,
+            )? {
+                per_item_edits[primary_idx].push(edit);
+            }
+        }
+
+        for (idx, item) in relocation_plan.moved_items.iter().enumerate() {
+            if idx == primary_idx {
+                continue;
+            }
+            if let Some(impl_block) = ast::Impl::cast(item.syntax.clone()) {
+                plan_impl_visibility_edits(
+                    sema,
+                    &impl_block,
+                    item,
+                    target_level,
+                    &mut per_item_edits[idx],
+                )?;
+            }
+        }
+
+        Ok(())
+    })?;
+
+    Ok(per_item_edits)
+}
+
+fn plan_struct_field_visibility_edits(
+    sema: &Semantics<'_, RootDatabase>,
+    strukt: &ast::Struct,
+    item: &PlannedItem,
+    target_level: VisibilityLevel,
+) -> RenameResult<Vec<(TextRange, String)>> {
+    let mut edits = Vec::new();
+    let Some(field_list) = strukt.field_list() else {
+        return Ok(edits);
+    };
+
+    match field_list {
+        ast::FieldList::RecordFieldList(record_list) => {
+            for field in record_list.fields() {
+                let Some(field_def) = sema.to_def(&field) else {
+                    continue;
+                };
+                let definition = Definition::Field(field_def);
+                let current_level = visibility_level_for_definition(&definition, sema.db);
+                if let Some(edit) =
+                    plan_visibility_change_for_owner(&field, item, current_level, target_level)?
+                {
+                    edits.push(edit);
+                }
+            }
+        }
+        ast::FieldList::TupleFieldList(tuple_list) => {
+            for field in tuple_list.fields() {
+                let Some(field_def) = sema.to_def(&field) else {
+                    continue;
+                };
+                let definition = Definition::Field(field_def);
+                let current_level = visibility_level_for_definition(&definition, sema.db);
+                if let Some(edit) =
+                    plan_visibility_change_for_owner(&field, item, current_level, target_level)?
+                {
+                    edits.push(edit);
+                }
+            }
+        }
+    }
+
+    Ok(edits)
+}
+
+fn plan_impl_visibility_edits(
+    sema: &Semantics<'_, RootDatabase>,
+    impl_block: &ast::Impl,
+    item: &PlannedItem,
+    target_level: VisibilityLevel,
+    edits: &mut Vec<(TextRange, String)>,
+) -> RenameResult<()> {
+    let Some(items) = impl_block.assoc_item_list() else {
+        return Ok(());
+    };
+    for assoc_item in items.assoc_items() {
+        let ast::AssocItem::Fn(func) = assoc_item else {
+            continue;
+        };
+        let Some(function_def) = sema.to_def(&func) else {
+            continue;
+        };
+        let definition = Definition::Function(function_def);
+        let current_level = visibility_level_for_definition(&definition, sema.db);
+        if let Some(edit) =
+            plan_visibility_change_for_owner(&func, item, current_level, target_level)?
+        {
+            edits.push(edit);
+        }
+    }
+    Ok(())
+}
+
 fn orchestrate_move(
     sema: &Semantics<'_, RootDatabase>,
     def: &Definition,
@@ -917,7 +1219,8 @@ fn orchestrate_move(
     let mut module_plan = plan_module_file_system_ops(sema, def, move_op)?;
     let mut relocation_plan = plan_item_relocation(sema, def, move_op, &module_plan)?;
     let external_plan = plan_external_reference_updates(sema, def, move_op, &relocation_plan)?;
-    let internal_plan = plan_internal_reference_updates(sema, def, &relocation_plan)?;
+    let internal_plan = plan_internal_reference_updates(sema, def, move_op, &relocation_plan)?;
+    let visibility_plan = plan_visibility_updates(sema, def, move_op, &relocation_plan)?;
 
     let mut reference_change =
         def.rename(sema, resolved_name.as_str(), RenameDefinition::ReferencesOnly)?;
@@ -931,17 +1234,16 @@ fn orchestrate_move(
     for (target, additional) in per_item_edits.iter_mut().zip(internal_rewrites) {
         target.extend(additional);
     }
+    for (target, additional) in per_item_edits.iter_mut().zip(visibility_plan) {
+        target.extend(additional);
+    }
     apply_edits_to_moved_items(&mut relocation_plan.moved_items, per_item_edits)?;
 
     let def_index = apply_definition_rename(sema, def, resolved_name, &mut relocation_plan)?;
     let insertion_order = build_insertion_order(relocation_plan.moved_items.len(), def_index);
 
-    let move_change = build_move_change(
-        &mut module_plan,
-        &relocation_plan,
-        &external_plan,
-        &insertion_order,
-    )?;
+    let move_change =
+        build_move_change(&mut module_plan, &relocation_plan, &external_plan, &insertion_order)?;
 
     Ok(move_change.merge(reference_change))
 }
@@ -972,17 +1274,15 @@ fn extract_reference_edits_for_moved_items(
     for (file_id, (text_edit, snippet)) in original_edits {
         let mut builder = TextEditBuilder::default();
         for indel in text_edit.into_iter() {
-            if external_ranges
-                .get(&file_id)
-                .is_some_and(|ranges| ranges.iter().any(|range| ranges_overlap(indel.delete, *range)))
-            {
+            if external_ranges.get(&file_id).is_some_and(|ranges| {
+                ranges.iter().any(|range| ranges_overlap(indel.delete, *range))
+            }) {
                 continue;
             }
 
-            if let Some((item_idx, item_range)) = moved_ranges
-                .get(&file_id)
-                .and_then(|ranges| ranges.iter().find(|(_, range)| range.contains_range(indel.delete)))
-            {
+            if let Some((item_idx, item_range)) = moved_ranges.get(&file_id).and_then(|ranges| {
+                ranges.iter().find(|(_, range)| range.contains_range(indel.delete))
+            }) {
                 let relative = to_relative_range(*item_range, indel.delete)?;
                 per_item_edits[*item_idx].push((relative, indel.insert.clone()));
                 continue;
@@ -1006,12 +1306,9 @@ fn collect_internal_rewrites(
 ) -> RenameResult<Vec<Vec<(TextRange, String)>>> {
     let mut per_item_edits = vec![Vec::new(); relocation_plan.moved_items.len()];
     for rewrite in &internal_plan.path_rewrites {
-        let Some((idx, item)) = relocation_plan
-            .moved_items
-            .iter()
-            .enumerate()
-            .find(|(_, item)| item.editioned_file_id == rewrite.file_id && item.range.contains_range(rewrite.range))
-        else {
+        let Some((idx, item)) = relocation_plan.moved_items.iter().enumerate().find(|(_, item)| {
+            item.editioned_file_id == rewrite.file_id && item.range.contains_range(rewrite.range)
+        }) else {
             continue;
         };
         let relative = to_relative_range(item.range, rewrite.range)?;
@@ -1048,12 +1345,9 @@ fn apply_definition_rename(
     let edition = def_range.file_id.edition(sema.db);
     let replacement = resolved_name.display(sema.db, edition).to_string();
 
-    let Some((idx, item)) = relocation_plan
-        .moved_items
-        .iter_mut()
-        .enumerate()
-        .find(|(_, item)| item.editioned_file_id == def_range.file_id && item.range.contains_range(def_range.range))
-    else {
+    let Some((idx, item)) = relocation_plan.moved_items.iter_mut().enumerate().find(|(_, item)| {
+        item.editioned_file_id == def_range.file_id && item.range.contains_range(def_range.range)
+    }) else {
         bail!("Primary definition not found among moved items");
     };
 
@@ -1094,7 +1388,10 @@ fn build_move_change(
     match &relocation_plan.destination {
         RelocationDestination::ExistingFile { file_id, insert_offset } => {
             if !inserted_text.is_empty() {
-                change.insert_source_edit(*file_id, TextEdit::insert(*insert_offset, inserted_text.clone()));
+                change.insert_source_edit(
+                    *file_id,
+                    TextEdit::insert(*insert_offset, inserted_text.clone()),
+                );
             }
         }
         RelocationDestination::InlineModule { file_id, insert_offset, indent } => {
@@ -1109,7 +1406,9 @@ fn build_move_change(
                 .iter_mut()
                 .find(|creation| creation.relative_path == *relative_path)
             {
-                if !creation.initial_contents.is_empty() && !creation.initial_contents.ends_with('\n') {
+                if !creation.initial_contents.is_empty()
+                    && !creation.initial_contents.ends_with('\n')
+                {
                     creation.initial_contents.push('\n');
                 }
                 creation.initial_contents.push_str(&inserted_text);
@@ -1206,11 +1505,22 @@ fn definition_is_within_moved_items(
         .unwrap_or(false)
 }
 
-fn module_within_source_tree(
-    mut module: Module,
-    source: Module,
-    db: &RootDatabase,
-) -> bool {
+fn visibility_level_for_definition(definition: &Definition, db: &RootDatabase) -> VisibilityLevel {
+    let visibility = definition.visibility(db);
+    match visibility {
+        Some(Visibility::Public) => VisibilityLevel::Pub,
+        Some(Visibility::PubCrate(_)) => VisibilityLevel::PubCrate,
+        Some(Visibility::Module(module_id, _)) => {
+            let module = module_id.into();
+            let is_same_module =
+                definition.module(db).is_some_and(|def_module| def_module == module);
+            if is_same_module { VisibilityLevel::Private } else { VisibilityLevel::PubCrate }
+        }
+        None => VisibilityLevel::Private,
+    }
+}
+
+fn module_within_source_tree(mut module: Module, source: Module, db: &RootDatabase) -> bool {
     loop {
         if module == source {
             return true;
@@ -1220,6 +1530,101 @@ fn module_within_source_tree(
             None => return false,
         }
     }
+}
+
+fn visibility_allows_access(
+    db: &RootDatabase,
+    visibility: Visibility,
+    dest_module_path: &[Name],
+    dest_crate: Crate,
+) -> bool {
+    match visibility {
+        Visibility::Public => true,
+        Visibility::PubCrate(krate) => Crate::from(krate) == dest_crate,
+        Visibility::Module(module_id, _) => {
+            let allowed_module: Module = module_id.into();
+            let allowed_crate = allowed_module.krate();
+            if allowed_crate != dest_crate {
+                return false;
+            }
+            let allowed_path = module_path_from_root(allowed_module, db);
+            module_path_is_prefix(dest_module_path, &allowed_path)
+        }
+    }
+}
+
+fn module_path_is_prefix(path: &[Name], prefix: &[Name]) -> bool {
+    if prefix.len() > path.len() {
+        return false;
+    }
+    prefix.iter().zip(path).all(|(a, b)| a == b)
+}
+
+fn visibility_insertion_offset(node: &SyntaxNode) -> TextSize {
+    node.children_with_tokens()
+        .find(|element| {
+            !matches!(
+                element.kind(),
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::ATTR
+            )
+        })
+        .map(|el| el.text_range().start())
+        .unwrap_or_else(|| node.text_range().start())
+}
+
+fn plan_visibility_change_for_owner<N>(
+    owner: &N,
+    item: &PlannedItem,
+    current_level: VisibilityLevel,
+    target_level: VisibilityLevel,
+) -> RenameResult<Option<(TextRange, String)>>
+where
+    N: ast::AstNode + ast::HasVisibility,
+{
+    if target_level < current_level {
+        return Ok(None);
+    }
+
+    if let Some(existing) = owner.visibility() {
+        if target_level == current_level {
+            if let Some(keyword) = target_level.canonical_repr() {
+                if existing.syntax().text() == keyword {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        let Some(replacement_base) = target_level.replacement_text() else {
+            return Ok(None);
+        };
+        let replacement = replacement_base.to_string();
+        let range = existing.syntax().text_range();
+        let relative = to_relative_range(item.range, range)?;
+        return Ok(Some((relative, replacement)));
+    }
+
+    let Some(replacement_base) = target_level.insertion_text() else {
+        return Ok(None);
+    };
+    let replacement = replacement_base.to_string();
+    let insert_at = visibility_insertion_offset(owner.syntax());
+    let relative = to_relative_range(item.range, TextRange::new(insert_at, insert_at))?;
+    Ok(Some((relative, replacement)))
+}
+
+fn reference_module(
+    sema: &Semantics<'_, RootDatabase>,
+    reference: &FileReference,
+) -> Option<Module> {
+    let syntax_node = match &reference.name {
+        FileReferenceNode::Name(name) => name.syntax().clone(),
+        FileReferenceNode::NameRef(name_ref) => name_ref.syntax().clone(),
+        FileReferenceNode::Lifetime(lifetime) => lifetime.syntax().clone(),
+        FileReferenceNode::FormatStringEntry(_, _) => return None,
+    };
+    let scope = sema.scope(&syntax_node)?;
+    Some(scope.module().nearest_non_block_module(sema.db))
 }
 
 fn path_in_use_tree(path: &ast::Path) -> bool {
@@ -1303,7 +1708,12 @@ fn plan_module_declaration_for_existing_parent(
             bail!("Inline module missing syntax body");
         };
         let vfs_file_id = file_id.original_file(db).file_id(db);
-        let plan = plan_mod_decl_in_inline_module(&module_ast, vfs_file_id, visibility_prefix, child_name.as_str())?;
+        let plan = plan_mod_decl_in_inline_module(
+            &module_ast,
+            vfs_file_id,
+            visibility_prefix,
+            child_name.as_str(),
+        )?;
         Ok(Some(plan))
     } else {
         let def_hir_file = parent_module.definition_source_file_id(db);
@@ -1350,10 +1760,7 @@ fn module_declaration_exists_in_source_file(
         .any(|module| module_name_matches(&module, child_name.as_str()))
 }
 
-fn module_declaration_exists_in_inline_module(
-    module_ast: &ast::Module,
-    child_name: &Name,
-) -> bool {
+fn module_declaration_exists_in_inline_module(module_ast: &ast::Module, child_name: &Name) -> bool {
     module_ast
         .item_list()
         .into_iter()
@@ -1370,10 +1777,7 @@ fn module_name_matches(module: &ast::Module, target: &str) -> bool {
 }
 
 #[allow(dead_code)]
-fn plan_import_reference(
-    reference: &FileReference,
-    new_path: &str,
-) -> Option<(TextRange, String)> {
+fn plan_import_reference(reference: &FileReference, new_path: &str) -> Option<(TextRange, String)> {
     let name_ref = reference.name.as_name_ref()?;
     let use_tree = name_ref.syntax().ancestors().find_map(ast::UseTree::cast)?;
 
@@ -1429,6 +1833,14 @@ fn format_crate_item_path(
     result
 }
 
+fn format_crate_module_path(db: &RootDatabase, edition: Edition, module_path: &[Name]) -> String {
+    let mut result = String::from("crate");
+    for segment in module_path {
+        format_to!(result, "::{}", segment.display(db, edition));
+    }
+    result
+}
+
 fn plan_mod_decl_in_source_file(
     db: &RootDatabase,
     file_id: FileId,
@@ -1459,9 +1871,8 @@ fn plan_mod_decl_in_inline_module(
     visibility_prefix: &str,
     child_name: &str,
 ) -> RenameResult<ModuleDeclarationPlan> {
-    let item_list = module_ast
-        .item_list()
-        .ok_or_else(|| format_err!("Inline module missing item list"))?;
+    let item_list =
+        module_ast.item_list().ok_or_else(|| format_err!("Inline module missing item list"))?;
     let insert_offset = item_list
         .r_curly_token()
         .map(|tok| tok.text_range().start())
@@ -2072,14 +2483,15 @@ mod tests {
     use crate::fixture;
 
     use hir::{Name, Semantics};
-    use syntax::AstNode;
     use span::Edition;
+    use syntax::AstNode;
 
     use super::{
-        detect_move_operation, find_definitions, plan_external_reference_updates, plan_internal_reference_updates,
-        plan_item_relocation, plan_module_file_system_ops, ExternalReferenceUpdatePlan, IdentifierKind,
-        InternalPathRewrite, InternalReferenceUpdatePlan, ItemRelocationPlan, ModuleFileSystemPlan, ParsedRenameTarget,
-        RangeInfo, RelocationDestination, RenameDefinition, RenameError,
+        ExternalReferenceUpdatePlan, FileSystemEdit, IdentifierKind, InternalPathRewrite,
+        InternalReferenceUpdatePlan, ItemRelocationPlan, ModuleFileSystemPlan, ParsedRenameTarget,
+        RangeInfo, RelocationDestination, RenameDefinition, RenameError, detect_move_operation,
+        find_definitions, plan_external_reference_updates, plan_internal_reference_updates,
+        plan_item_relocation, plan_module_file_system_ops,
     };
 
     #[track_caller]
@@ -2202,16 +2614,13 @@ mod tests {
 
     #[test]
     fn parse_move_target_from_crate_path() {
-        let parsed = ParsedRenameTarget::parse(
-            Edition::Edition2021,
-            "crate::mod_one::finish::Final",
-        )
-        .unwrap();
+        let parsed =
+            ParsedRenameTarget::parse(Edition::Edition2021, "crate::mod_one::finish::Final")
+                .unwrap();
 
         assert_eq!(parsed.final_name_text(), "Final");
         let target = parsed.move_target().expect("expected move target");
-        let segments: Vec<_> =
-            target.module_path().iter().map(|name| name.as_str()).collect();
+        let segments: Vec<_> = target.module_path().iter().map(|name| name.as_str()).collect();
         assert_eq!(segments, ["mod_one", "finish"]);
 
         let source_path = vec![Name::new_root("mod_one")];
@@ -2231,8 +2640,7 @@ mod tests {
 
     #[test]
     fn parse_move_target_requires_crate_prefix() {
-        let err =
-            ParsedRenameTarget::parse(Edition::Edition2021, "alpha::beta::Item").unwrap_err();
+        let err = ParsedRenameTarget::parse(Edition::Edition2021, "alpha::beta::Item").unwrap_err();
         assert_eq!(err.to_string(), "Rename-to-move paths must start with `crate::`");
     }
 
@@ -2253,9 +2661,8 @@ mod tests {
         let edition = file_id.edition(db);
         let parsed_target = ParsedRenameTarget::parse(edition, new_name)
             .expect("expected move target parsing to succeed");
-        let move_target = parsed_target
-            .move_target()
-            .expect("compute_move_plan requires a move target");
+        let move_target =
+            parsed_target.move_target().expect("compute_move_plan requires a move target");
         let (final_name, _) =
             IdentifierKind::classify(edition, parsed_target.final_name_text()).unwrap();
 
@@ -2275,11 +2682,11 @@ mod tests {
                 detect_move_operation(&sema, &def, &resolved_name, move_target)
                     .expect("move detection failed")
             {
-                let module_plan =
-                    plan_module_file_system_ops(&sema, &def, &move_operation)
-                        .expect("module filesystem planning failed");
-                let relocation_plan = plan_item_relocation(&sema, &def, &move_operation, &module_plan)
-                    .expect("item relocation planning failed");
+                let module_plan = plan_module_file_system_ops(&sema, &def, &move_operation)
+                    .expect("module filesystem planning failed");
+                let relocation_plan =
+                    plan_item_relocation(&sema, &def, &move_operation, &module_plan)
+                        .expect("item relocation planning failed");
                 return (module_plan, relocation_plan);
             }
         }
@@ -2303,9 +2710,8 @@ mod tests {
         let edition = file_id.edition(db);
         let parsed_target = ParsedRenameTarget::parse(edition, new_name)
             .expect("expected move target parsing to succeed");
-        let move_target = parsed_target
-            .move_target()
-            .expect("external reference plan requires a move target");
+        let move_target =
+            parsed_target.move_target().expect("external reference plan requires a move target");
         let (final_name, _) =
             IdentifierKind::classify(edition, parsed_target.final_name_text()).unwrap();
 
@@ -2325,18 +2731,14 @@ mod tests {
                 detect_move_operation(&sema, &def, &resolved_name, move_target)
                     .expect("move detection failed")
             {
-                let module_plan =
-                    plan_module_file_system_ops(&sema, &def, &move_operation)
-                        .expect("module filesystem planning failed");
-                let relocation_plan = plan_item_relocation(&sema, &def, &move_operation, &module_plan)
-                    .expect("item relocation planning failed");
-                let external_plan = plan_external_reference_updates(
-                    &sema,
-                    &def,
-                    &move_operation,
-                    &relocation_plan,
-                )
-                .expect("external reference planning failed");
+                let module_plan = plan_module_file_system_ops(&sema, &def, &move_operation)
+                    .expect("module filesystem planning failed");
+                let relocation_plan =
+                    plan_item_relocation(&sema, &def, &move_operation, &module_plan)
+                        .expect("item relocation planning failed");
+                let external_plan =
+                    plan_external_reference_updates(&sema, &def, &move_operation, &relocation_plan)
+                        .expect("external reference planning failed");
                 return (analysis, external_plan);
             }
         }
@@ -2360,9 +2762,8 @@ mod tests {
         let edition = file_id.edition(db);
         let parsed_target = ParsedRenameTarget::parse(edition, new_name)
             .expect("expected move target parsing to succeed");
-        let move_target = parsed_target
-            .move_target()
-            .expect("internal reference plan requires a move target");
+        let move_target =
+            parsed_target.move_target().expect("internal reference plan requires a move target");
         let (final_name, _) =
             IdentifierKind::classify(edition, parsed_target.final_name_text()).unwrap();
 
@@ -2382,13 +2783,13 @@ mod tests {
                 detect_move_operation(&sema, &def, &resolved_name, move_target)
                     .expect("move detection failed")
             {
-                let module_plan =
-                    plan_module_file_system_ops(&sema, &def, &move_operation)
-                        .expect("module filesystem planning failed");
-                let relocation_plan = plan_item_relocation(&sema, &def, &move_operation, &module_plan)
-                    .expect("item relocation planning failed");
+                let module_plan = plan_module_file_system_ops(&sema, &def, &move_operation)
+                    .expect("module filesystem planning failed");
+                let relocation_plan =
+                    plan_item_relocation(&sema, &def, &move_operation, &module_plan)
+                        .expect("item relocation planning failed");
                 let internal_plan =
-                    plan_internal_reference_updates(&sema, &def, &relocation_plan)
+                    plan_internal_reference_updates(&sema, &def, &move_operation, &relocation_plan)
                         .expect("internal reference planning failed");
                 return (analysis, relocation_plan, internal_plan);
             }
@@ -2412,10 +2813,7 @@ pub struct Existing;
 
         assert_eq!(plan.file_paths(), ["mod_two.rs", "mod_two/finish.rs"]);
         assert_eq!(plan.destination_path(), "mod_two/finish.rs");
-        assert_eq!(
-            plan.file_initial_contents(),
-            ["pub mod finish;\n", ""]
-        );
+        assert_eq!(plan.file_initial_contents(), ["pub mod finish;\n", ""]);
         let decls: Vec<_> = plan
             .module_declaration_texts()
             .into_iter()
@@ -2509,11 +2907,8 @@ struct Existing;
         );
 
         assert_eq!(relocation.moved_items.len(), 2);
-        let texts: Vec<_> = relocation
-            .moved_items
-            .iter()
-            .map(|item| item.text.trim().to_owned())
-            .collect();
+        let texts: Vec<_> =
+            relocation.moved_items.iter().map(|item| item.text.trim().to_owned()).collect();
         assert!(texts[0].starts_with("struct ToMove"));
         assert!(texts[1].starts_with("impl ToMove"));
         match relocation.destination {
@@ -2575,7 +2970,7 @@ use crate::beta::Final;
 fn f() {
     let _ = crate::beta::Final::default();
 }
-"#
+"#,
         );
         assert_eq_text!(expected.as_str(), text.as_str());
     }
@@ -2618,7 +3013,7 @@ pub mod nested {
         let _ = crate::beta::Final;
     }
 }
-"#
+"#,
         );
         assert_eq_text!(expected.as_str(), text.as_str());
     }
@@ -2657,7 +3052,7 @@ use crate::beta::Final as OldAlias;
 pub fn make() -> OldAlias {
     OldAlias {}
 }
-"#
+"#,
         );
         assert_eq_text!(expected.as_str(), text.as_str());
     }
@@ -3365,6 +3760,125 @@ fn make() -> ToMove {
                     },
                 ]
             "#]],
+        );
+    }
+
+    #[test]
+    fn rename_move_rejects_private_dependency() {
+        check(
+            "crate::dest::compute",
+            r#"
+mod source {
+    fn helper() -> i32 {
+        42
+    }
+
+    pub fn compute$0() -> i32 {
+        helper()
+    }
+}
+
+mod other {
+    use crate::source::compute;
+
+    pub fn consume() -> i32 {
+        compute()
+    }
+}
+"#,
+            r#"error: Cannot move item; `crate::source::helper` is not visible from destination module"#,
+        );
+    }
+
+    #[test]
+    fn rename_move_upgrades_visibility_pub_crate() {
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+mod source {
+    pub(super) struct ToMove$0;
+
+    impl ToMove {
+        pub(super) fn build() -> Self {
+            ToMove
+        }
+    }
+}
+
+mod other {
+    use crate::source::ToMove;
+
+    pub fn make() -> ToMove {
+        ToMove::build()
+    }
+}
+"#,
+        );
+
+        let source_change = analysis
+            .rename(position, "crate::dest::Moved")
+            .unwrap()
+            .expect("rename should succeed");
+
+        let created =
+            source_change
+                .file_system_edits
+                .iter()
+                .find_map(|edit| match edit {
+                    FileSystemEdit::CreateFile { dst, initial_contents } => {
+                        if dst.path == "dest.rs" { Some(initial_contents.as_str()) } else { None }
+                    }
+                    _ => None,
+                })
+                .expect("expected new module file to be created");
+
+        assert!(
+            created.contains("pub(crate) struct Moved"),
+            "created file should upgrade struct visibility:\n{created}"
+        );
+    }
+
+    #[test]
+    fn rename_move_function_upgrades_visibility() {
+        let (analysis, position) = fixture::position(
+            r#"
+//- /lib.rs
+mod source {
+    pub(super) fn compute$0() -> i32 {
+        0
+    }
+}
+
+mod other {
+    use crate::source::compute;
+
+    pub fn use_it() -> i32 {
+        compute()
+    }
+}
+"#,
+        );
+
+        let source_change = analysis
+            .rename(position, "crate::dest::compute")
+            .unwrap()
+            .expect("rename should succeed");
+
+        let created =
+            source_change
+                .file_system_edits
+                .iter()
+                .find_map(|edit| match edit {
+                    FileSystemEdit::CreateFile { dst, initial_contents } => {
+                        if dst.path == "dest.rs" { Some(initial_contents.as_str()) } else { None }
+                    }
+                    _ => None,
+                })
+                .expect("expected new module file to be created");
+
+        assert!(
+            created.contains("pub(crate) fn compute"),
+            "created file should upgrade function visibility:\n{created}"
         );
     }
 
