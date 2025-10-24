@@ -4,19 +4,21 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, InFile, Name, Semantics, sym};
+use hir::{AsAssocItem, InFile, ModPath, Name, Semantics, sym};
 use ide_db::{
     FileId, FileRange, RootDatabase,
     defs::{Definition, NameClass, NameRefClass},
     rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
     source_change::SourceChangeBuilder,
+    syntax_helpers::LexedStr,
 };
 use itertools::Itertools;
+use span::SyntaxContext;
 use std::fmt::Write;
 use stdx::{always, format_to, never};
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
-    ast::{self, HasArgList, prec::ExprPrecedence},
+    ast::{self, HasArgList, make::path_from_text_with_edition, prec::ExprPrecedence},
 };
 
 use ide_db::text_edit::TextEdit;
@@ -25,9 +27,21 @@ use crate::{FilePosition, RangeInfo, SourceChange};
 
 pub use ide_db::rename::RenameError;
 
-type RenameResult<T> = Result<T, RenameError>;
+pub(crate) type RenameResult<T> = Result<T, RenameError>;
 
-/// This is similar to `collect::<Result<Vec<_>, _>>`, but unlike it, it succeeds if there is *any* `Ok` item.
+/// Collects successful results from an iterator of `Result`s, succeeding if at least one `Ok` is found.
+///
+/// Unlike the standard `collect::<Result<Vec<_>, _>>()` which fails if any item is `Err`,
+/// this function succeeds as long as there is at least one `Ok` value in the iterator.
+///
+/// # Behavior
+/// - Collects all `Ok` values into a `Vec`
+/// - If any `Ok` values were found, returns `Ok(Vec<T>)` with those values
+/// - If no `Ok` values were found but an `Err` was encountered, returns that `Err`
+/// - If the iterator is empty, returns `Ok(Vec::new())`
+///
+/// This is useful for rename operations where multiple definitions might exist,
+/// and we want to succeed if we can rename at least one of them.
 fn ok_if_any<T, E>(iter: impl Iterator<Item = Result<T, E>>) -> Result<Vec<T>, E> {
     let mut err = None;
     let oks = iter
@@ -109,9 +123,15 @@ pub(crate) fn rename(
     let syntax = source_file.syntax();
 
     let edition = file_id.edition(db);
-    let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
 
+    let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
+    // TODO: Branch here on fully qualified path ident
+    // - Or maybe do we want to branch after find definitions?
+    // - Probably? And we only need to support a limited subset of definitions, like maybe just local
+
+    // TODO: Do we need to modify find_definitions to handle fully qualified paths?
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
+
     let alias_fallback =
         alias_fallback(syntax, position, &new_name.display(db, edition).to_string());
 
@@ -165,6 +185,7 @@ pub(crate) fn rename(
                     return rename_to_self(&sema, local);
                 }
             }
+            // TODO: Pass (name, kind) here
             def.rename(&sema, new_name.as_str(), rename_def)
         })),
     };
@@ -189,7 +210,21 @@ pub(crate) fn will_rename_file(
     Some(change)
 }
 
-// FIXME: Should support `extern crate`.
+/// Creates a rename-as-alias edit when renaming path segments in use trees.
+///
+/// When the cursor is on the last segment of a path in a use tree (e.g., `use foo::Bar`),
+/// this function generates an edit that adds or updates an alias (`as` clause) instead of
+/// renaming the actual definition.
+///
+/// # Examples
+/// - `use foo::Bar` with cursor on `Bar` → `use foo::Bar as NewName`
+/// - `use foo::Bar as Baz` with cursor on `Bar` → `use foo::Bar as NewName`
+///
+/// # Returns
+/// - `Some(SourceChange)` if the position is on the last segment of a path in a use tree
+/// - `None` otherwise
+///
+/// FIXME: Should support `extern crate`.
 fn alias_fallback(
     syntax: &SyntaxNode,
     FilePosition { file_id, offset }: FilePosition,
@@ -221,6 +256,94 @@ fn alias_fallback(
     Some(builder.finish())
 }
 
+/// Finds all definitions at a given position that should be renamed.
+///
+/// This function resolves the syntax element at the cursor position to one or more definitions
+/// that should be renamed together. Multiple definitions can exist for a single rename operation
+/// primarily due to macro expansions, where one source-level identifier expands into multiple
+/// distinct definitions in the compiled code.
+///
+/// # Why Multiple Definitions Can Exist
+///
+/// A single identifier in source code can correspond to multiple definitions when:
+///
+/// 1. **Macro expansions create multiple items from one identifier**:
+///    ```rust
+///    macro_rules! define_items {
+///        ($name:ident) => {
+///            const $name: () = ();    // Definition 1: constant
+///            struct $name {}          // Definition 2: struct
+///        };
+///    }
+///    define_items!(Foo);  // Creates both `const Foo` and `struct Foo`
+///    // Renaming "Foo" must rename BOTH definitions
+///    ```
+///
+/// 2. **Macro hygiene generates names with prefixes/suffixes**:
+///    ```rust
+///    // A macro might internally generate:
+///    // struct Foo_internal { ... }
+///    // When renaming Foo → Bar, this becomes Bar_internal
+///    ```
+///
+/// 3. **Format string captures**:
+///    ```rust
+///    let name = "Alice";
+///    println!("{name}");  // "name" inside the string is a reference to the variable
+///    ```
+///
+/// # Concrete Examples
+///
+/// ## Example 1: Multiple definitions from macro expansion
+/// ```rust
+/// macro_rules! foo {
+///     ($ident:ident) => {
+///         const $ident: () = ();
+///         struct $ident {}
+///     };
+/// }
+///
+/// foo!(Bar);  // ← Renaming "Bar" here...
+/// const _: () = Bar;
+/// const _: Bar = Bar {};
+/// ```
+/// This returns **2 definitions**: the constant `Bar` and the struct `Bar`.
+/// Both must be renamed together to `Baz`.
+///
+/// ## Example 2: Suffix preservation
+/// ```rust
+/// // Suppose a macro generates: Foo_v1, Foo_v2
+/// // When renaming Foo → Bar, the function detects the "_v1" suffix
+/// // and renames to Bar_v1, Bar_v2
+/// ```
+///
+/// ## Example 3: Single definition (common case)
+/// ```rust
+/// struct Point { x: i32 }  // ← Renaming "Point"
+/// let p = Point { x: 0 };
+/// ```
+/// This returns **1 definition**: just the struct `Point`.
+/// The iterator happens to have one element.
+///
+/// # Handling Cases
+/// - Regular identifiers (names and name references)
+/// - Lifetimes
+/// - Format string arguments (e.g., in `format_args!("{foo}")`)
+/// - Macro-generated definitions with name suffixes/prefixes
+///
+/// # Returns
+/// An iterator of tuples containing:
+/// - `FileRange`: The location of the definition
+/// - `SyntaxKind`: The kind of syntax node (e.g., IDENT, LIFETIME_IDENT)
+/// - `Definition`: The semantic definition being renamed
+/// - `Name`: The new name (possibly with suffix/prefix for macro-generated names)
+/// - `RenameDefinition`: Whether this is the primary definition being renamed
+///
+/// # Errors
+/// Returns an error if:
+/// - No identifier is found at the position
+/// - The identifier resolves to an alias (which is currently unsupported)
+/// - No references are found at the position
 fn find_definitions(
     sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
@@ -263,6 +386,15 @@ fn find_definitions(
             let range = sema
                 .original_range_opt(name_like.syntax())
                 .ok_or_else(|| format_err!("No references found at position"))?;
+
+            // NOTE: For move-rename we probably only want to handle NameLike::Name && NameClass::Definition
+            // - That is, we only support move-rename at the definition site
+            // - And only regular definitions
+            // - Also want to be sure we
+            //
+            // Actually, maybe it's fine to also support NameLike::NameRef && NameRefClass::Definition
+            // - NameRefClass::classify finds the original NameLike::Name definition it appears, so we should have all the info we need for the move-rename
+
             let res = match &name_like {
                 // renaming aliases would rename the item being aliased as the HIR doesn't track aliases yet
                 ast::NameLike::Name(name)
@@ -354,6 +486,31 @@ fn find_definitions(
     }
 }
 
+/// Transforms associated function calls into method calls after renaming a parameter to `self`.
+///
+/// When a parameter is renamed to `self`, converting an associated function into a method,
+/// this function updates all call sites to use method call syntax.
+///
+/// # Example transformation
+/// ```rust
+/// // Before: associated function
+/// impl Foo {
+///     fn bar(foo: &Foo) { }  // Renamed parameter to self
+/// }
+/// Foo::bar(&x);
+///
+/// // After: method call
+/// impl Foo {
+///     fn bar(&self) { }
+/// }
+/// x.bar();
+/// ```
+///
+/// The function handles:
+/// - Removing the receiver argument from the argument list
+/// - Converting the receiver to the method receiver (stripping refs/derefs)
+/// - Adding parentheses around the receiver if needed for correct precedence
+/// - Updating the call syntax from `Type::method(receiver, ...)` to `receiver.method(...)`
 fn transform_assoc_fn_into_method_call(
     sema: &Semantics<'_, RootDatabase>,
     source_change: &mut SourceChange,
@@ -433,6 +590,47 @@ fn transform_assoc_fn_into_method_call(
     }
 }
 
+/// Renames a function parameter to `self`, converting an associated function into a method.
+///
+/// This function handles the special case of renaming the first parameter of an associated
+/// function to `self`, which transforms the function into a method. It performs validation
+/// to ensure the transformation is valid and updates both the parameter declaration and
+/// all call sites.
+///
+/// # Validations
+/// The function checks that:
+/// - The local being renamed is not already `self`
+/// - The parent is a function (not a closure or other `DefWithBody`)
+/// - The function doesn't already have a `self` parameter
+/// - The local is the first parameter of the function
+/// - The parameter is not a destructuring pattern
+/// - The function is an associated function (in an impl block)
+/// - The function is not in a trait (only impl blocks are supported)
+/// - The parameter type matches the impl block's self type (or is a reference to it)
+///
+/// # Example transformation
+/// ```rust
+/// // Before
+/// impl Foo {
+///     fn bar(foo: &Foo) { foo.field }
+/// }
+/// Foo::bar(&x);
+///
+/// // After
+/// impl Foo {
+///     fn bar(&self) { self.field }
+/// }
+/// x.bar();
+/// ```
+///
+/// # Returns
+/// A `SourceChange` containing:
+/// - Edits to rename all uses of the parameter to `self`
+/// - Edit to change the parameter declaration to `self`, `&self`, or `&mut self`
+/// - Edits to transform all call sites from associated function to method syntax
+///
+/// # Errors
+/// Returns an error if any validation fails.
 fn rename_to_self(
     sema: &Semantics<'_, RootDatabase>,
     local: hir::Local,
@@ -514,6 +712,41 @@ fn rename_to_self(
     Ok(source_change)
 }
 
+/// Renames a `self` parameter to a regular named parameter, converting a method into an associated function.
+///
+/// This function handles the reverse transformation of `rename_to_self`: it converts a method's
+/// `self` parameter into a regular named parameter.
+///
+/// # Parameters
+/// - `local`: The local variable representing the `self` parameter
+/// - `self_param`: The AST node for the self parameter
+/// - `new_name`: The new name for the parameter
+/// - `identifier_kind`: The kind of identifier (regular, underscore, etc.)
+///
+/// # Example transformation
+/// ```rust
+/// // Before
+/// impl Foo {
+///     fn bar(&self) { self.field }
+/// }
+///
+/// // After (renaming self to foo)
+/// impl Foo {
+///     fn bar(foo: &Self) { foo.field }
+/// }
+/// ```
+///
+/// # Special cases
+/// - If renaming `self` to `self`, returns an empty `SourceChange` (no-op)
+/// - If renaming to `_` and the parameter is used multiple times, returns an error
+///
+/// # Returns
+/// A `SourceChange` containing:
+/// - Edit to change the self parameter to a regular parameter with explicit type
+/// - Edits to rename all uses of `self` to the new name
+///
+/// # Errors
+/// Returns an error if trying to rename to `_` when the parameter is used multiple times.
 fn rename_self_to_param(
     sema: &Semantics<'_, RootDatabase>,
     local: hir::Local,
@@ -557,6 +790,20 @@ fn rename_self_to_param(
     Ok(source_change)
 }
 
+/// Creates a text edit to convert a `self` parameter into a regular named parameter with explicit type.
+///
+/// Takes a self parameter AST node and generates the replacement text for converting it
+/// to a regular parameter with an explicit `Self` type, preserving reference and lifetime information.
+///
+/// # Example transformations
+/// - `self` → `new_name: Self`
+/// - `&self` → `new_name: &Self`
+/// - `&mut self` → `new_name: &mut Self`
+/// - `&'a self` → `new_name: &'a Self`
+/// - `&'a mut self` → `new_name: &'a mut Self`
+///
+/// # Returns
+/// A `TextEdit` that replaces the entire self parameter with the named parameter version.
 fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: String) -> Option<TextEdit> {
     let mut replacement_text = new_name;
     replacement_text.push_str(": ");

@@ -38,3 +38,6 @@ in-rust-tree = []
 
 [lints]
 workspace = true
+
+[profile.dev]
+debug = true

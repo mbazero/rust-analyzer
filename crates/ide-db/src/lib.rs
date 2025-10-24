@@ -16,6 +16,7 @@ pub mod items_locator;
 pub mod label;
 pub mod path_transform;
 pub mod prime_caches;
+pub mod rename_move;
 pub mod ra_fixture;
 pub mod range_mapper;
 pub mod rename;

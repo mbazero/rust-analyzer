@@ -43,6 +43,7 @@ mod move_item;
 mod parent_module;
 mod references;
 mod rename;
+mod rename_move;
 mod runnables;
 mod signature_help;
 mod ssr;
@@ -831,7 +832,13 @@ impl Analysis {
         position: FilePosition,
         new_name: &str,
     ) -> Cancellable<Result<SourceChange, RenameError>> {
-        self.with_db(|db| rename::rename(db, position, new_name))
+        self.with_db(|db| {
+            if new_name.contains("::") {
+                rename_move::rename_move(db, position, new_name)
+            } else {
+                rename::rename(db, position, new_name)
+            }
+        })
     }
 
     pub fn prepare_rename(

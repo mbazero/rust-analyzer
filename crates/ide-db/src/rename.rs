@@ -79,6 +79,7 @@ impl Definition {
     pub fn rename(
         &self,
         sema: &Semantics<'_, RootDatabase>,
+        // TODO: accept (name, kind) so we don't have to recompute
         new_name: &str,
         rename_definition: RenameDefinition,
     ) -> Result<SourceChange> {
@@ -682,10 +683,17 @@ pub enum IdentifierKind {
     Lifetime,
     Underscore,
     LowercaseSelf,
+    // TODO: Add fully qualified path
 }
 
 impl IdentifierKind {
     pub fn classify(edition: Edition, new_name: &str) -> Result<(Name, IdentifierKind)> {
+        // TODO: Support parsing fully qualified path
+        // - Parsing options:
+        //   - LexedStr::new() will parse the string into tokens
+        //   - ModPath::from_src() is probably your best bet
+        // - Branch on LexedStr::single_token().is_none()
+        //   - Result is none for a path
         match parser::LexedStr::single_token(edition, new_name) {
             Some(res) => match res {
                 (SyntaxKind::IDENT, _) => Ok((Name::new_root(new_name), IdentifierKind::Ident)),
@@ -705,7 +713,20 @@ impl IdentifierKind {
                 (_, Some(syntax_error)) => bail!("Invalid name `{}`: {}", new_name, syntax_error),
                 (_, None) => bail!("Invalid name `{}`: not an identifier", new_name),
             },
-            None => bail!("Invalid name `{}`: not an identifier", new_name),
+            None => {
+                // Fully qualfied path will hit this branch
+                bail!("Invalid name `{}`: not an identifier", new_name)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod temp_tests {
+    use span::Edition::Edition2024;
+
+    #[test]
+    fn test_classify() {
+        let output = parser::LexedStr::new(Edition2024, "invalidString");
     }
 }

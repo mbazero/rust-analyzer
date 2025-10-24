@@ -28,6 +28,7 @@ use syntax::{
 
 // FIXME: a more precise name would probably be `Symbol`?
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+// NOTE: Move-rename support for Module, Function, Adt? Do we want more? 
 pub enum Definition {
     Macro(Macro),
     Field(Field),
@@ -35,6 +36,7 @@ pub enum Definition {
     Module(Module),
     Crate(Crate),
     Function(Function),
+    // NOTE: Struct, enums, etc in here
     Adt(Adt),
     Variant(Variant),
     Const(Const),

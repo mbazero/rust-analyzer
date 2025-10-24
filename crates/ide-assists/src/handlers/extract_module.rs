@@ -175,6 +175,46 @@ pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opti
     )
 }
 
+/// Generates the AST for a new module definition from the extracted items.
+///
+/// Creates a module with the given name containing all the extracted items with proper indentation.
+/// If the items were extracted from an impl block, wraps them in a new impl block and adds
+/// a `use super::Type` statement.
+///
+/// # Parameters
+/// - `parent_impl`: If items were extracted from an impl block, this contains the impl
+/// - `module`: The Module containing the name, body items, and use items
+/// - `old_indent`: The original indentation level to maintain proper formatting
+///
+/// # Returns
+/// An `ast::Module` node representing the new module
+///
+/// # Example
+/// ```rust
+/// // Without impl block:
+/// fn foo() {}
+/// fn bar() {}
+///
+/// // Becomes:
+/// mod modname {
+///     pub(crate) fn foo() {}
+///     pub(crate) fn bar() {}
+/// }
+///
+/// // With impl block:
+/// impl Foo {
+///     fn method() {}
+/// }
+///
+/// // Becomes:
+/// mod modname {
+///     use super::Foo;
+///
+///     impl Foo {
+///         fn method() {}
+///     }
+/// }
+/// ```
 fn generate_module_def(
     parent_impl: &Option<ast::Impl>,
     module: Module,
@@ -207,6 +247,22 @@ fn generate_module_def(
     make::mod_(module_name, Some(module_body)).indent(old_indent)
 }
 
+/// Creates a `use super::ItemName;` statement for importing an item from the parent module.
+///
+/// This helper is used when extracting a module to import types/items that remain in the parent module
+/// but need to be accessible in the new child module.
+///
+/// # Parameters
+/// - `node_syntax`: The syntax node of the item to import (e.g., a struct, enum, or type name)
+///
+/// # Returns
+/// An `ast::Item::Use` containing `use super::NodeName;`
+///
+/// # Example
+/// ```rust
+/// // Input: SyntaxNode for "Foo"
+/// // Output: use super::Foo;
+/// ```
 fn make_use_stmt_of_node_with_super(node_syntax: &SyntaxNode) -> ast::Item {
     let super_path = make::ext::ident_path("super");
     let node_path = make::ext::ident_path(&node_syntax.to_string());
@@ -230,6 +286,26 @@ struct Module {
     use_items: Vec<ast::Item>,
 }
 
+/// Extracts a single AST item into a Module structure.
+///
+/// When a single complete item (like a function or struct) is selected for extraction,
+/// this function creates a Module containing that item. Use items are kept separate
+/// from body items.
+///
+/// # Parameters
+/// - `node`: The AST item to extract
+///
+/// # Returns
+/// A `Module` with a default name "modname" containing the item
+///
+/// # Example
+/// ```rust
+/// // Input: fn foo() {} (as ast::Item)
+/// // Output: Module { name: "modname", body_items: [fn foo()], use_items: [] }
+///
+/// // Input: use std::io; (as ast::Item)
+/// // Output: Module { name: "modname", body_items: [], use_items: [use std::io] }
+/// ```
 fn extract_single_target(node: &ast::Item) -> Module {
     let (body_items, use_items) = if matches!(node, ast::Item::Use(_)) {
         (Vec::new(), vec![node.clone()])
@@ -240,6 +316,33 @@ fn extract_single_target(node: &ast::Item) -> Module {
     Module { name, body_items, use_items }
 }
 
+/// Extracts multiple child items from a selection range into a Module structure.
+///
+/// When multiple items are selected (e.g., multiple functions in a row), this function
+/// collects all items within the selection range, separates use statements from other items,
+/// and returns both the Module and the range of nodes that were extracted.
+///
+/// # Parameters
+/// - `node`: The parent syntax node containing the children
+/// - `selection_range`: The text range of the user's selection
+///
+/// # Returns
+/// - `Some((Module, range))` where range is the inclusive range from first to last extracted node
+/// - `None` if no items were found in the selection
+///
+/// # Example
+/// ```rust
+/// // Input selection:
+/// fn foo() {}
+/// fn bar() {}
+/// use std::io;
+///
+/// // Output: Module {
+/// //   name: "modname",
+/// //   body_items: [fn foo(), fn bar()],
+/// //   use_items: [use std::io]
+/// // }, range: foo_node..=io_node
+/// ```
 fn extract_child_target(
     node: &SyntaxNode,
     selection_range: TextRange,
@@ -257,6 +360,32 @@ fn extract_child_target(
 }
 
 impl Module {
+    /// Collects all usages of items in the module and identifies record fields that need visibility changes.
+    ///
+    /// This method processes all body items (structs, functions, constants, etc.) in the module to:
+    /// 1. Find all usages outside the extraction range
+    /// 2. Update those usages to include the new module path (e.g., `foo()` → `modname::foo()`)
+    /// 3. Collect struct/union record fields that need pub(crate) visibility
+    /// 4. Handle use statements that reference items being extracted
+    ///
+    /// # Parameters
+    /// - `ctx`: The assist context for semantic analysis
+    /// - `replace_range`: The text range being extracted (items within this range are excluded from path updates)
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// - `FxHashMap<FileId, Vec<(TextRange, String)>>`: Usages to update, grouped by file (range to replace, new text)
+    /// - `Vec<SyntaxNode>`: Record field syntax nodes that need visibility changes
+    /// - `FxHashMap<TextSize, ast::Use>`: Use statements that reference extracted items (keyed by position to avoid duplicates)
+    ///
+    /// # Example
+    /// ```rust
+    /// // Before extraction:
+    /// fn bar() { foo(); }  // Outside selection
+    /// fn foo() {}          // Inside selection
+    ///
+    /// // Returns usages: { file_id: [(range_of_foo_call, "modname::foo")] }
+    /// ```
     fn get_usages_and_record_fields(
         &self,
         ctx: &AssistContext<'_>,
@@ -346,6 +475,31 @@ impl Module {
         (refs, adt_fields, use_stmts_to_be_inserted)
     }
 
+    /// Finds all usages of a definition and groups them by file, updating paths with module prefix.
+    ///
+    /// For a single definition (like a function or struct), this method:
+    /// 1. Finds all usages across the codebase
+    /// 2. For usages outside the extraction range, prepends the module name (e.g., `foo` → `modname::foo`)
+    /// 3. For use statements inside the selection that reference the item, updates them to include the module path
+    ///
+    /// # Parameters
+    /// - `ctx`: The assist context for semantic analysis
+    /// - `replace_range`: The range being extracted into a module
+    /// - `node_def`: The definition to find usages for
+    /// - `refs_in_files`: Mutable map to accumulate usage replacements, grouped by file
+    /// - `use_stmts_to_be_inserted`: Mutable map to track use statements that need updating
+    ///
+    /// # Example
+    /// ```rust
+    /// // Original code:
+    /// fn main() { foo(); }  // Outside selection
+    /// use foo;              // Inside selection - top-level use
+    /// fn foo() {}           // Inside selection
+    ///
+    /// // After processing:
+    /// // refs_in_files gets: (range_of_foo_call, "modname::foo")
+    /// // use_stmts_to_be_inserted gets updated use stmt: use modname::foo;
+    /// ```
     fn expand_and_group_usages_file_wise(
         &self,
         ctx: &AssistContext<'_>,
@@ -399,6 +553,27 @@ impl Module {
         }
     }
 
+    /// Changes the visibility of all items in the module to `pub(crate)` where appropriate.
+    ///
+    /// When extracting items into a new module, they need to be accessible from the parent module.
+    /// This method adds `pub(crate)` visibility to:
+    /// - All module body items (functions, structs, enums, etc.)
+    /// - Items inside impl blocks (but not trait impl items, which don't allow explicit visibility)
+    /// - Record fields of structs/unions that are accessed from outside the module
+    ///
+    /// # Parameters
+    /// - `record_fields`: Syntax nodes for struct/union fields that need visibility updates
+    ///
+    /// # Example
+    /// ```rust
+    /// // Before:
+    /// fn foo() {}
+    /// struct Bar { field: i32 }
+    ///
+    /// // After:
+    /// pub(crate) fn foo() {}
+    /// pub(crate) struct Bar { pub(crate) field: i32 }
+    /// ```
     fn change_visibility(&mut self, record_fields: Vec<SyntaxNode>) {
         let (mut replacements, record_field_parents, impls) =
             get_replacements_for_visibility_change(&mut self.body_items, false);
@@ -438,6 +613,35 @@ impl Module {
         }
     }
 
+    /// Resolves and fixes import statements when extracting items into a new module.
+    ///
+    /// This complex method handles import resolution by:
+    /// 1. Finding all names/name references in the extracted items
+    /// 2. Determining which definitions they refer to
+    /// 3. Deciding whether imports need to be added, removed, or modified
+    /// 4. Collecting ranges of import statements to remove from the original location
+    ///
+    /// The logic considers whether definitions are:
+    /// - Inside vs outside the selection
+    /// - In the same module vs different module
+    /// - Already imported vs not imported
+    ///
+    /// # Parameters
+    /// - `module`: The current parent module (if extracting from within a module)
+    /// - `ctx`: The assist context for semantic analysis
+    ///
+    /// # Returns
+    /// Vector of text ranges for import statements that should be removed from the original location
+    ///
+    /// # Example
+    /// ```rust
+    /// // Before extraction:
+    /// use std::fmt::Display;
+    /// fn foo(x: Display) {}  // Selected for extraction
+    ///
+    /// // After: adds `use std::fmt::Display;` inside new module
+    /// // Returns: range of original use statement to potentially remove
+    /// ```
     fn resolve_imports(
         &mut self,
         module: Option<ast::Module>,
@@ -478,6 +682,38 @@ impl Module {
         imports_to_remove
     }
 
+    /// Processes a definition referenced in the selection to determine import statement changes.
+    ///
+    /// This method analyzes a single definition (like a type, function, or module) that is referenced
+    /// within the code being extracted. It decides:
+    /// 1. Whether the definition needs to be imported in the new module
+    /// 2. Whether existing import statements should be removed, modified, or cloned
+    /// 3. Whether `super::` imports are needed for definitions outside the selection
+    ///
+    /// The decision tree considers:
+    /// - Whether the definition is used inside and/or outside the selection
+    /// - Whether the definition itself is inside or outside the selection
+    /// - Whether the definition is in the same module or a different module
+    /// - Whether a use statement already imports this definition
+    ///
+    /// # Parameters
+    /// - `def`: The definition being referenced
+    /// - `use_node`: The syntax node of the name/name reference
+    /// - `curr_parent_module`: The current parent module context
+    /// - `ctx`: The assist context
+    ///
+    /// # Returns
+    /// - `Some(TextRange)` if an import statement should be removed from the original location
+    /// - `None` if no removal is needed
+    ///
+    /// # Example
+    /// ```rust
+    /// // Case: Definition outside selection, used inside
+    /// struct Foo;  // Outside selection
+    /// fn bar() { let x: Foo; }  // Inside selection
+    ///
+    /// // Result: Adds `use super::Foo;` to new module's use_items
+    /// ```
     fn process_def_in_sel(
         &mut self,
         def: Definition,
@@ -629,6 +865,31 @@ impl Module {
         import_path_to_be_removed
     }
 
+    /// Extracts path information from a use statement for reconstructing imports in the new module.
+    ///
+    /// When a definition being extracted is already imported via a use statement, this method:
+    /// 1. Finds the use statement that imports the definition
+    /// 2. Extracts the full path chain from the use tree (e.g., `std::collections::HashMap`)
+    /// 3. Determines the text range to remove if the use statement should be deleted
+    ///
+    /// # Parameters
+    /// - `use_stmt`: The use statement that might import the node
+    /// - `node_syntax`: The syntax node being searched for (e.g., a type name)
+    ///
+    /// # Returns
+    /// - `Some((paths, range))` where:
+    ///   - `paths`: Vector of path segments from deepest to shallowest (reversed later by caller)
+    ///   - `range`: Optional text range to remove if the entire use tree should be deleted
+    /// - `None` if the node is not found in the use statement
+    ///
+    /// # Example
+    /// ```rust
+    /// // Input: use stmt "use std::collections::HashMap;" and node "HashMap"
+    /// // Returns: (vec![HashMap, collections, std], Some(range_of_use_tree))
+    ///
+    /// // Input: use stmt "use std::{io, fs};" and node "io"
+    /// // Returns: (vec![io, std], Some(range_including_comma))
+    /// ```
     fn process_use_stmt_for_import_resolve(
         &self,
         use_stmt: Option<ast::Use>,
@@ -658,6 +919,25 @@ impl Module {
     }
 }
 
+/// Adds an import path range to the removal list, merging with any intersecting ranges.
+///
+/// Import path text ranges often extend to include commas, which can cause overlapping ranges
+/// when multiple imports from the same use statement are being removed. This function prevents
+/// panics from overlapping deletions by merging all intersecting ranges into a single range.
+///
+/// # Parameters
+/// - `import_paths_to_be_removed`: Mutable vector of ranges to remove
+/// - `import_path`: New range to add (will be merged with any intersecting ranges)
+///
+/// # Example
+/// ```rust
+/// // Removing multiple items from: use std::{io, fs, net};
+/// // Range for "io, " might be [10..14]
+/// // Range for "fs, " might be [14..18] - intersects!
+/// // These get merged into single range [10..18]
+/// ```
+///
+/// This fixes issue #11766 where overlapping deletions caused panics.
 fn check_intersection_and_push(
     import_paths_to_be_removed: &mut Vec<TextRange>,
     mut import_path: TextRange,
@@ -679,6 +959,36 @@ fn check_intersection_and_push(
     import_paths_to_be_removed.push(import_path);
 }
 
+/// Checks whether a definition is in the same module and outside the selection range.
+///
+/// This helper determines two important properties of a definition:
+/// 1. **def_in_mod**: Is the definition in the same module as the extraction context?
+/// 2. **def_out_sel**: Is the definition outside the selection being extracted?
+///
+/// These properties are used to decide whether `super::` imports are needed or whether
+/// the definition will be available in the new module.
+///
+/// # Parameters
+/// - `def`: The definition to check
+/// - `ctx`: The assist context
+/// - `curr_parent_module`: The current parent module (if any)
+/// - `selection_range`: The text range being extracted
+/// - `curr_file_id`: The current file ID
+///
+/// # Returns
+/// A tuple `(def_in_mod, def_out_sel)` where:
+/// - `def_in_mod`: `true` if the definition shares the same parent module
+/// - `def_out_sel`: `true` if the definition is outside the selection range
+///
+/// # Example
+/// ```rust
+/// mod parent {
+///     struct Foo;  // def_in_mod=true (same module), def_out_sel=true (outside selection)
+///     fn bar() {   // def_in_mod=true, def_out_sel=false (inside selection)
+///         let x: Foo;
+///     }
+/// }
+/// ```
 fn check_def_in_mod_and_out_sel(
     def: Definition,
     ctx: &AssistContext<'_>,
@@ -731,6 +1041,35 @@ fn check_def_in_mod_and_out_sel(
     (false, false)
 }
 
+/// Collects items that need visibility changes and categorizes them for processing.
+///
+/// Analyzes a list of items and identifies which ones need `pub(crate)` visibility added.
+/// Separates items into regular items, record field parents (structs/unions with fields),
+/// and impl blocks that need special handling.
+///
+/// # Parameters
+/// - `items`: Mutable slice of items to analyze (will be cloned for update if needed)
+/// - `is_clone_for_updated`: If `false`, clones items for update; if `true`, assumes already cloned
+///
+/// # Returns
+/// A tuple containing:
+/// 1. `Vec<(Option<Visibility>, SyntaxNode)>`: Items that need visibility changes
+/// 2. `Vec<(Option<Visibility>, SyntaxNode)>`: Struct/union items that have record fields
+/// 3. `Vec<ast::Impl>`: Impl blocks (not trait impls) for further processing
+///
+/// # Example
+/// ```rust
+/// // Input:
+/// fn foo() {}
+/// struct Bar { field: i32 }
+/// impl Bar { fn method() {} }
+/// use std::io;  // Ignored
+///
+/// // Returns:
+/// // 1. replacements: [(None, fn_node), (None, struct_node)]
+/// // 2. record_field_parents: [(None, struct_node)]
+/// // 3. impls: [impl_node]
+/// ```
 fn get_replacements_for_visibility_change(
     items: &mut [ast::Item],
     is_clone_for_updated: bool,
@@ -781,6 +1120,30 @@ fn get_replacements_for_visibility_change(
     (replacements, record_field_parents, impls)
 }
 
+/// Recursively extracts all path segments from a use tree, walking up the ancestor chain.
+///
+/// Given a path within a use statement, this function traverses up through the use tree
+/// structure to collect all parent path segments. This is used to reconstruct the full
+/// import path when moving use statements into the extracted module.
+///
+/// # Parameters
+/// - `path`: The starting path to traverse from
+/// - `use_tree_str`: Mutable vector to accumulate path segments (populated in-place)
+///
+/// # Returns
+/// - `Some(&mut Vec<ast::Path>)` if parent use trees were found
+/// - `None` if no parent use trees exist
+///
+/// # Example
+/// ```rust
+/// // For use tree: use std::collections::HashMap;
+/// // Starting from "HashMap" path:
+/// // use_tree_str accumulates: [collections, std]
+///
+/// // For use tree: use std::{io::Read, fs};
+/// // Starting from "Read" path:
+/// // use_tree_str accumulates: [io, std]
+/// ```
 fn get_use_tree_paths_from_path(
     path: ast::Path,
     use_tree_str: &mut Vec<ast::Path>,
@@ -803,6 +1166,27 @@ fn get_use_tree_paths_from_path(
     Some(use_tree_str)
 }
 
+/// Inserts `pub(crate)` visibility before an item if it doesn't already have visibility.
+///
+/// This is a helper for the visibility change phase of module extraction. If an item
+/// has no visibility modifier, this function inserts `pub(crate)` before the item's
+/// keyword (fn, struct, etc.) using the tree editing (ted) API.
+///
+/// # Parameters
+/// - `vis`: The current visibility of the item (if any)
+/// - `node_or_token_opt`: The syntax element before which to insert the visibility
+///
+/// # Example
+/// ```rust
+/// // Before:
+/// fn foo() {}
+///
+/// // After add_change_vis is called:
+/// pub(crate) fn foo() {}
+///
+/// // Items with existing visibility are unchanged:
+/// pub fn bar() {}  // Stays pub
+/// ```
 fn add_change_vis(vis: Option<ast::Visibility>, node_or_token_opt: Option<syntax::SyntaxElement>) {
     if vis.is_none()
         && let Some(node_or_token) = node_or_token_opt
@@ -812,6 +1196,26 @@ fn add_change_vis(vis: Option<ast::Visibility>, node_or_token_opt: Option<syntax
     }
 }
 
+/// Finds the whitespace/indentation range immediately before a given node.
+///
+/// When removing a node from the source code, we often want to also remove the
+/// indentation that precedes it to avoid leaving extra blank space. This function
+/// searches the previous siblings to find the whitespace token.
+///
+/// # Parameters
+/// - `node`: The syntax node whose preceding indentation to find
+///
+/// # Returns
+/// - `Some(TextRange)` of the whitespace token before the node
+/// - `None` if there is no whitespace before the node
+///
+/// # Example
+/// ```rust
+/// // For this code with 4-space indentation:
+/// //     fn foo() {}
+/// //     ^^^^
+/// // Returns: range of the 4 spaces before "fn"
+/// ```
 fn indent_range_before_given_node(node: &SyntaxNode) -> Option<TextRange> {
     node.siblings_with_tokens(syntax::Direction::Prev)
         .find(|x| x.kind() == WHITESPACE)
