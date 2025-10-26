@@ -4,7 +4,7 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, InFile, ModPath, Name, Semantics, sym};
+use hir::{AsAssocItem, EditionedFileId, InFile, ModPath, Name, Semantics, sym};
 use ide_db::{
     FileId, FileRange, RootDatabase,
     defs::{Definition, NameClass, NameRefClass},
@@ -131,6 +131,12 @@ pub(crate) fn rename(
 
     // TODO: Do we need to modify find_definitions to handle fully qualified paths?
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
+    let defs: Vec<_> = defs.collect();
+    if defs.len() > 1 {
+        dbg!(&defs);
+        bail!("Found {} defs!", defs.len());
+    }
+    let defs = defs.into_iter();
 
     let alias_fallback =
         alias_fallback(syntax, position, &new_name.display(db, edition).to_string());
@@ -344,7 +350,7 @@ fn alias_fallback(
 /// - No identifier is found at the position
 /// - The identifier resolves to an alias (which is currently unsupported)
 /// - No references are found at the position
-fn find_definitions(
+pub(crate) fn find_definitions(
     sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
     FilePosition { file_id, offset }: FilePosition,
@@ -367,6 +373,16 @@ fn find_definitions(
         .into_iter());
     }
 
+    let orig_token = syntax
+        .token_at_offset(offset)
+        .max_by_key(|t| {
+            t.kind().is_any_identifier() || matches!(t.kind(), SyntaxKind::LIFETIME_IDENT)
+        })
+        .ok_or_else(|| format_err!("No references found at position"))?;
+    let e_file_id = EditionedFileId::new(sema.db, file_id, span::Edition::Edition2024);
+    let orig_inside_macro = sema.is_inside_macro_call(InFile::new(e_file_id.into(), &orig_token));
+    dbg!(orig_inside_macro);
+
     let original_ident = syntax
         .token_at_offset(offset)
         .max_by_key(|t| {
@@ -380,8 +396,13 @@ fn find_definitions(
             }
         })
         .ok_or_else(|| format_err!("No references found at position"))?;
+
+    // let orig_ident_name_class = NameClass::classify(sema, &original_ident);
+    // dbg!(orig_ident_name_class);
+
     let symbols =
         sema.find_namelike_at_offset_with_descend(syntax, offset).map(|name_like| {
+            dbg!(&name_like);
             let kind = name_like.syntax().kind();
             let range = sema
                 .original_range_opt(name_like.syntax())
@@ -1182,6 +1203,23 @@ fn main() {
 
     #[test]
     fn test_rename_macro_multiple_occurrences() {
+        // NOTE: Don't support this
+        // - Don't want to support anything defined my a macro
+        //
+        // Defs:
+        // - RenameDefinition::Yes | Const
+        // - RenameDefinition::Yes | Adt::Struct
+        //
+        // Both defs have same text range, pointin to the macro call site!
+        //
+        // How does the rename impl avoid multiple rename edits?
+        // - Probably tracks the edit file range or someting?
+        //
+        // Identification:
+        // - Modified version of is_inside_macro_call
+        // - Only check that ancestor can be directly cast to macro call
+        //   - ast::MacroCall::can_cast(ancestor.kind())
+        //
         check(
             "Baaah",
             r#"macro_rules! foo {
@@ -3669,6 +3707,14 @@ trait Trait<U> {
 
     #[test]
     fn rename_macro_generated_type_from_type_with_a_suffix() {
+        // TODO: This should actually be supported
+        // - This will yield multiple defintions, but they are generated with a derive-like macro
+        // - The main rename is on a struct, as long as we move this with the derive macro still attached we should be fine
+        // - Still need to update the derived refs as normal
+        //
+        // Identification: RenameDefintion::Yes && Adt::Struct
+        //
+        // The struct we don't want to move is Adt::Struct but it's RenameDefinition::No
         check(
             "Bar",
             r#"
@@ -3713,6 +3759,10 @@ fn other_place() { Bar; }
 
     #[test]
     fn rename_macro_generated_type_from_variant_with_a_suffix() {
+        // NOTE: This should not be handled
+        // - Not because of the macro, but because we don't support rename-move for enum variants
+        //
+        // Identification: RenameDefinition::Yes && Variant
         check(
             "Bar",
             r#"

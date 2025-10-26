@@ -9,6 +9,7 @@ use ide_db::rename::RenameError;
 use ide_db::rename::bail;
 use ide_db::rename::format_err;
 use ide_db::{FilePosition, RootDatabase, source_change::SourceChange};
+use itertools::Itertools;
 use span::Edition;
 use syntax::AstNode;
 use syntax::SourceFile;
@@ -16,6 +17,8 @@ use syntax::SyntaxKind;
 use syntax::SyntaxNode;
 use syntax::ast;
 use syntax::ast::HasModuleItem;
+
+use crate::rename::find_definitions;
 
 pub type Result<T> = crate::rename::RenameResult<T>;
 
@@ -54,6 +57,7 @@ pub type Result<T> = crate::rename::RenameResult<T>;
 //
 // Edge cases:
 // - Support raw identifiers
+// - Derive macros, etc must be moved as well
 
 pub(crate) fn rename_move(
     db: &RootDatabase,
@@ -69,19 +73,15 @@ pub(crate) fn rename_move(
     let edition = file_id.edition(db);
 
     let new_path = parse_move_target(new_path, &sema, edition)?;
+    let def = find_definitions(&sema, syntax, position, new_path.segments().last().unwrap())?
+        .exactly_one()
+        .map_err(|_| {
+            // Multiple found definitions indicates macro involvement, which is currently unsupported
+            format_err!("Rename-move unsupported")
+        })?;
 
-    // TODO: Also find impl blocks etc
-    let def = find_definition(&sema, syntax, position, &new_path)?;
+    // RETURN
 
-    todo!()
-}
-
-fn find_definition(
-    sema: &Semantics<'_, RootDatabase>,
-    syntax: &SyntaxNode,
-    FilePosition { file_id, offset }: FilePosition,
-    new_path: &ModPath,
-) -> Result<(FileRange, SyntaxKind, Definition, Name, RenameDefinition)> {
     todo!()
 }
 

@@ -832,6 +832,8 @@ impl Analysis {
         position: FilePosition,
         new_name: &str,
     ) -> Cancellable<Result<SourceChange, RenameError>> {
+        // TODO: Check if the rename actually defines a new crate, indicating a move. Otherwise, use
+        // normal rename
         self.with_db(|db| {
             if new_name.contains("::") {
                 rename_move::rename_move(db, position, new_name)

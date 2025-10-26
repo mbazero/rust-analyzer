@@ -680,6 +680,7 @@ impl<'db> SemanticsImpl<'db> {
     /// Checks if renaming `renamed` to `new_name` may introduce conflicts with other locals,
     /// and returns the conflicting locals.
     pub fn rename_conflicts(&self, to_be_renamed: &Local, new_name: &Name) -> Vec<Local> {
+        // NOTE: Can use this for checking for conflicts in the new module
         let body = self.db.body(to_be_renamed.parent);
         let resolver = to_be_renamed.parent.resolver(self.db);
         let starting_expr = body.binding_owner(to_be_renamed.binding_id).unwrap_or(body.body_expr);
@@ -963,16 +964,32 @@ impl<'db> SemanticsImpl<'db> {
     /// Note that if this token itself is within the context of a macro expansion does not matter.
     /// That is, we strictly check if it lies inside the input of a macro call.
     pub fn is_inside_macro_call(&self, token @ InFile { value, .. }: InFile<&SyntaxToken>) -> bool {
+        // NOTE: Use this to identify macro calls
+        // - Hmm, maybe this isn't correct actually because it seems to be returning true even for
+        // structs with derive-live macros on them
+        //   - e.g. rename_macro_generated_type_from_type_with_a_suffix()
+        // - It does seem to work correctly for other occurences, so maybe we're misunderstanding
+        // how the macro parsing in the method above actually works
+        // - Ahhh, it's probably hitting "file_of_adt_has_derive"
+        // - Nevermind, it hits item_to_macro_call which checks if the item has any attribute macro
+        // calls, which the struct in the test above does indeed have
+
         value.parent_ancestors().any(|ancestor| {
+            dbg!(&ancestor);
             if ast::MacroCall::can_cast(ancestor.kind()) {
+                println!("Ancestor is macro call");
                 return true;
             }
 
             let Some(item) = ast::Item::cast(ancestor) else {
+                println!("Ancestor is not item");
                 return false;
             };
+            println!("Ancestor item: {item:?}");
+
             self.with_ctx(|ctx| {
                 if ctx.item_to_macro_call(token.with_value(&item)).is_some() {
+                    println!("Ancestor item is macro call");
                     return true;
                 }
                 let adt = match item {
@@ -981,7 +998,12 @@ impl<'db> SemanticsImpl<'db> {
                     ast::Item::Union(it) => it.into(),
                     _ => return false,
                 };
-                ctx.file_of_adt_has_derives(token.with_value(&adt))
+                if ctx.file_of_adt_has_derives(token.with_value(&adt)) {
+                    println!("Ancestor item has derives");
+                    true
+                } else {
+                    false
+                }
             })
         })
     }
