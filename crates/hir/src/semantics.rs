@@ -975,7 +975,7 @@ impl<'db> SemanticsImpl<'db> {
         // calls, which the struct in the test above does indeed have
 
         value.parent_ancestors().any(|ancestor| {
-            dbg!(&ancestor);
+            // dbg!(&ancestor);
             if ast::MacroCall::can_cast(ancestor.kind()) {
                 println!("Ancestor is macro call");
                 return true;

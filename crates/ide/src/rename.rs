@@ -131,12 +131,15 @@ pub(crate) fn rename(
 
     // TODO: Do we need to modify find_definitions to handle fully qualified paths?
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
-    let defs: Vec<_> = defs.collect();
-    if defs.len() > 1 {
-        dbg!(&defs);
-        bail!("Found {} defs!", defs.len());
-    }
-    let defs = defs.into_iter();
+
+    // let defs: Vec<_> = defs.collect();
+    // let num_renames =
+    //     defs.iter().filter(|(_, _, _, _, rn)| matches!(rn, &RenameDefinition::Yes)).count();
+    // if num_renames > 1 {
+    //     dbg!(defs);
+    //     bail!("Got {num_renames} renames!");
+    // }
+    // let defs = defs.into_iter();
 
     let alias_fallback =
         alias_fallback(syntax, position, &new_name.display(db, edition).to_string());
@@ -402,7 +405,7 @@ pub(crate) fn find_definitions(
 
     let symbols =
         sema.find_namelike_at_offset_with_descend(syntax, offset).map(|name_like| {
-            dbg!(&name_like);
+            // dbg!(&name_like);
             let kind = name_like.syntax().kind();
             let range = sema
                 .original_range_opt(name_like.syntax())
@@ -844,6 +847,8 @@ fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: String) -> O
     Some(TextEdit::replace(self_param.syntax().text_range(), replacement_text))
 }
 
+// TODO: Check that all of these still work with fully qualified path that just does  a normal
+// rename
 #[cfg(test)]
 mod tests {
     use expect_test::{Expect, expect};

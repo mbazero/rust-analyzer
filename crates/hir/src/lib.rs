@@ -590,6 +590,12 @@ impl Module {
         res
     }
 
+    pub fn canonical_path(&self, db: &dyn HirDatabase, edition: Edition) -> Option<String> {
+        let segments: Vec<_> =
+            self.path_to_root(db).into_iter().flat_map(|m| m.name(db)).rev().collect();
+        Some(segments.iter().map(|n| n.display(db, edition)).join("::"))
+    }
+
     /// Returns a `ModuleScope`: a set of items, visible in this module.
     pub fn scope(
         self,
