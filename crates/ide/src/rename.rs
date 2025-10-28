@@ -25,7 +25,7 @@ use crate::{FilePosition, RangeInfo, SourceChange};
 
 pub use ide_db::rename::RenameError;
 
-type RenameResult<T> = Result<T, RenameError>;
+pub(crate) type RenameResult<T> = Result<T, RenameError>;
 
 pub struct RenameConfig {
     pub prefer_no_std: bool,
@@ -246,7 +246,7 @@ fn alias_fallback(
     Some(builder.finish())
 }
 
-fn find_definitions(
+pub(crate) fn find_definitions(
     sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
     FilePosition { file_id, offset }: FilePosition,
@@ -791,7 +791,7 @@ fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: String) -> O
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use expect_test::{Expect, expect};
     use ide_db::source_change::SourceChange;
     use ide_db::text_edit::TextEdit;
@@ -806,8 +806,10 @@ mod tests {
     const TEST_CONFIG: RenameConfig =
         RenameConfig { prefer_no_std: false, prefer_prelude: true, prefer_absolute: false };
 
+    // TODO: Extract this to utility class for shared use with rename_move instead of making the
+    // function and tests module pub(crate);
     #[track_caller]
-    fn check(
+    pub(crate) fn check(
         new_name: &str,
         #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
         #[rust_analyzer::rust_fixture] ra_fixture_after: &str,
@@ -822,6 +824,8 @@ mod tests {
         let rename_result = analysis
             .rename(position, new_name, &TEST_CONFIG)
             .unwrap_or_else(|err| panic!("Rename to '{new_name}' was cancelled: {err}"));
+        
+        // TODO: Try using check_source_change with file edit limit check
         match rename_result {
             Ok(source_change) => {
                 let mut text_edit_builder = TextEdit::builder();

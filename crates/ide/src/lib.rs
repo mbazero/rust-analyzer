@@ -43,6 +43,7 @@ mod move_item;
 mod parent_module;
 mod references;
 mod rename;
+mod rename_move;
 mod runnables;
 mod signature_help;
 mod ssr;
@@ -832,7 +833,16 @@ impl Analysis {
         new_name: &str,
         config: &RenameConfig,
     ) -> Cancellable<Result<SourceChange, RenameError>> {
-        self.with_db(|db| rename::rename(db, position, new_name, config))
+        self.with_db(|db| {
+            // TODO: Improve rename-move / rename branching logic
+            // - Better path check than contains double colon?
+            // - If new and old module paths are the same do normal rename
+            if new_name.contains("::") {
+                rename_move::rename_move(db, position, new_name)
+            } else {
+                rename::rename(db, position, new_name, config)
+            }
+        })
     }
 
     pub fn prepare_rename(
