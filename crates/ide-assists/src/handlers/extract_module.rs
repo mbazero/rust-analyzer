@@ -494,6 +494,7 @@ impl Module {
         ctx: &AssistContext<'_>,
     ) -> Option<TextRange> {
         //We only need to find in the current file
+        // NOTE: If we want to reuse this function for rename-move, we will have to expand our search scope beyond the current file
         let selection_range = ctx.selection_trimmed();
         let file_id = ctx.file_id();
         let usage_res = def.usages(&ctx.sema).in_scope(&SearchScope::single_file(file_id)).all();
