@@ -91,6 +91,8 @@ pub(crate) type Result<T> = crate::rename::RenameResult<T>;
 //   - rename.rs
 //   - extract_module.rs
 //   - move_mod_to_file.rs
+// - extract_module and move_mod_to_file are both special cases of rename_move
+//   - These should be updated to call into rename_move utils
 
 pub(crate) fn rename_move(
     db: &RootDatabase,
