@@ -19,6 +19,7 @@ pub mod prime_caches;
 pub mod ra_fixture;
 pub mod range_mapper;
 pub mod rename;
+pub mod rename_move;
 pub mod rust_doc;
 pub mod search;
 pub mod source_change;
