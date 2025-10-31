@@ -26,6 +26,11 @@ impl From<SyntaxKind> for u16 {
 
 impl SyntaxKind {
     #[inline]
+    pub fn is_whitespace(self) -> bool {
+        matches!(self, SyntaxKind::WHITESPACE)
+    }
+
+    #[inline]
     pub fn is_trivia(self) -> bool {
         matches!(self, SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
     }

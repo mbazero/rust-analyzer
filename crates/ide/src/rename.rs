@@ -824,7 +824,7 @@ pub(crate) mod tests {
         let rename_result = analysis
             .rename(position, new_name, &TEST_CONFIG)
             .unwrap_or_else(|err| panic!("Rename to '{new_name}' was cancelled: {err}"));
-        
+
         // TODO: Try using check_source_change with file edit limit check
         match rename_result {
             Ok(source_change) => {
