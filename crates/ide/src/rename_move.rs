@@ -8,6 +8,7 @@ use ide_db::defs::Definition;
 use ide_db::rename::RenameError;
 use ide_db::rename::bail;
 use ide_db::rename::format_err;
+use ide_db::rename_move::RenameMoveAdt;
 use ide_db::source_change::SourceChangeBuilder;
 use ide_db::{FilePosition, RootDatabase, source_change::SourceChange};
 use itertools::Itertools;
@@ -32,14 +33,24 @@ pub(crate) type Result<T> = crate::rename::RenameResult<T>;
 //
 // Tentative rename-move steps:
 // - Parse new_path into a ModPath
-// - Find definitions for the refactor position and ensure they can be rename-moved
+// - Find definition and ensure it can be rename-moved
 //   - To start, only support Module, Function, Adt, Const, and Static definitions
+// - Find associated impls in file
+// - Construct RenameMoveComponents struct with definitions and associated impl
 // - Get or create the destination module
 //   - If destination module doesn't exist, we need to add source edits to create it
 //   - Also need to support creating intermediate modules for nested paths
-// - Move renamed target definition and required imports to existing or newly created module
+// - Move all RenameMoveComponents to target module
 //   - See extract_module.rs and move_mod_to_file.rs for some guidance here
-// - Update all references to the target definition
+// - Pull in required imports
+//   - Update internal use statements
+//   - Find any unresolved internal refs
+//      - Refs can be resolved by internal use statements or use statements already in the module
+// - Update internal visibility
+//      - Struct fields
+//      - Impl constants
+//      - Function defs
+// - Update all external usages (rename)
 //   - This can probably be done with existing rename.rs infrastructure with some slight
 //   modifications
 //
@@ -84,7 +95,11 @@ pub(crate) type Result<T> = crate::rename::RenameResult<T>;
 //   - Do we want to support this?
 // - Adt defined within inline module
 // - Delete src module if it becomes empty
-// - Handle inline module destinations
+// - Handle inline module targets
+//   - Need to indent appropriately
+// - Handle inline module origins
+//   - Need to unindent
+// - Actually, do need to handle multiple defintions since the def could be annotated by a proc macro which creates some additional defs, maybe
 //
 // Misc:
 // - Once a functional implementation is complete, see how much functionality can be merged with:
@@ -109,57 +124,41 @@ pub(crate) fn rename_move(
         .ok_or_else(|| format_err!("Invalid source module"))?;
     let syntax = source_file.syntax();
     let edition = file_id.edition(db);
-    let new_path = parse_move_target(new_path, &sema, edition)?;
+
+    let mut new_path = parse_move_target(new_path, &sema, edition)?;
     let new_name = new_path.segments().last().ok_or_else(|| format_err!("Invalid new path"))?;
 
+    // TODO: Bail if definition target is defined within a macro
+    // TODO: Probably do want to support multiple definitions if they are define in a proc macro, which will get moved alongside the main def
     let (_file_range, _syntax_kind, def, _new_name, _rename_def) =
         find_definitions(&sema, syntax, position, new_name)?.exactly_one().map_err(|_| {
             // Multiple found definitions indicates macro involvement, which is currently unsupported
             format_err!("Rename-move unsupported")
         })?;
 
-    // TODO: Bail if definition target is defined within a macro
-
-    let dst_mod_path = match def {
+    let source_change = match def {
         Definition::Module(_module) => {
             // TODO: Handle module moves
             bail!("Module moves not yet supported");
         }
-        Definition::Adt(_)
-        | Definition::Const(_)
-        | Definition::Static(_)
-        | Definition::Trait(_) => {
-            let mut dst_mod_path = new_path.clone();
-            dst_mod_path.pop_segment();
-            dst_mod_path
+        Definition::Adt(adt) => {
+            let (new_name, dst_mod) = {
+                let new_name = new_path
+                    .pop_segment()
+                    .ok_or_else(|| format_err!("Invalid ADT rename-move target"))?;
+                let dst_mod = get_or_create_mod(&sema, &new_path, source_mod)
+                    .ok_or_else(|| format_err!("Invalid destination module"))?;
+                (new_name, dst_mod)
+            };
+
+            RenameMoveAdt::new(&sema, adt, new_name, source_mod, dst_mod)
+                .into_source_change(&sema)
+                .ok_or_else(|| format_err!("Failed to rename-move ADT"))?
         }
         _ => bail!("Rename-move unsupported"),
     };
 
-    let dst_mod = get_or_create_mod(&sema, &dst_mod_path, source_mod)
-        .ok_or_else(|| format_err!("Invalid destination module"))?;
-    let dst_file_id = dst_mod
-        .definition_source_file_id(db)
-        .file_id()
-        .ok_or_else(|| format_err!("Invalid destination file"))?;
-    let lca_mod = get_mod_lca(&sema, source_mod, dst_mod);
-    dbg!(dst_mod.name(db));
-    dbg!(lca_mod.map(|m| m.name(db).unwrap_or(Name::new_root("crate"))));
-
-    let def_nav_target = def.try_to_nav(&sema).unwrap().call_site();
-    let def_syntax_text = source_file.syntax().text().slice(def_nav_target.full_range);
-    println!("def_syntax_text:\n{def_syntax_text}");
-
-    let dst_mod_path_str =
-        dst_mod_path.segments().iter().map(|name| name.display(db, edition)).format("/");
-    println!("dst_mod_path_str: {dst_mod_path_str}");
-
-    let mut builder = SourceChangeBuilder::new(position.file_id);
-    builder.delete(def_nav_target.full_range);
-    builder.edit_file(dst_file_id.file_id(db));
-    builder.insert(TextSize::new(0), def_syntax_text);
-
-    Ok(builder.finish())
+    Ok(source_change)
 }
 
 fn get_or_create_mod(
@@ -248,7 +247,10 @@ mod tests {
     use stdx::{format_to, trim_indent};
     use test_utils::assert_eq_text;
 
-    use crate::fixture;
+    use crate::{RenameConfig, fixture};
+
+    const TEST_CONFIG: RenameConfig =
+        RenameConfig { prefer_no_std: false, prefer_prelude: true, prefer_absolute: false };
 
     #[track_caller]
     pub(crate) fn check(
@@ -264,7 +266,7 @@ mod tests {
             panic!("Prepare rename to '{new_name}' was failed: {err}")
         }
         let rename_result = analysis
-            .rename(position, new_name)
+            .rename(position, new_name, &TEST_CONFIG)
             .unwrap_or_else(|err| panic!("Rename to '{new_name}' was cancelled: {err}"));
 
         // TODO: Try using check_source_change with file edit limit check
@@ -329,6 +331,12 @@ mod tests {
         assert_eq_text!(after, &buf);
     }
 
+    // TODO: Test coverage to add
+    // - Regular & trait impl block tests
+    //   - Trait impls in same file are moved
+    //   - Multiple trait impls in same file are moved
+    //   - Trait impls in same file but inline module aren't moved
+
     #[test]
     fn test_simple_move_to_existing_module() {
         check(
@@ -337,18 +345,70 @@ mod tests {
 //- /main.rs
 mod foo;
 mod bar;
+
+pub trait MainTrait {
+    fn main_trait_fn(&self) -> bool;
+}
 //- /foo.rs
+use crate::MainTrate;
+
 struct $0FooStruct;
+
+impl FooStruct {
+    fn method_in_first_impl(&self) -> i32 {
+        0
+    }
+}
+
+impl MainTrait for FooStruct {
+    fn main_trait_fn(&self) -> bool {
+        false
+    }
+}
+
 struct OtherFooStruct;
+
+impl MainTrait for OtherFooStruct {
+    fn main_trait_fn(&self) -> bool {
+        false
+    }
+}
 //- /bar.rs
-struct BarStruct;
+use std::string::String;
+use std::vec::Vec;
+
+struct BarStruct(Vec<String>);
             "#,
             r#"
 //- /foo.rs
+use crate::MainTrate;
+
 struct OtherFooStruct;
+
+impl MainTrait for OtherFooStruct {
+    fn main_trait_fn(&self) -> bool {
+        false
+    }
+}
 //- /bar.rs
-struct BarStruct;
+use std::string::String;
+use std::vec::Vec;
+
 struct FooStruct;
+
+impl FooStruct {
+    fn method_in_first_impl(&self) -> i32 {
+        0
+    }
+}
+
+impl MainTrait for FooStruct {
+    fn main_trait_fn(&self) -> bool {
+        false
+    }
+}
+
+struct BarStruct(Vec<String>);
             "#,
         );
     }
