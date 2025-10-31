@@ -6,7 +6,10 @@
 //! The *real* implementation is in the (language-agnostic) `rowan` crate, this
 //! module just wraps its API.
 
-use rowan::{GreenNodeBuilder, Language};
+use std::ops::RangeInclusive;
+
+use either::Either;
+use rowan::{Direction, GreenNodeBuilder, Language};
 
 use crate::{Parse, SyntaxError, SyntaxKind, TextSize};
 
@@ -72,5 +75,43 @@ impl SyntaxTreeBuilder {
 
     pub fn error(&mut self, error: String, text_pos: TextSize) {
         self.errors.push(SyntaxError::new_at_offset(error, text_pos));
+    }
+}
+
+pub trait SyntaxElementExt {
+    fn neighbor(&self, direction: Direction) -> Option<SyntaxElement>;
+
+    fn ws_neighbors(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement>;
+
+    fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement>;
+
+    fn element_range_with_ws(&self) -> RangeInclusive<SyntaxElement>;
+}
+
+impl SyntaxElementExt for SyntaxElement {
+    fn neighbor(&self, direction: Direction) -> Option<SyntaxElement> {
+        match direction {
+            Direction::Next => self.next_sibling_or_token(),
+            Direction::Prev => self.prev_sibling_or_token(),
+        }
+    }
+
+    fn ws_neighbors(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> {
+        self.siblings_with_tokens(direction)
+            .skip(1)
+            .take_while(|s| s.as_token().is_some_and(|t| t.kind().is_whitespace()))
+    }
+
+    fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> {
+        match self {
+            NodeOrToken::Node(node) => Either::Left(node.siblings_with_tokens(direction)),
+            NodeOrToken::Token(token) => Either::Right(token.siblings_with_tokens(direction)),
+        }
+    }
+
+    fn element_range_with_ws(&self) -> RangeInclusive<SyntaxElement> {
+        let start = self.ws_neighbors(Direction::Prev).last().unwrap_or_else(|| self.clone());
+        let end = self.ws_neighbors(Direction::Next).last().unwrap_or_else(|| self.clone());
+        start..=end
     }
 }

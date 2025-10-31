@@ -1,28 +1,23 @@
-use std::collections::HashSet;
-
-use crate::rename::RenameError;
-use crate::rename::format_err;
 use crate::source_change::SourceChangeBuilder;
-use crate::{rename::Result, search::UsageSearchResult};
 use hir::HasSource;
 use hir::ModuleSource;
-use hir::{ModPath, Module, Name, Semantics};
+use hir::{Module, Name, Semantics};
 use itertools::Itertools;
 use itertools::chain;
 use parser::SyntaxKind;
-use span::TextSize;
 use syntax::AstNode;
 use syntax::Direction;
-use syntax::RustLanguage;
+use syntax::SyntaxElement;
+use syntax::SyntaxElementExt;
 use syntax::SyntaxNode;
 use syntax::SyntaxToken;
+use syntax::algo::merge_element_ranges;
 use syntax::ast;
 use syntax::ast::HasModuleItem;
 use syntax::ast::edit::AstNodeEdit;
 use syntax::ast::edit::IndentLevel;
 use syntax::ast::make::tokens;
 use syntax::syntax_editor::Position;
-use syntax::syntax_editor::SyntaxEditor;
 
 use crate::{RootDatabase, defs::Definition, source_change::SourceChange};
 
@@ -119,21 +114,12 @@ impl RenameMoveAdt {
         let mut builder = SourceChangeBuilder::new(src_file_id);
 
         // Delete items from origin
-        // TODO: Add blankline handling to common helper method delete_with_blanklines
-        // TODO: Smarter handling of adjecent items to be deleted
-        // TODO: Unified delete_all_with_blanklines to handle the above two
         builder.apply_file_edits(src_file_id, &src_mod_node, |editor| {
-            let mut blanklines = HashSet::new();
-            blanklines.extend(adj_blanklines(Direction::Prev, adt_ast.syntax()));
-            editor.delete(adt_ast.syntax());
-            blanklines.extend(adj_blanklines(Direction::Next, adt_ast.syntax()));
-            for impl_ast in &impl_asts {
-                blanklines.extend(adj_blanklines(Direction::Prev, impl_ast.syntax()));
-                editor.delete(impl_ast.syntax());
-                blanklines.extend(adj_blanklines(Direction::Next, impl_ast.syntax()));
-            }
-            // TODO: The skip is hack to get unit test to pass. See above for real solution
-            blanklines.into_iter().skip(1).for_each(|bl| editor.delete(bl));
+            let ranges = chain![[adt_ast.syntax()], impl_asts.iter().map(ast::Impl::syntax)]
+                .map(|node| SyntaxElement::from(node.clone()).element_range_with_ws());
+            merge_element_ranges(ranges)
+                .into_iter()
+                .for_each(|range| editor.replace_all(range, vec![tokens::blank_line().into()]));
         });
 
         // Add items to target

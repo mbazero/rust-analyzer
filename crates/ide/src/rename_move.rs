@@ -1,7 +1,6 @@
 use hir::ModPath;
 use hir::Module;
 use hir::ModuleDef;
-use hir::Name;
 use hir::Semantics;
 use hir::db::ExpandDatabase;
 use ide_db::defs::Definition;
@@ -9,17 +8,14 @@ use ide_db::rename::RenameError;
 use ide_db::rename::bail;
 use ide_db::rename::format_err;
 use ide_db::rename_move::RenameMoveAdt;
-use ide_db::source_change::SourceChangeBuilder;
 use ide_db::{FilePosition, RootDatabase, source_change::SourceChange};
 use itertools::Itertools;
 use span::Edition;
-use span::TextSize;
 use syntax::AstNode;
 use syntax::SourceFile;
 use syntax::ast;
 use syntax::ast::HasModuleItem;
 
-use crate::TryToNav;
 use crate::rename::find_definitions;
 
 pub(crate) type Result<T> = crate::rename::RenameResult<T>;
@@ -175,12 +171,6 @@ fn get_or_create_mod(
         }
     };
 
-    // NOW: Remove this
-    let res_mod_path: Option<Vec<_>> = root_mod
-        .resolve_mod_path(sema.db, mod_path.segments().iter().cloned())
-        .map(|x| x.collect());
-    dbg!(res_mod_path);
-
     // TODO: Support creating non-existent module
 
     root_mod
@@ -192,6 +182,7 @@ fn get_or_create_mod(
         .last()
 }
 
+// TODO: Use alog::least_common_ancestor
 fn get_mod_lca(sema: &Semantics<'_, RootDatabase>, mod_a: Module, mod_b: Module) -> Option<Module> {
     let [mod_a, mod_b] = [mod_a, mod_b].map(Definition::Module);
     let [mut mod_a_path, mut mod_b_path] =
@@ -360,13 +351,13 @@ impl FooStruct {
     }
 }
 
+struct OtherFooStruct;
+
 impl MainTrait for FooStruct {
     fn main_trait_fn(&self) -> bool {
         false
     }
 }
-
-struct OtherFooStruct;
 
 impl MainTrait for OtherFooStruct {
     fn main_trait_fn(&self) -> bool {

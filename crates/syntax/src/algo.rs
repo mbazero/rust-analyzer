@@ -1,5 +1,7 @@
 //! Collection of assorted algorithms for syntax trees.
 
+use std::ops::RangeInclusive;
+
 use itertools::Itertools;
 
 use crate::{
@@ -131,4 +133,30 @@ pub fn previous_non_trivia_token(e: impl Into<SyntaxElement>) -> Option<SyntaxTo
         }
     }
     None
+}
+
+pub fn merge_element_ranges(
+    ranges: impl IntoIterator<Item = RangeInclusive<SyntaxElement>>,
+) -> Vec<RangeInclusive<SyntaxElement>> {
+    let mut ranges = ranges
+        .into_iter()
+        .map(|r| r.into_inner())
+        .sorted_by_cached_key(|(s, e)| (s.text_range().start(), e.text_range().end()));
+
+    let Some((mut cur_start, mut cur_end)) = ranges.next() else {
+        return Vec::new();
+    };
+
+    let mut merged = Vec::new();
+    for (s, e) in ranges {
+        if s.text_range().start() <= cur_end.text_range().end() {
+            if e.text_range().end() > cur_end.text_range().end() {
+                cur_end = e;
+            }
+        } else {
+            merged.push(std::mem::replace(&mut cur_start, s)..=std::mem::replace(&mut cur_end, e));
+        }
+    }
+    merged.push(cur_start..=cur_end);
+    merged
 }

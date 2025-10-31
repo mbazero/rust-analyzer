@@ -296,7 +296,7 @@ impl SourceChangeBuilder {
 
     pub fn apply_file_edits<F>(&mut self, file_id: impl Into<FileId>, node: &SyntaxNode, edit_fn: F)
     where
-        F: FnOnce(&mut SyntaxEditor) -> (),
+        F: FnOnce(&mut SyntaxEditor),
     {
         let mut editor = self.make_editor(node);
         edit_fn(&mut editor);
