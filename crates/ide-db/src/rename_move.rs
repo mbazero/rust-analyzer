@@ -100,6 +100,10 @@ impl RenameMoveAdt {
 
         let src_mod_node = self.src_mod.definition_source(sema.db).value.node();
 
+        if std::env::var("SS") == Ok("1".to_owned()) {
+            println!("{src_mod_node:#?}");
+        }
+
         let dst_mod_source = self.dst_mod.definition_source(sema.db);
         let dst_mod_node = dst_mod_source.value.node();
         let dst_file_id = self.dst_mod.as_source_file_id(sema.db)?.file_id(sema.db);
