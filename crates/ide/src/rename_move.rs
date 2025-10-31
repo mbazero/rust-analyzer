@@ -343,6 +343,7 @@ pub trait MainTrait {
 //- /foo.rs
 use crate::MainTrate;
 
+/// FooStruct doc
 struct $0FooStruct;
 
 impl FooStruct {
@@ -385,6 +386,7 @@ impl MainTrait for OtherFooStruct {
 use std::string::String;
 use std::vec::Vec;
 
+/// FooStruct doc
 struct FooStruct;
 
 impl FooStruct {
