@@ -1347,11 +1347,16 @@ pub fn token(kind: SyntaxKind) -> SyntaxToken {
 }
 
 pub mod tokens {
-    use std::sync::LazyLock;
+    use std::{ops::Not, sync::LazyLock};
 
     use parser::Edition;
 
-    use crate::{AstNode, Parse, SourceFile, SyntaxKind::*, SyntaxToken, ast};
+    use crate::{
+        AstNode, Parse, SourceFile,
+        SyntaxKind::*,
+        SyntaxToken,
+        ast::{self, edit::IndentLevel},
+    };
 
     pub(super) static SOURCE_FILE: LazyLock<Parse<SourceFile>> = LazyLock::new(|| {
         SourceFile::parse(
@@ -1397,6 +1402,11 @@ pub mod tokens {
         assert!(text.trim().is_empty());
         let sf = SourceFile::parse(text, Edition::CURRENT).ok().unwrap();
         sf.syntax().clone_for_update().first_child_or_token().unwrap().into_token().unwrap()
+    }
+
+    pub fn whitespace_indent(text: &str, indent: IndentLevel) -> Option<SyntaxToken> {
+        let text = format!("{text}{indent}");
+        text.is_empty().not().then(|| whitespace(&text))
     }
 
     pub fn doc_comment(text: &str) -> SyntaxToken {

@@ -119,9 +119,10 @@ impl RenameMoveAdt {
         let mut builder = SourceChangeBuilder::new(src_file_id);
 
         // Delete items from origin
+        // TODO: use edit::remove item style pattern
         builder.apply_file_edits(src_file_id, &src_mod_node, |editor| {
             let ranges = chain![[adt_ast.syntax()], impl_asts.iter().map(ast::Impl::syntax)]
-                .map(|node| SyntaxElement::from(node.clone()).element_range_with_ws());
+                .map(|node| SyntaxElement::from(node.clone_for_update()).element_range_with_ws());
 
             merge_element_ranges(ranges).into_iter().for_each(|range| {
                 let replacement = if range.start().prev_sibling_or_token().is_some()
@@ -138,30 +139,49 @@ impl RenameMoveAdt {
         // Add items to target
         // TODO: Handle indent level
         // TODO: Add blankline handling to a common helper method insert_with_blanklines
-        let TargetModInsert { position, indent_level, include_prefix, include_postfix } =
-            TargetModInsert::new(&dst_mod_source.value)?;
-        builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
-            editor.insert_all(
-                position,
-                chain![
-                    include_prefix.then_some(tokens::blank_line().into()),
-                    Itertools::intersperse_with(
-                        chain![
-                            [adt_ast.syntax().clone_for_update().into()],
-                            impl_asts.into_iter().map(|ast| ast.syntax().clone_for_update().into()),
-                        ],
-                        || tokens::blank_line().into(),
-                    ),
-                    include_postfix.then_some(tokens::blank_line().into()),
-                ]
-                .collect(),
-            );
-        });
+        // let TargetModInsert { position, indent_level, include_prefix, include_postfix } =
+        //     TargetModInsert::new(&dst_mod_source.value)?;
+        // builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
+        //     editor.insert_all(
+        //         position,
+        //         chain![
+        //             include_prefix.then_some(tokens::blank_line().into()),
+        //             Itertools::intersperse_with(
+        //                 chain![
+        //                     [adt_ast.syntax().clone_for_update().into()],
+        //                     impl_asts.into_iter().map(|ast| ast.syntax().clone_for_update().into()),
+        //                 ],
+        //                 || tokens::blank_line().into(),
+        //             ),
+        //             include_postfix.then_some(tokens::blank_line().into()),
+        //         ]
+        //         .collect(),
+        //     );
+        // });
+
+        let items = chain![[adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
+        match dst_mod_source.value {
+            ModuleSource::SourceFile(source_file) => {
+                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
+                    source_file.add_item_after_headers(editor, items);
+                })
+            }
+            ModuleSource::Module(module) => {
+                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
+                    module.add_item_after_headers(editor, items);
+                })
+            }
+            ModuleSource::BlockExpr(block_expr) => {
+                // TODO: Validate earlier
+                return None;
+            }
+        }
 
         Some(builder.finish())
     }
 }
 
+// TODO: Remove and use existing method
 fn get_lca_mod(sema: &Semantics<'_, RootDatabase>, mod_a: Module, mod_b: Module) -> Option<Module> {
     let [mod_a, mod_b] = [mod_a, mod_b].map(Definition::Module);
     let [mut mod_a_path, mut mod_b_path] =
@@ -185,6 +205,7 @@ struct TargetModInsert {
     include_postfix: bool,
 }
 
+// TODO: Delete this
 impl TargetModInsert {
     fn new(mod_source: &ModuleSource) -> Option<Self> {
         let (mod_syntax, mod_items, indent_level) = match mod_source {
@@ -200,7 +221,7 @@ impl TargetModInsert {
                 return None;
             }
         };
-        
+
         dbg!(&mod_syntax);
         dbg!(Position::first_child_of(mod_syntax));
 
