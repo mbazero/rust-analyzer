@@ -295,6 +295,7 @@ mod tests {
                 let path = sr.path_for_file(&file_id).unwrap();
                 format_to!(buf, "//- {}\n", path)
             }
+            dbg!(&text);
             buf.push_str(&text);
         }
 
@@ -327,6 +328,72 @@ mod tests {
     //   - Trait impls in same file are moved
     //   - Multiple trait impls in same file are moved
     //   - Trait impls in same file but inline module aren't moved
+
+    #[test]
+    fn test_rename_move_to_existing_module() {
+        check(
+            "crate::bar::FooStruct",
+            r#"
+//- /main.rs
+mod foo;
+mod bar;
+//- /foo.rs
+struct $0FooStruct;
+//- /bar.rs
+struct BarStruct;
+            "#,
+            r#"
+//- /foo.rs
+//- /bar.rs
+struct FooStruct;
+
+struct BarStruct;
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_rename_move_to_existing_inline_module() {
+        check(
+            "crate::bar::FooStruct",
+            r#"
+//- /main.rs
+mod foo;
+
+mod bar {
+    struct BarStruct;
+}
+//- /foo.rs
+struct $0FooStruct;
+            "#,
+            r#"
+//- /main.rs
+mod foo;
+
+mod bar {
+    struct FooStruct;
+
+    struct BarStruct;
+}
+//- /foo.rs
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_rename_move_to_existing_nested_inline_module() {
+        todo!()
+    }
+
+    #[test]
+    fn test_rename_move_from_inline_module() {
+        todo!()
+    }
+
+    #[test]
+    fn test_rename_move_from_nested_inline_module() {
+        todo!()
+    }
 
     #[test]
     fn test_simple_move_to_existing_module() {

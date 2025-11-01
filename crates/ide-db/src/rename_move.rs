@@ -100,13 +100,14 @@ impl RenameMoveAdt {
 
         let src_mod_node = self.src_mod.definition_source(sema.db).value.node();
 
-        if std::env::var("SS") == Ok("1".to_owned()) {
-            println!("{src_mod_node:#?}");
-        }
-
         let dst_mod_source = self.dst_mod.definition_source(sema.db);
         let dst_mod_node = dst_mod_source.value.node();
-        let dst_file_id = self.dst_mod.as_source_file_id(sema.db)?.file_id(sema.db);
+        let dst_file_id = dst_mod_source.file_id.file_id()?.file_id(sema.db);
+
+        if std::env::var("SS") == Ok("1".to_owned()) {
+            println!("{src_mod_node:#?}");
+            println!("{dst_mod_node:#?}");
+        }
 
         let adt_ast = adt_source.value;
         let impl_asts = self
@@ -121,9 +122,17 @@ impl RenameMoveAdt {
         builder.apply_file_edits(src_file_id, &src_mod_node, |editor| {
             let ranges = chain![[adt_ast.syntax()], impl_asts.iter().map(ast::Impl::syntax)]
                 .map(|node| SyntaxElement::from(node.clone()).element_range_with_ws());
-            merge_element_ranges(ranges)
-                .into_iter()
-                .for_each(|range| editor.replace_all(range, vec![tokens::blank_line().into()]));
+
+            merge_element_ranges(ranges).into_iter().for_each(|range| {
+                let replacement = if range.start().prev_sibling_or_token().is_some()
+                    && range.end().next_sibling_or_token().is_some()
+                {
+                    vec![tokens::blank_line().into()]
+                } else {
+                    vec![]
+                };
+                editor.replace_all(range, replacement);
+            });
         });
 
         // Add items to target
@@ -191,10 +200,14 @@ impl TargetModInsert {
                 return None;
             }
         };
+        
+        dbg!(&mod_syntax);
+        dbg!(Position::first_child_of(mod_syntax));
 
         let mut mod_items = mod_items.into_iter().flatten().peekable();
         let last_header_item = mod_items
             .peeking_take_while(|item| {
+                dbg!(&item);
                 matches!(
                     item,
                     ast::Item::Use(_)
@@ -225,6 +238,7 @@ impl TargetModInsert {
     }
 }
 
+// TODO: Use new whitespace methods
 fn adj_blanklines(direction: Direction, node: &SyntaxNode) -> impl Iterator<Item = SyntaxToken> {
     node.siblings_with_tokens(direction).skip(1).map_while(|item| {
         let t = item.into_token()?;

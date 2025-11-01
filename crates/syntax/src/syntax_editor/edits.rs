@@ -128,6 +128,21 @@ impl ast::AssocItemList {
     }
 }
 
+impl ast::ItemList {
+    
+    // RENTRY: Impl this for inline and file mod inserts
+    pub fn add_item_after_headers(&self, editor: &mut SyntaxEditor, items: Vec<ast::Item>) {
+        
+    }
+}
+
+impl ast::SourceFile {
+    
+    pub fn add_item_after_headers(&self, editor: &mut SyntaxEditor, items: Vec<ast::Item>) {
+    }
+    
+}
+
 impl ast::VariantList {
     pub fn add_variant(&self, editor: &mut SyntaxEditor, variant: &ast::Variant) {
         let make = SyntaxFactory::without_mappings();
