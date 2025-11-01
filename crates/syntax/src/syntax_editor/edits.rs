@@ -1,10 +1,14 @@
 //! Structural editing for ast using `SyntaxEditor`
 
+use itertools::{Itertools, chain};
+
 use crate::{
     AstToken, Direction, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, T,
     algo::neighbor,
     ast::{
-        self, AstNode, Fn, GenericParam, HasGenericParams, HasName, edit::IndentLevel, make,
+        self, AstNode, Fn, GenericParam, HasGenericParams, HasModuleItem, HasName,
+        edit::{AstNodeEdit, IndentLevel},
+        make::{self, tokens},
         syntax_factory::SyntaxFactory,
     },
     syntax_editor::{Position, SyntaxEditor},
@@ -128,19 +132,110 @@ impl ast::AssocItemList {
     }
 }
 
-impl ast::ItemList {
-    
+impl ast::Module {
     // RENTRY: Impl this for inline and file mod inserts
-    pub fn add_item_after_headers(&self, editor: &mut SyntaxEditor, items: Vec<ast::Item>) {
-        
+    // TODO: Merge with SourceFile version
+    pub fn add_item_after_headers(
+        &self,
+        editor: &mut SyntaxEditor,
+        items: impl IntoIterator<Item = ast::Item>,
+    ) {
+        let mut list_items = self.item_list().into_iter().flat_map(|il| il.items()).peekable();
+        let last_header = list_items
+            .peeking_take_while(|item| {
+                matches!(
+                    item,
+                    ast::Item::Use(_)
+                        | ast::Item::Const(_)
+                        | ast::Item::ExternBlock(_)
+                        | ast::Item::ExternCrate(_)
+                        | ast::Item::Static(_)
+                )
+            })
+            .last();
+        let first_body = list_items.next();
+
+        let (indent, position) = match &last_header {
+            Some(last_header) => (
+                IndentLevel::from_node(last_header.syntax()),
+                Position::after(last_header.syntax()),
+            ),
+            None => match self.item_list().and_then(|il| il.l_curly_token()) {
+                Some(l_curly) => {
+                    // TODO: Remove in favor of always-run normalize_ws_at_insertion_position or something
+                    normalize_ws_between_braces(editor, self.syntax());
+                    (IndentLevel::from_token(&l_curly) + 1, Position::after(&l_curly))
+                }
+                None => (IndentLevel::single(), Position::first_child_of(self.syntax())),
+            },
+        };
+
+        let prefix_ws = if last_header.is_some() { "\n\n" } else { "\n" };
+        // TODO: When you fix normalization, you'll want a blankline here
+        let postfix_ws = if first_body.is_some() { "\n" } else { "" };
+
+        let elements = chain![
+            tokens::whitespace_indent(prefix_ws, indent).map(Into::into),
+            Itertools::intersperse_with(
+                items.into_iter().map(|i| i.reset_indent().indent(indent).syntax().clone().into()),
+                || { tokens::whitespace(&format!("\n\n{indent}")).into() }
+            ),
+            tokens::whitespace_indent(postfix_ws, IndentLevel(0)).map(Into::into),
+        ]
+        .collect();
+
+        editor.insert_all(position, elements);
     }
 }
 
 impl ast::SourceFile {
-    
-    pub fn add_item_after_headers(&self, editor: &mut SyntaxEditor, items: Vec<ast::Item>) {
+    pub fn add_item_after_headers(
+        &self,
+        editor: &mut SyntaxEditor,
+        items: impl IntoIterator<Item = ast::Item>,
+    ) {
+        let mut list_items = self.items().peekable();
+        let last_header = list_items
+            .peeking_take_while(|item| {
+                matches!(
+                    item,
+                    ast::Item::Use(_)
+                        | ast::Item::Const(_)
+                        | ast::Item::ExternBlock(_)
+                        | ast::Item::ExternCrate(_)
+                        | ast::Item::Static(_)
+                )
+            })
+            .last();
+        let first_body = list_items.next();
+        
+        dbg!(&last_header);
+        dbg!(&first_body);
+
+        let (indent, position) = match &last_header {
+            Some(last_header) => (
+                IndentLevel::from_node(last_header.syntax()),
+                Position::after(last_header.syntax()),
+            ),
+            None => (IndentLevel::from(0), Position::first_child_of(self.syntax())),
+        };
+
+        let prefix_ws = if last_header.is_some() { "\n\n" } else { "" };
+        let postfix_ws = if first_body.is_some() { "\n\n" } else { "" };
+
+        let elements = chain![
+            tokens::whitespace_indent(prefix_ws, indent).map(Into::into),
+            Itertools::intersperse_with(
+                items.into_iter().map(|i| i.reset_indent().indent(indent).syntax().clone().into()),
+                || { tokens::whitespace(&format!("\n\n{indent}")).into() }
+            ),
+            tokens::whitespace_indent(postfix_ws, IndentLevel(0)).map(Into::into), // TODO: Clean up
+        ]
+        .collect();
+
+        // REENTRY: Fix whitespace issue by introducing better whitespace normalization fns
+        editor.insert_all(position, elements);
     }
-    
 }
 
 impl ast::VariantList {

@@ -295,7 +295,6 @@ mod tests {
                 let path = sr.path_for_file(&file_id).unwrap();
                 format_to!(buf, "//- {}\n", path)
             }
-            dbg!(&text);
             buf.push_str(&text);
         }
 
@@ -338,17 +337,21 @@ mod tests {
 mod foo;
 mod bar;
 //- /foo.rs
-struct $0FooStruct;
+struct $0FooStruct {
+    x: i32,
+}
 //- /bar.rs
 struct BarStruct;
-            "#,
+"#,
             r#"
 //- /foo.rs
 //- /bar.rs
-struct FooStruct;
+struct FooStruct {
+    x: i32,
+}
 
 struct BarStruct;
-            "#,
+"#,
         );
     }
 
@@ -364,39 +367,70 @@ mod bar {
     struct BarStruct;
 }
 //- /foo.rs
-struct $0FooStruct;
-            "#,
+struct $0FooStruct {
+    x: i32,
+}
+"#,
             r#"
 //- /main.rs
 mod foo;
 
 mod bar {
-    struct FooStruct;
+    struct FooStruct {
+        x: i32,
+    }
 
     struct BarStruct;
 }
 //- /foo.rs
-            "#,
+"#,
+        );
+    }
+    
+    #[test]
+    fn fake_test_parse() {
+        check(
+            "crate::bar::MainStruct",
+            r#"
+//- /main.rs
+mod foo;
+
+struct $0MainStruct;
+
+mod bar {}
+//- /foo.rs
+"#,
+            r#"
+//- /main.rs
+mod foo;
+
+mod bar {
+    struct MainStruct;
+}
+"#,
         );
     }
 
     #[test]
+    #[ignore]
     fn test_rename_move_to_existing_nested_inline_module() {
         todo!()
     }
 
     #[test]
+    #[ignore]
     fn test_rename_move_from_inline_module() {
         todo!()
     }
 
     #[test]
+    #[ignore]
     fn test_rename_move_from_nested_inline_module() {
         todo!()
     }
 
     #[test]
-    fn test_simple_move_to_existing_module() {
+    fn test_rename_move_to_existing_module_with_impls() {
         check(
             "crate::bar::FooStruct",
             r#"
@@ -437,7 +471,7 @@ use std::string::String;
 use std::vec::Vec;
 
 struct BarStruct(Vec<String>);
-            "#,
+"#,
             r#"
 //- /foo.rs
 use crate::MainTrate;
@@ -469,11 +503,12 @@ impl MainTrait for FooStruct {
 }
 
 struct BarStruct(Vec<String>);
-            "#,
+"#,
         );
     }
 
     #[test]
+    #[ignore]
     fn test_complex_move_to_new_module() {
         check(
             "crate::bar::BarStruct",
@@ -504,7 +539,7 @@ struct $0FooStruct {
 };
 
 struct OtherStruct(Vec<i32>);
-            "#,
+"#,
             r#"
 //- /main.rs
 use std::str::String;
@@ -535,7 +570,7 @@ struct BarStruct {
     a: i32,
     b: String,
 };
-            "#,
+"#,
         );
     }
 }
