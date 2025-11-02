@@ -564,6 +564,15 @@ impl Module {
         children.into_iter()
     }
 
+    /// Finds a child module with the given name.
+    pub fn child(self, db: &dyn HirDatabase, name: &Name) -> Option<Module> {
+        let def_map = self.id.def_map(db);
+        def_map[self.id.local_id]
+            .children
+            .get(name)
+            .map(|module_id| Module { id: def_map.module_id(*module_id) })
+    }
+
     /// Finds a parent module.
     pub fn parent(self, db: &dyn HirDatabase) -> Option<Module> {
         let def_map = self.id.def_map(db);
@@ -590,6 +599,7 @@ impl Module {
         res
     }
 
+    // TODO: Delete if unused
     pub fn canonical_path(&self, db: &dyn HirDatabase, edition: Edition) -> Option<String> {
         let segments: Vec<_> =
             self.path_to_root(db).into_iter().flat_map(|m| m.name(db)).rev().collect();
@@ -629,6 +639,27 @@ impl Module {
             .resolver(db)
             .resolve_module_path_in_items(db, &ModPath::from_segments(PathKind::Plain, segments));
         Some(items.iter_items().map(|(item, _)| item.into()))
+    }
+
+    // TODO: Delete if unused
+    pub fn resolve_mod_path_ignore_vis(
+        &self,
+        db: &dyn HirDatabase,
+        segments: impl IntoIterator<Item = Name>,
+    ) -> Option<impl Iterator<Item = ItemInNs>> {
+        let mut segments = segments.into_iter();
+        let mut res_path = Vec::new();
+        let mut cur_mod = *self;
+        while let Some(segment) = segments.next() {
+            let next_item = cur_mod.resolve_mod_path(db, [segment])?.exactly_one().ok()?;
+            res_path.push(next_item);
+            cur_mod = match next_item.into_module_def() {
+                ModuleDef::Module(next_mod) => next_mod,
+                _ if segments.next().is_some() => return None,
+                _ => break,
+            };
+        }
+        Some(res_path.into_iter())
     }
 
     /// Fills `acc` with the module's diagnostics.
