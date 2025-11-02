@@ -68,6 +68,10 @@ impl ModPath {
         &self.segments
     }
 
+    pub fn into_segments(self) -> impl Iterator<Item = Name> {
+        self.segments.into_iter()
+    }
+
     pub fn push_segment(&mut self, segment: Name) {
         self.segments.push(segment);
     }

@@ -1,6 +1,5 @@
 use hir::ModPath;
 use hir::Module;
-use hir::ModuleDef;
 use hir::Semantics;
 use hir::db::ExpandDatabase;
 use ide_db::defs::Definition;
@@ -142,7 +141,7 @@ pub(crate) fn rename_move(
                 let new_name = new_path
                     .pop_segment()
                     .ok_or_else(|| format_err!("Invalid ADT rename-move target"))?;
-                let dst_mod = get_or_create_mod(&sema, &new_path, source_mod)
+                let dst_mod = get_or_create_mod(&sema, source_mod, new_path)
                     .ok_or_else(|| format_err!("Invalid destination module"))?;
                 (new_name, dst_mod)
             };
@@ -159,27 +158,17 @@ pub(crate) fn rename_move(
 
 fn get_or_create_mod(
     sema: &Semantics<'_, RootDatabase>,
-    mod_path: &ModPath,
     anchor_mod: Module,
+    mod_path: ModPath,
 ) -> Option<Module> {
-    let root_mod = match mod_path.kind {
-        hir::PathKind::Crate => anchor_mod.crate_root(sema.db),
-        hir::PathKind::Super(n) => (0..n).fold(anchor_mod, |m, _| m.parent(sema.db).unwrap()),
-        _ => {
-            // TODO: Add error messages for unsupported path types
-            return None;
-        }
-    };
+    let ResolvedModPath { mut resolved, unresolved } =
+        ResolvedModPath::new(sema.db, anchor_mod, mod_path)?;
 
-    // TODO: Support creating non-existent module
+    if unresolved.is_empty() {
+        return resolved.pop();
+    }
 
-    root_mod
-        .resolve_mod_path(sema.db, mod_path.segments().iter().cloned())?
-        .filter_map(|item| match item.into_module_def() {
-            ModuleDef::Module(module) => Some(module),
-            _ => None,
-        })
-        .last()
+    todo!("Support non-existing modules");
 }
 
 // TODO: Use alog::least_common_ancestor
@@ -228,6 +217,42 @@ fn parse_mod_path(
     })
 }
 
+// TODO: Add visibility
+#[derive(Default, Debug)]
+struct ResolvedModPath {
+    resolved: Vec<Module>,
+    unresolved: Vec<hir::Name>,
+}
+
+impl ResolvedModPath {
+    fn new(db: &RootDatabase, anchor_mod: Module, mod_path: ModPath) -> Option<Self> {
+        let mut cur_mod = match mod_path.kind {
+            hir::PathKind::Crate => anchor_mod.crate_root(db),
+            hir::PathKind::Super(n) => (0..n).fold(anchor_mod, |m, _| m.parent(db).unwrap()),
+            _ => {
+                // TODO: Add error messages for unsupported path types
+                return None;
+            }
+        };
+
+        let mut segments = mod_path.into_segments();
+        let mut resolved = vec![cur_mod];
+        let mut unresolved = vec![];
+        while let Some(segment) = segments.next() {
+            if let Some(next_mod) = cur_mod.child(db, &segment) {
+                resolved.push(next_mod);
+                cur_mod = next_mod;
+            } else {
+                unresolved.push(segment);
+                unresolved.extend(segments);
+                break;
+            }
+        }
+
+        Some(Self { resolved, unresolved })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ide_db::{
@@ -235,7 +260,9 @@ mod tests {
         base_db::SourceDatabase,
         source_change::{FileSystemEdit, SourceChange},
     };
+    use span::Edition;
     use stdx::{format_to, trim_indent};
+    use syntax::SourceFile;
     use test_utils::assert_eq_text;
 
     use crate::{RenameConfig, fixture};
@@ -322,6 +349,23 @@ mod tests {
         assert_eq_text!(after, &buf);
     }
 
+    // TODO: Remove
+    #[test]
+    #[allow(clippy::dbg_macro)]
+    fn test_print_source_file() {
+        let sf = SourceFile::parse(
+            r#"
+mod {
+
+}
+"#,
+            Edition::LATEST,
+        )
+        .tree();
+
+        dbg!(sf);
+    }
+
     // TODO: Test coverage to add
     // - Regular & trait impl block tests
     //   - Trait impls in same file are moved
@@ -341,16 +385,24 @@ struct $0FooStruct {
     x: i32,
 }
 //- /bar.rs
-struct BarStruct;
+use std::string::String;
+
+pub const BAR_CONST: usize = 0;
+
+struct BarStruct(String);
 "#,
             r#"
 //- /foo.rs
 //- /bar.rs
+use std::string::String;
+
+pub const BAR_CONST: usize = 0;
+
 struct FooStruct {
     x: i32,
 }
 
-struct BarStruct;
+struct BarStruct(String);
 "#,
         );
     }
@@ -364,7 +416,11 @@ struct BarStruct;
 mod foo;
 
 mod bar {
-    struct BarStruct;
+    use std::string::String;
+
+    pub const BAR_CONST: usize = 0;
+
+    struct BarStruct(String);
 }
 //- /foo.rs
 struct $0FooStruct {
@@ -376,57 +432,149 @@ struct $0FooStruct {
 mod foo;
 
 mod bar {
+    use std::string::String;
+
+    pub const BAR_CONST: usize = 0;
+
     struct FooStruct {
         x: i32,
     }
 
-    struct BarStruct;
+    struct BarStruct(String);
 }
 //- /foo.rs
 "#,
         );
     }
-    
+
     #[test]
-    fn fake_test_parse() {
+    fn test_rename_move_to_existing_nested_inline_module() {
         check(
-            "crate::bar::MainStruct",
+            "crate::bar::baz::FooStruct",
             r#"
 //- /main.rs
 mod foo;
 
-struct $0MainStruct;
+mod bar {
+    mod baz {
+        use std::string::String;
 
-mod bar {}
+        pub const BAR_CONST: usize = 0;
+
+        struct BarStruct(String);
+    }
+}
 //- /foo.rs
+struct $0FooStruct {
+    x: i32,
+}
 "#,
             r#"
 //- /main.rs
 mod foo;
 
 mod bar {
-    struct MainStruct;
+    mod baz {
+        use std::string::String;
+
+        pub const BAR_CONST: usize = 0;
+
+        struct FooStruct {
+            x: i32,
+        }
+
+        struct BarStruct(String);
+    }
 }
+//- /foo.rs
 "#,
         );
     }
 
     #[test]
-    #[ignore]
-    fn test_rename_move_to_existing_nested_inline_module() {
-        todo!()
-    }
-
-    #[test]
-    #[ignore]
+    // TODO: Fix whitespace issue after deletion
+    // TODO: Maybe auto-delete empty modules after move?
+    // - Or maybe only auto-delete empty inline modules?
     fn test_rename_move_from_inline_module() {
-        todo!()
+        check(
+            "crate::bar::FooStruct",
+            r#"
+//- /main.rs
+mod bar;
+
+mod foo {
+    struct $0FooStruct {
+        x: i32,
+    }
+}
+//- /bar.rs
+use std::string::String;
+
+pub const BAR_CONST: usize = 0;
+
+struct BarStruct(String);
+"#,
+            r#"
+//- /main.rs
+mod bar;
+
+mod foo {}
+//- /bar.rs
+use std::string::String;
+
+pub const BAR_CONST: usize = 0;
+
+struct FooStruct {
+    x: i32,
+}
+
+struct BarStruct(String);
+"#,
+        );
     }
 
     #[test]
-    #[ignore]
+    // TODO: Fix whitespace issue
     fn test_rename_move_from_nested_inline_module() {
-        todo!()
+        check(
+            "crate::bar::FooStruct",
+            r#"
+//- /main.rs
+mod bar;
+
+mod foo {
+    mod fizz {
+        struct $0FooStruct {
+            x: i32,
+        }
+    }
+}
+//- /bar.rs
+use std::string::String;
+
+pub const BAR_CONST: usize = 0;
+
+struct BarStruct(String);
+"#,
+            r#"
+//- /main.rs
+mod bar;
+
+mod foo {
+    mod fizz {}
+}
+//- /bar.rs
+use std::string::String;
+
+pub const BAR_CONST: usize = 0;
+
+struct FooStruct {
+    x: i32,
+}
+
+struct BarStruct(String);
+"#,
+        );
     }
 
     #[test]

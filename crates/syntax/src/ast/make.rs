@@ -1404,7 +1404,11 @@ pub mod tokens {
         sf.syntax().clone_for_update().first_child_or_token().unwrap().into_token().unwrap()
     }
 
-    pub fn whitespace_indent(text: &str, indent: IndentLevel) -> Option<SyntaxToken> {
+    pub fn whitespace_indent(text: &str, indent: IndentLevel) -> SyntaxToken {
+        whitespace_indent_opt(text, indent).unwrap()
+    }
+
+    pub fn whitespace_indent_opt(text: &str, indent: IndentLevel) -> Option<SyntaxToken> {
         let text = format!("{text}{indent}");
         text.is_empty().not().then(|| whitespace(&text))
     }

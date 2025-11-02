@@ -79,39 +79,56 @@ impl SyntaxTreeBuilder {
 }
 
 pub trait SyntaxElementExt {
-    fn neighbor(&self, direction: Direction) -> Option<SyntaxElement>;
-
-    fn ws_neighbors(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement>;
-
     fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement>;
 
-    fn element_range_with_ws(&self) -> RangeInclusive<SyntaxElement>;
-}
-
-impl SyntaxElementExt for SyntaxElement {
     fn neighbor(&self, direction: Direction) -> Option<SyntaxElement> {
-        match direction {
-            Direction::Next => self.next_sibling_or_token(),
-            Direction::Prev => self.prev_sibling_or_token(),
-        }
+        self.siblings_with_tokens(direction).next()
     }
 
+    fn neighbor_ws(&self, direction: Direction) -> Option<SyntaxElement> {
+        self.siblings_with_tokens(direction)
+            .skip(1)
+            .take_while(|s| s.as_token().is_some_and(|t| t.kind().is_whitespace()))
+            .next()
+    }
+
+    fn range_with_neighboring_ws(&self) -> RangeInclusive<SyntaxElement>
+    where
+        Self: Clone + Into<SyntaxElement>,
+    {
+        let start =
+            self.ws_neighbors(Direction::Prev).last().unwrap_or_else(|| self.clone().into());
+        let end = self.ws_neighbors(Direction::Next).last().unwrap_or_else(|| self.clone().into());
+        start..=end
+    }
+
+    // TODO: Delete in favor of neighbor_ws
+    // It appears as if the parser collapses all whitespace tokens into a single element,
+    // so there will never be more than a single neighbor ws element.
     fn ws_neighbors(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> {
         self.siblings_with_tokens(direction)
             .skip(1)
             .take_while(|s| s.as_token().is_some_and(|t| t.kind().is_whitespace()))
     }
+}
 
+impl SyntaxElementExt for SyntaxElement {
     fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> {
         match self {
             NodeOrToken::Node(node) => Either::Left(node.siblings_with_tokens(direction)),
             NodeOrToken::Token(token) => Either::Right(token.siblings_with_tokens(direction)),
         }
     }
+}
 
-    fn element_range_with_ws(&self) -> RangeInclusive<SyntaxElement> {
-        let start = self.ws_neighbors(Direction::Prev).last().unwrap_or_else(|| self.clone());
-        let end = self.ws_neighbors(Direction::Next).last().unwrap_or_else(|| self.clone());
-        start..=end
+impl SyntaxElementExt for SyntaxNode {
+    fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> {
+        self.siblings_with_tokens(direction)
+    }
+}
+
+impl SyntaxElementExt for SyntaxToken {
+    fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement> {
+        self.siblings_with_tokens(direction)
     }
 }
