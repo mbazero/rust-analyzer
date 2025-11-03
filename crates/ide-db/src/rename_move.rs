@@ -111,7 +111,10 @@ impl RenameMoveAdt {
                 editor.replace_all(range, replacement);
             });
         });
+        
+        // TODO: Update internal references
 
+        // Move items to target
         let items = chain![[adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
         match dst_mod_source.value {
             ModuleSource::SourceFile(source_file) => {
@@ -129,6 +132,23 @@ impl RenameMoveAdt {
                 return None;
             }
         }
+        
+        // Update definition usages
+        let def = Definition::Adt(self.adt);
+        let usages = def.usages(sema).all();
+        for (file_id, refs) in usages.iter() {
+            // Special case to update refs in origin module
+            // - Add imports if there are any uncovered refs in the module (scope?)
+            // - Update names as normal
+            
+            // Unqualified name ref update
+            // - Just swap out the name for the ident
+            
+            // Qualified name ref update
+            // - Merge the paths somehow
+            dbg!(file_id, refs);
+        }
+        
 
         Some(builder.finish())
     }

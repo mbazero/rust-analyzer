@@ -95,6 +95,7 @@ pub(crate) type Result<T> = crate::rename::RenameResult<T>;
 // - Handle inline module origins
 //   - Need to unindent
 // - Actually, do need to handle multiple defintions since the def could be annotated by a proc macro which creates some additional defs, maybe
+// - Test that illegal idents and mod paths are disallowed
 //
 // Misc:
 // - Once a functional implementation is complete, see how much functionality can be merged with:
@@ -103,6 +104,10 @@ pub(crate) type Result<T> = crate::rename::RenameResult<T>;
 //   - move_mod_to_file.rs
 // - extract_module and move_mod_to_file are both special cases of rename_move
 //   - These should be updated to call into rename_move utils
+// - Ensure that associated functions, consts, static, cannot be moved
+//      - Maybe just check that parent is a module?
+// - Ensure that struct embedded within a function cannot be moved
+//      - Maybe just check that the parent is a module?
 
 pub(crate) fn rename_move(
     db: &RootDatabase,
@@ -352,11 +357,15 @@ mod tests {
     // TODO: Remove
     #[test]
     #[allow(clippy::dbg_macro)]
-    fn test_print_source_file() {
+    fn test_sandbox() {
         let sf = SourceFile::parse(
             r#"
 mod {
-
+    struct Hello;
+    
+    // Comment
+    
+    struct World;
 }
 "#,
             Edition::LATEST,
@@ -366,12 +375,191 @@ mod {
         dbg!(sf);
     }
 
+    // TODO: Conflict detection in usage file
+
+    #[test]
+    fn test_rename_move_simple_usage_updates() {
+        check(
+            "crate::fizz::FizzStruct",
+            r#"
+//- /main.rs
+mod foo {
+    pub(crate) struct $0FooStruct;
+    pub(crate) struct FooOtherStruct;
+}
+
+mod fizz {}
+
+mod bar {
+    use crate::foo::FooStruct;
+    fn use_foo(f: FooStruct) -> FooStruct { f }
+}
+
+mod beta {
+    use crate::foo::{FooStruct, FooOtherStruct};
+    fn use_foo(f: (FooStruct, FooOtherStruct)) -> (FooStruct, FooOtherStruct) { f }
+}
+
+mod gamma {
+    use super::foo::FooStruct;
+    fn use_foo(f: FooStruct) -> FooStruct { f }
+}
+
+mod delta {
+    use super::foo::{FooStruct, FooOtherStruct};
+    fn use_foo(f: (FooStruct, FooOtherStruct)) -> (FooStruct, FooOtherStruct) { f }
+}
+
+mod episilon {
+    fn use_foo(f: crate::foo::FooStruct) -> super::foo::FooStruct { f }
+}
+"#,
+            r#"
+//- /main.rs
+mod foo {
+    pub(crate) struct FooOtherStruct;
+}
+
+mod fizz {
+    pub(crate) struct $0FizzStruct;
+}
+
+mod bar {
+    use crate::fizz::FizzStruct;
+    fn use_foo(f: FizzStruct) -> FizzStruct { f }
+}
+
+mod beta {
+    use crate::foo::FizzOtherStruct;
+    use crate::fizz::FizzStruct;
+    fn use_foo(f: (FizzStruct, FooOtherStruct)) -> (FizzStruct, FooOtherStruct) { f }
+}
+
+mod gamma {
+    use super::fizz::FizzStruct;
+    fn use_foo(f: FizzStruct) -> FizzStruct { f }
+}
+
+mod delta {
+    use super::foo::FizzOtherStruct;
+    use super::fizz::FizzStruct;
+    fn use_foo(f: (FizzStruct, FooOtherStruct)) -> (FizzStruct, FooOtherStruct) { f }
+}
+
+mod episilon {
+    fn use_foo(f: crate::fizz::FizzStruct) -> super::fizz::FizzStruct { f }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_rename_move_struct_update_refs() {
+        check(
+            "crate::fizz::FizzStruct",
+            r#"
+//- /main.rs
+mod foo;
+mod fizz;
+mod bar;
+mod baz;
+//- /foo.rs
+pub(crate) const FIZZ_CONST: usize = 0;
+
+pub(crate) struct $0FooStruct;
+
+fn use_foo(f: FooStruct) -> FooStruct {
+    f
+}
+//- /fizz.rs
+use crate::foo::FooStruct;
+
+pub(crate) enum FizzEnum {
+    A(FooStruct)
+}
+//- /bar.rs
+use crate::foo::FooStruct;
+
+fn use_foo(f: FooStruct) -> FooStruct {
+    f
+}
+
+mod inner_rel {
+    use super::FooStruct;
+    use crate::foo::FOO_CONST;
+
+    fn use_foo_inner(f: FooStruct) -> (FooStruct, usize) {
+        (f, FOO_CONST)
+    }
+}
+
+mod inner_abs {
+    use crate::foo::{FooStruct, FOO_CONST};
+
+    fn use_foo_inner(f: FooStruct) -> (FooStruct, usize) {
+        (f, FOO_CONST)
+    }
+}
+//- /baz.rs
+fn use_foo_qualfied(f: crate::foo::FooStruct) -> crate::foo::FooStruct {
+    f
+}
+"#,
+            r#"
+//- /foo.rs
+use crate::fizz::FizzStruct;
+
+pub(crate) const FIZZ_CONST: usize = 0;
+
+fn use_foo(f: FizzStruct) -> FizzStruct {
+    f
+}
+//- /fizz.rs
+pub(crate) struct FizzStruct;
+
+pub(crate) enum FizzEnum {
+    A(FizzStruct)
+}
+//- /bar.rs
+use crate::fizz::FizzStruct;
+
+fn use_foo(f: FizzStruct) -> FizzStruct {
+    f
+}
+
+mod inner_rel {
+    use super::FizzStruct;
+    use crate::foo::FOO_CONST;
+
+    fn use_foo_inner(f: FizzStruct) -> (FizzStruct, usize) {
+        (f, FOO_CONST)
+    }
+}
+
+mod inner_abs {
+    use crate::foo::FOO_CONST;
+    use crate::fizz::FizzStruct;
+
+    fn use_foo_inner(f: FizzStruct) -> (FizzStruct, usize) {
+        (f, FOO_CONST)
+    }
+}
+//- /baz.rs
+fn use_foo_qualfied(f: crate::fizz::FizzStruct) -> crate::fizz::FizzStruct {
+    f
+}
+"#,
+        );
+    }
+
     // TODO: Test coverage to add
     // - Regular & trait impl block tests
     //   - Trait impls in same file are moved
     //   - Multiple trait impls in same file are moved
     //   - Trait impls in same file but inline module aren't moved
 
+    // TODO: Support multiple inputs defining the same rename
+    // - E.g. super based stuff
     #[test]
     fn test_rename_move_to_existing_module() {
         check(
