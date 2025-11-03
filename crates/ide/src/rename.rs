@@ -790,6 +790,9 @@ fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: String) -> O
     Some(TextEdit::replace(self_param.syntax().text_range(), replacement_text))
 }
 
+// TODO:
+// - Convert all mod tests to use multi-file assertions
+// - Update any applicable tests to both normal rename and rename-move forms
 #[cfg(test)]
 pub(crate) mod tests {
     use expect_test::{Expect, expect};

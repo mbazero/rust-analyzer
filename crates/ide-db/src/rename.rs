@@ -28,7 +28,7 @@ use crate::{
 };
 use base_db::AnchoredPathBuf;
 use either::Either;
-use hir::{FieldSource, FileRange, InFile, ModuleSource, Name, Semantics, sym};
+use hir::{FieldSource, FileRange, InFile, ModPath, ModuleSource, Name, Semantics, sym};
 use span::{Edition, FileId, SyntaxContext};
 use stdx::{TupleExt, never};
 use syntax::{

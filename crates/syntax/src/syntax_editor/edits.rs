@@ -140,9 +140,14 @@ impl ast::Module {
         editor: &mut SyntaxEditor,
         items: impl IntoIterator<Item = ast::Item>,
     ) {
-        let mut list_items = self.item_list().into_iter().flat_map(|il| il.items()).peekable();
-        let last_header = list_items
-            .peeking_take_while(|item| {
+        let l_curly = self.item_list().and_then(|il| il.l_curly_token()).map(SyntaxElement::from);
+        let r_curly = self.item_list().and_then(|il| il.r_curly_token()).map(SyntaxElement::from);
+
+        let last_header = self
+            .item_list()
+            .into_iter()
+            .flat_map(|il| il.items())
+            .take_while(|item| {
                 matches!(
                     item,
                     ast::Item::Use(_)
@@ -152,44 +157,55 @@ impl ast::Module {
                         | ast::Item::Static(_)
                 )
             })
-            .last();
-        let first_body = list_items.next();
+            .last()
+            .map(|i| SyntaxElement::from(i.syntax().clone()));
 
-        let (indent, position) = match &last_header {
-            Some(last_header) => {
-                if let Some(neighbor_ws) = last_header.syntax().neighbor_ws(Direction::Next) {
-                    editor.delete(neighbor_ws);
+        let first_body = last_header.as_ref().or(l_curly.as_ref()).and_then(|s| {
+            let first_non_ws = s.siblings_with_tokens(Direction::Next).skip(1).find(|x| {
+                if x.kind().is_whitespace() {
+                    editor.delete(x);
+                    false
+                } else {
+                    true
                 }
-                (
-                    IndentLevel::from_node(last_header.syntax()),
-                    Position::after(last_header.syntax()),
-                )
-            }
-            None => match self.item_list().and_then(|il| il.l_curly_token()) {
-                Some(l_curly) => {
-                    if let Some(neighbor_ws) = l_curly.neighbor_ws(Direction::Next) {
-                        editor.delete(neighbor_ws);
-                    }
-                    (IndentLevel::from_token(&l_curly) + 1, Position::after(&l_curly))
-                }
-                None => (IndentLevel::single(), Position::first_child_of(self.syntax())),
-            },
+            });
+            first_non_ws.filter(|x| Some(x) != r_curly.as_ref())
+        });
+
+        dbg!(&last_header, &first_body);
+
+        let (prefix_ws, body_indent, insert_pos) = if let Some(last_header) = &last_header {
+            ("\n\n", IndentLevel::from_element(last_header), Position::after(last_header))
+        } else if let Some(l_curly) = &l_curly {
+            ("\n", IndentLevel::from_element(l_curly) + 1, Position::after(l_curly))
+        } else {
+            ("\n", IndentLevel(0), Position::first_child_of(self.syntax()))
         };
 
-        let prefix_ws = if last_header.is_some() { "\n\n" } else { "\n" };
-        let postfix_ws = if first_body.is_some() { "\n\n" } else { "\n" };
+        let (postfix_ws, postfix_indent) = if let Some(first_body) = &first_body {
+            ("\n\n", IndentLevel::from_element(first_body))
+        } else if let Some(r_curly) = &r_curly {
+            ("\n", IndentLevel::from_element(r_curly))
+        } else {
+            ("\n", IndentLevel(0))
+        };
 
         let elements = chain![
-            tokens::whitespace_indent_opt(prefix_ws, indent).map(Into::into),
+            tokens::whitespace_indent_opt(prefix_ws, body_indent).map(Into::into),
             Itertools::intersperse_with(
-                items.into_iter().map(|i| i.reset_indent().indent(indent).syntax().clone().into()),
-                || { tokens::whitespace_indent("\n\n", indent).into() }
+                items.into_iter().map(|i| i
+                    .reset_indent()
+                    .indent(body_indent)
+                    .syntax()
+                    .clone()
+                    .into()),
+                || { tokens::whitespace_indent("\n\n", body_indent).into() }
             ),
-            tokens::whitespace_indent_opt(postfix_ws, indent).map(Into::into),
+            tokens::whitespace_indent_opt(postfix_ws, postfix_indent).map(Into::into),
         ]
         .collect();
 
-        editor.insert_all(position, elements);
+        editor.insert_all(insert_pos, elements);
     }
 }
 
