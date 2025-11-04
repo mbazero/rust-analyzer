@@ -1,9 +1,13 @@
+use crate::search::FileReference;
+use crate::search::FileReferenceNode;
 use crate::source_change::SourceChangeBuilder;
+use crate::syntax_helpers::node_ext::full_path_of_name_ref;
 use hir::HasSource;
 use hir::ModuleSource;
 use hir::{Module, Name, Semantics};
 use itertools::chain;
 use parser::T;
+use span::Edition;
 use syntax::AstNode;
 use syntax::SyntaxElement;
 use syntax::SyntaxElementExt;
@@ -49,6 +53,7 @@ impl RenameMoveAdt {
     }
 
     pub fn into_source_change(self, sema: &Semantics<'_, RootDatabase>) -> Option<SourceChange> {
+        let edition = self.src_mod.krate().edition(sema.db);
         let adt_source = self.adt.source(sema.db)?;
         let src_file_id = self.src_mod.as_source_file_id(sema.db)?.file_id(sema.db);
 
@@ -111,7 +116,7 @@ impl RenameMoveAdt {
                 editor.replace_all(range, replacement);
             });
         });
-        
+
         // TODO: Update internal references
 
         // Move items to target
@@ -132,7 +137,7 @@ impl RenameMoveAdt {
                 return None;
             }
         }
-        
+
         // Update definition usages
         let def = Definition::Adt(self.adt);
         let usages = def.usages(sema).all();
@@ -140,15 +145,34 @@ impl RenameMoveAdt {
             // Special case to update refs in origin module
             // - Add imports if there are any uncovered refs in the module (scope?)
             // - Update names as normal
-            
+
             // Unqualified name ref update
             // - Just swap out the name for the ident
-            
+
             // Qualified name ref update
             // - Merge the paths somehow
-            dbg!(file_id, refs);
+            let file_id = file_id.file_id(sema.db);
+
+            for FileReference { range, name, category } in refs {
+                match name {
+                    FileReferenceNode::Name(_) => {
+                        builder.replace(
+                            *range,
+                            format!("{}", self.new_name.display(sema.db, edition)),
+                        );
+                    }
+                    FileReferenceNode::NameRef(name_ref) => {
+                        // REENTRY
+                        let path = full_path_of_name_ref(name_ref);
+                        dbg!(path);
+                    }
+                    FileReferenceNode::Lifetime(_) | FileReferenceNode::FormatStringEntry(_, _) => {
+                        // TODO: Log something
+                        return None;
+                    }
+                }
+            }
         }
-        
 
         Some(builder.finish())
     }
