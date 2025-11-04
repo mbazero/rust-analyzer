@@ -362,9 +362,9 @@ mod tests {
             r#"
 mod {
     struct Hello;
-    
+
     // Comment
-    
+
     struct World;
 }
 "#,
@@ -382,7 +382,6 @@ mod {
         check(
             "crate::fizz::FizzStruct",
             r#"
-//- /main.rs
 mod foo {
     pub(crate) struct $0FooStruct;
     pub(crate) struct FooOtherStruct;
@@ -415,7 +414,6 @@ mod episilon {
 }
 "#,
             r#"
-//- /main.rs
 mod foo {
     pub(crate) struct FooOtherStruct;
 }
