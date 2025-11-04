@@ -125,7 +125,8 @@ pub(crate) fn rename_move(
     let syntax = source_file.syntax();
     let edition = file_id.edition(db);
 
-    let mut new_path = parse_move_target(new_path, &sema, edition)?;
+    let new_path_str = new_path;
+    let mut new_path = parse_move_target(new_path_str, &sema, edition)?;
     let new_name = new_path.segments().last().ok_or_else(|| format_err!("Invalid new path"))?;
 
     // TODO: Bail if definition target is defined within a macro
@@ -151,7 +152,7 @@ pub(crate) fn rename_move(
                 (new_name, dst_mod)
             };
 
-            RenameMoveAdt::new(&sema, adt, new_name, source_mod, dst_mod)
+            RenameMoveAdt::new(&sema, adt, new_name, source_mod, dst_mod, new_path_str)
                 .into_source_change(&sema)
                 .ok_or_else(|| format_err!("Failed to rename-move ADT"))?
         }
@@ -375,8 +376,43 @@ mod {
         dbg!(sf);
     }
 
-    // TODO: Conflict detection in usage file
+    // TODO: Fix spacing on use statements
+    #[test]
+    fn test_rename_move_simple_ref_update() {
+        check(
+            "crate::fizz::FizzStruct",
+            r#"
+mod foo {
+    pub(crate) struct $0FooStruct;
+}
 
+mod fizz {}
+
+mod bar {
+    use crate::foo::FooStruct;
+
+    fn use_foo(f: FooStruct) -> FooStruct { f }
+}
+"#,
+            r#"
+mod foo {}
+
+mod fizz {
+    pub(crate) struct FizzStruct;
+}
+
+mod bar {
+    use crate::fizz::FizzStruct;
+
+
+    fn use_foo(f: FizzStruct) -> FizzStruct { f }
+}
+"#,
+        );
+    }
+
+    // TODO: Conflict detection in usage file
+    // TODO: Fix spacing on use statements
     #[test]
     fn test_rename_move_simple_usage_updates() {
         check(
@@ -419,28 +455,30 @@ mod foo {
 }
 
 mod fizz {
-    pub(crate) struct $0FizzStruct;
+    pub(crate) struct FizzStruct;
 }
 
 mod bar {
     use crate::fizz::FizzStruct;
+
     fn use_foo(f: FizzStruct) -> FizzStruct { f }
 }
 
 mod beta {
-    use crate::foo::FizzOtherStruct;
-    use crate::fizz::FizzStruct;
+    use crate::{fizz::FizzStruct, foo::FooOtherStruct};
     fn use_foo(f: (FizzStruct, FooOtherStruct)) -> (FizzStruct, FooOtherStruct) { f }
 }
 
 mod gamma {
-    use super::fizz::FizzStruct;
+    use crate::fizz::FizzStruct;
+
     fn use_foo(f: FizzStruct) -> FizzStruct { f }
 }
 
 mod delta {
-    use super::foo::FizzOtherStruct;
-    use super::fizz::FizzStruct;
+    use crate::fizz::FizzStruct;
+
+    use super::foo::FooOtherStruct;
     fn use_foo(f: (FizzStruct, FooOtherStruct)) -> (FizzStruct, FooOtherStruct) { f }
 }
 

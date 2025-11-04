@@ -1,20 +1,29 @@
+use crate::imports::insert_use::ImportGranularity;
+use crate::imports::insert_use::ImportScope;
+use crate::imports::insert_use::InsertUseConfig;
+use crate::imports::insert_use::insert_use;
 use crate::search::FileReference;
 use crate::search::FileReferenceNode;
+use crate::search::ReferenceCategory;
 use crate::source_change::SourceChangeBuilder;
 use crate::syntax_helpers::node_ext::full_path_of_name_ref;
 use hir::HasSource;
 use hir::ModuleSource;
+use hir::PrefixKind;
 use hir::{Module, Name, Semantics};
 use itertools::chain;
 use parser::T;
-use span::Edition;
 use syntax::AstNode;
 use syntax::SyntaxElement;
 use syntax::SyntaxElementExt;
 use syntax::algo::merge_element_ranges;
 use syntax::ast;
+use syntax::ast::HasName;
+use syntax::ast::PathSegmentKind;
 use syntax::ast::edit::IndentLevel;
+use syntax::ast::make::path_from_text_with_edition;
 use syntax::ast::make::tokens;
+use syntax::ted;
 
 use crate::{RootDatabase, defs::Definition, source_change::SourceChange};
 
@@ -29,6 +38,7 @@ pub struct RenameMoveAdt {
     src_mod: Module,
     // Destination module to move to.
     dst_mod: Module,
+    dst_path: String, // HACK!
 }
 
 impl RenameMoveAdt {
@@ -38,6 +48,7 @@ impl RenameMoveAdt {
         new_name: Name,
         src_mod: Module,
         dst_mod: Module,
+        dst_path: &str, // HACK: Fix this
     ) -> Self {
         // TODO:
         // - Do we need to sort by syntax start range, or does all_in_module already return in that order?
@@ -49,7 +60,14 @@ impl RenameMoveAdt {
                     && imp.source(sema.db).is_some_and(|src| !src.file_id.is_macro())
             })
             .collect();
-        Self { adt, impls_to_move: impls, new_name, src_mod, dst_mod }
+        Self {
+            adt,
+            impls_to_move: impls,
+            new_name,
+            src_mod,
+            dst_mod,
+            dst_path: dst_path.to_owned(),
+        }
     }
 
     pub fn into_source_change(self, sema: &Semantics<'_, RootDatabase>) -> Option<SourceChange> {
@@ -71,6 +89,17 @@ impl RenameMoveAdt {
         }
 
         let adt_ast = adt_source.value;
+        // TODO: Rename with SyntaxEditor
+        let renamed_adt_ast = {
+            let clone = adt_ast.clone_for_update();
+            if let Some(name) = clone.name() {
+                let replacement =
+                    syntax::ast::make::name(&self.new_name.display(sema.db, edition).to_string())
+                        .clone_for_update();
+                ted::replace(name.syntax(), replacement.syntax());
+            }
+            clone
+        };
         let impl_asts = self
             .impls_to_move
             .into_iter()
@@ -120,7 +149,7 @@ impl RenameMoveAdt {
         // TODO: Update internal references
 
         // Move items to target
-        let items = chain![[adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
+        let items = chain![[renamed_adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
         match dst_mod_source.value {
             ModuleSource::SourceFile(source_file) => {
                 builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
@@ -152,8 +181,8 @@ impl RenameMoveAdt {
             // Qualified name ref update
             // - Merge the paths somehow
             let file_id = file_id.file_id(sema.db);
-
             for FileReference { range, name, category } in refs {
+                builder.edit_file(file_id);
                 match name {
                     FileReferenceNode::Name(_) => {
                         builder.replace(
@@ -162,9 +191,101 @@ impl RenameMoveAdt {
                         );
                     }
                     FileReferenceNode::NameRef(name_ref) => {
-                        // REENTRY
                         let path = full_path_of_name_ref(name_ref);
-                        dbg!(path);
+                        let import_scope =
+                            ImportScope::find_insert_use_container(name_ref.syntax(), sema);
+
+                        // TODO: If the import is non-tree normal import, maybe just replace the full path in the path case
+                        if category.contains(ReferenceCategory::IMPORT) {
+                            if let Some(import_scope) = import_scope {
+                                let import_scope = builder.make_import_scope_mut(import_scope);
+
+                                if let Some(leaf_use_tree) =
+                                    name_ref.syntax().ancestors().find_map(ast::UseTree::cast)
+                                {
+                                    let leaf_use_tree = builder.make_mut(leaf_use_tree);
+                                    leaf_use_tree.remove_recursive();
+                                }
+
+                                let cfg = InsertUseConfig {
+                                    granularity: ImportGranularity::Crate, // or Module/Item/One
+                                    enforce_granularity: false, // infer style from existing file when false
+                                    prefix_kind: PrefixKind::ByCrate, // ByCrate | BySelf | Plain
+                                    group: true, // group into std/external/local blocks
+                                    skip_glob_imports: false, // allow merging into `*` imports
+                                };
+                                let path = path_from_text_with_edition(&self.dst_path, edition)
+                                    .clone_for_update();
+                                insert_use(&import_scope, path, &cfg);
+                            }
+                        } else if let Some(path) = path {
+                            if path.qualifier().is_some() {
+                                let mut segments = Vec::new();
+                                let mut current = Some(path.clone());
+                                while let Some(p) = current {
+                                    if let Some(segment) = p.segment() {
+                                        segments.push(segment);
+                                    }
+                                    current = p.qualifier();
+                                }
+                                segments.reverse();
+
+                                let dst_module_name = self
+                                    .dst_mod
+                                    .name(sema.db)
+                                    .map(|name| name.display(sema.db, edition).to_string());
+                                let old_type_name =
+                                    self.adt.name(sema.db).display(sema.db, edition).to_string();
+                                let new_type_name =
+                                    self.new_name.display(sema.db, edition).to_string();
+
+                                let mut new_segments = Vec::with_capacity(segments.len());
+                                for segment in &segments {
+                                    let segment_text = match segment.kind() {
+                                        Some(PathSegmentKind::CrateKw) => "crate".to_string(),
+                                        Some(PathSegmentKind::SuperKw) => "super".to_string(),
+                                        Some(PathSegmentKind::SelfKw) => "self".to_string(),
+                                        Some(PathSegmentKind::SelfTypeKw) => "Self".to_string(),
+                                        Some(PathSegmentKind::Name(name_ref)) => {
+                                            let mut text = name_ref.text().to_string();
+                                            if text == old_type_name {
+                                                text = new_type_name.clone();
+                                            }
+                                            text
+                                        }
+                                        _ => segment.syntax().to_string(),
+                                    };
+                                    new_segments.push(segment_text);
+                                }
+
+                                if let Some(dst_module_name) = dst_module_name {
+                                    if new_segments.len() >= 2 {
+                                        for idx in (0..new_segments.len() - 1).rev() {
+                                            if matches!(
+                                                segments[idx].kind(),
+                                                Some(PathSegmentKind::Name(_))
+                                            ) {
+                                                new_segments[idx] = dst_module_name.clone();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let new_text = new_segments.join("::");
+                                builder.replace(path.syntax().text_range(), new_text);
+                            } else {
+                                builder.replace(
+                                    *range,
+                                    format!("{}", self.new_name.display(sema.db, edition)),
+                                );
+                            }
+                        } else {
+                            builder.replace(
+                                *range,
+                                format!("{}", self.new_name.display(sema.db, edition)),
+                            );
+                        }
                     }
                     FileReferenceNode::Lifetime(_) | FileReferenceNode::FormatStringEntry(_, _) => {
                         // TODO: Log something
