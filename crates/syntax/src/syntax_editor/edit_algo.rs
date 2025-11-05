@@ -82,11 +82,11 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
         });
 
     if !disjoint_replaces_ranges {
-        report_intersecting_changes(&changes, get_node_depth, &root);
+        report_intersecting_changes(&changes, get_node_depth, root.source_root());
 
         return SyntaxEdit {
-            old_root: root.clone(),
-            new_root: root,
+            old_root: root.edit_root().clone(),
+            new_root: root.edit_root().clone(),
             annotations: Default::default(),
             changed_elements: vec![],
         };
@@ -148,7 +148,9 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
     }
 
     // Map change targets to the correct syntax nodes
-    let tree_mutator = TreeMutator::new(&root);
+    let tree_mutator = TreeMutator::new(root.source_root());
+    let edit_root = root.edit_root().clone();
+    let edit_root_mut = tree_mutator.make_syntax_mut(&edit_root).clone();
     let mut changed_elements = vec![];
 
     for index in independent_changes {
@@ -309,8 +311,8 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
     }
 
     SyntaxEdit {
-        old_root: tree_mutator.immutable,
-        new_root: root,
+        old_root: edit_root.clone(),
+        new_root: edit_root_mut,
         changed_elements,
         annotations: annotation_groups,
     }

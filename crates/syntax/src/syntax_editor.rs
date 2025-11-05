@@ -14,7 +14,7 @@ use std::{
 use rowan::TextRange;
 use rustc_hash::FxHashMap;
 
-use crate::{SyntaxElement, SyntaxNode, SyntaxToken};
+use crate::{SyntaxElement, SyntaxNode, SyntaxNodePtr, SyntaxToken};
 
 mod edit_algo;
 mod edits;
@@ -24,8 +24,30 @@ pub use edits::Removable;
 pub use mapping::{SyntaxMapping, SyntaxMappingBuilder};
 
 #[derive(Debug)]
+enum Root {
+    Source(SyntaxNode),
+    Subtree { source: SyntaxNode, subtree: SyntaxNode },
+}
+
+impl Root {
+    fn edit_root(&self) -> &SyntaxNode {
+        match self {
+            Root::Source(root) => root,
+            Root::Subtree { subtree, .. } => subtree,
+        }
+    }
+
+    fn source_root(&self) -> &SyntaxNode {
+        match self {
+            Root::Source(root) => root,
+            Root::Subtree { source, .. } => source,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct SyntaxEditor {
-    root: SyntaxNode,
+    root: Root,
     changes: Vec<Change>,
     mappings: SyntaxMapping,
     annotations: Vec<(SyntaxElement, SyntaxAnnotation)>,
@@ -34,6 +56,20 @@ pub struct SyntaxEditor {
 impl SyntaxEditor {
     /// Creates a syntax editor to start editing from `root`
     pub fn new(root: SyntaxNode) -> Self {
+        Self {
+            root: Root::Source(root),
+            changes: vec![],
+            mappings: SyntaxMapping::default(),
+            annotations: vec![],
+        }
+    }
+
+    pub fn new_for_subtree(subtree: SyntaxNode) -> Self {
+        let root = match subtree.ancestors().last() {
+            Some(source) => Root::Subtree { source, subtree },
+            None => Root::Source(subtree),
+        };
+
         Self { root, changes: vec![], mappings: SyntaxMapping::default(), annotations: vec![] }
     }
 
@@ -52,7 +88,7 @@ impl SyntaxEditor {
 
     pub fn merge(&mut self, mut other: SyntaxEditor) {
         debug_assert!(
-            self.root == other.root || other.root.ancestors().any(|node| node == self.root),
+            self.root.source_root() == other.root.source_root(),
             "{:?} is not in the same tree as {:?}",
             other.root,
             self.root
@@ -64,20 +100,20 @@ impl SyntaxEditor {
     }
 
     pub fn insert(&mut self, position: Position, element: impl Element) {
-        debug_assert!(is_ancestor_or_self(&position.parent(), &self.root));
+        debug_assert!(is_ancestor_or_self(&position.parent(), self.root.edit_root()));
         self.changes.push(Change::Insert(position, element.syntax_element()))
     }
 
     pub fn insert_all(&mut self, position: Position, elements: Vec<SyntaxElement>) {
-        debug_assert!(is_ancestor_or_self(&position.parent(), &self.root));
+        debug_assert!(is_ancestor_or_self(&position.parent(), self.root.edit_root()));
         self.changes.push(Change::InsertAll(position, elements))
     }
 
     pub fn delete(&mut self, element: impl Element) {
         let element = element.syntax_element();
-        debug_assert!(is_ancestor_or_self_of_element(&element, &self.root));
+        debug_assert!(is_ancestor_or_self_of_element(&element, self.root.edit_root()));
         debug_assert!(
-            !matches!(&element, SyntaxElement::Node(node) if node == &self.root),
+            !matches!(&element, SyntaxElement::Node(node) if node == self.root.edit_root()),
             "should not delete root node"
         );
         self.changes.push(Change::Replace(element.syntax_element(), None));
@@ -89,21 +125,22 @@ impl SyntaxEditor {
             return;
         }
 
-        debug_assert!(is_ancestor_or_self_of_element(range.start(), &self.root));
+        debug_assert!(is_ancestor_or_self_of_element(range.start(), self.root.edit_root()));
         self.changes.push(Change::ReplaceAll(range, Vec::new()))
     }
 
     pub fn replace(&mut self, old: impl Element, new: impl Element) {
         let old = old.syntax_element();
-        debug_assert!(is_ancestor_or_self_of_element(&old, &self.root));
+        debug_assert!(is_ancestor_or_self_of_element(&old, self.root.edit_root()));
         self.changes.push(Change::Replace(old.syntax_element(), Some(new.syntax_element())));
     }
 
     pub fn replace_with_many(&mut self, old: impl Element, new: Vec<SyntaxElement>) {
         let old = old.syntax_element();
-        debug_assert!(is_ancestor_or_self_of_element(&old, &self.root));
+        debug_assert!(is_ancestor_or_self_of_element(&old, self.root.edit_root()));
         debug_assert!(
-            !(matches!(&old, SyntaxElement::Node(node) if node == &self.root) && new.len() > 1),
+            !(matches!(&old, SyntaxElement::Node(node) if node == self.root.edit_root())
+                && new.len() > 1),
             "cannot replace root node with many elements"
         );
         self.changes.push(Change::ReplaceWithMany(old.syntax_element(), new));
@@ -115,7 +152,7 @@ impl SyntaxEditor {
             return;
         }
 
-        debug_assert!(is_ancestor_or_self_of_element(range.start(), &self.root));
+        debug_assert!(is_ancestor_or_self_of_element(range.start(), self.root.edit_root()));
         self.changes.push(Change::ReplaceAll(range, new))
     }
 
@@ -147,6 +184,10 @@ impl SyntaxEdit {
         &self.new_root
     }
 
+    pub fn into_new_root(self) -> SyntaxNode {
+        self.new_root
+    }
+
     /// Which syntax elements in the modified syntax tree were inserted or
     /// modified as part of the edit.
     ///
@@ -164,6 +205,11 @@ impl SyntaxEdit {
     /// syntax tree.
     pub fn find_annotation(&self, annotation: SyntaxAnnotation) -> &[SyntaxElement] {
         self.annotations.get(&annotation).as_ref().map_or(&[], |it| it.as_slice())
+    }
+
+    pub fn find_node(&self, node: &SyntaxNode) -> SyntaxNode {
+        let ptr = SyntaxNodePtr::new(node);
+        ptr.to_node(&self.new_root)
     }
 }
 

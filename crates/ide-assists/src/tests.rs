@@ -10,11 +10,7 @@ use ide_db::{
     source_change::{FileSystemEdit, TreeMutator},
 };
 use stdx::{format_to, trim_indent};
-use syntax::{
-    TextRange,
-    ast::syntax_factory::SyntaxFactory,
-    syntax_editor::{SyntaxEdit, SyntaxEditor},
-};
+use syntax::{TextRange, ast::syntax_factory::SyntaxFactory, syntax_editor::SyntaxEditor};
 use test_fixture::WithFixture;
 use test_utils::{assert_eq_text, extract_offset};
 
@@ -482,11 +478,13 @@ fn move_and_edit_demo(editor: Editor, acc: &mut Assists, ctx: &AssistContext<'_>
             let init = init.unwrap();
 
             let edit_with_syntax_editor = || {
-                let mut editor = SyntaxEditor::new(let_stmt.syntax().clone());
+                let mut editor = SyntaxEditor::new_for_subtree(let_stmt.syntax().clone());
                 let make = SyntaxFactory::without_mappings();
+
                 editor.replace(name.syntax(), make.name("moved_var").syntax());
                 editor.replace(init.syntax(), make.expr_literal("42").syntax());
-                editor.finish().new_root().clone_subtree()
+
+                editor.finish().new_root().clone()
             };
 
             let edit_with_tree_mutator = || {
@@ -515,23 +513,30 @@ fn move_and_edit_demo(editor: Editor, acc: &mut Assists, ctx: &AssistContext<'_>
             if let Some(scope) = ctx.sema.scope(let_stmt.syntax()) {
                 let current_module = scope.module();
                 let root = current_module.krate().root_module();
-                if let Some(src2_mod) = root
+                match root
                     .children(ctx.db())
                     .find(|m| m.name(ctx.db()).is_some_and(|n| n.as_str() == "src2"))
                 {
-                    if let Some(file_eid) = src2_mod.as_source_file_id(ctx.db()) {
-                        let src2_file = ctx.sema.parse(file_eid);
-                        if let Some(f) = src2_file.syntax().descendants().find_map(ast::Fn::cast)
-                            && let Some(body) = f.body()
-                            && let Some(list) = body.stmt_list()
-                            && let Some(r_curly) = list.r_curly_token()
-                        {
-                            builder.edit_file(file_eid.file_id(ctx.db()));
-                            let insert_offset = r_curly.text_range().start();
-                            let text = format!(" {}", edited.to_string());
-                            builder.insert(insert_offset, text);
+                    Some(src2_mod) => {
+                        if let Some(file_eid) = src2_mod.as_source_file_id(ctx.db()) {
+                            let src2_file = ctx.sema.parse(file_eid);
+                            if let Some(f) =
+                                src2_file.syntax().descendants().find_map(ast::Fn::cast)
+                                && let Some(body) = f.body()
+                                && let Some(list) = body.stmt_list()
+                                && let Some(r_curly) = list.r_curly_token()
+                            {
+                                builder.edit_file(file_eid.file_id(ctx.db()));
+                                let insert_offset = r_curly.text_range().start();
+                                let text = match editor {
+                                    Editor::SyntaxEditor => format!(" {edited} "),
+                                    Editor::TreeMutator => format!(" {edited}"),
+                                };
+                                builder.insert(insert_offset, text);
+                            }
                         }
                     }
+                    _ => (),
                 }
             }
         },
@@ -577,7 +582,7 @@ fn foo() {}
 //- /src1.rs
 fn main() {  }
 //- /src2.rs
-fn foo() { let moved_var = 42;}
+fn foo() { let moved_var = 42; }
 "#,
     );
 }
