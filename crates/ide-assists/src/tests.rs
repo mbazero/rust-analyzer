@@ -10,7 +10,11 @@ use ide_db::{
     source_change::{FileSystemEdit, TreeMutator},
 };
 use stdx::{format_to, trim_indent};
-use syntax::{TextRange, ast::syntax_factory::SyntaxFactory};
+use syntax::{
+    TextRange,
+    ast::syntax_factory::SyntaxFactory,
+    syntax_editor::{SyntaxEdit, SyntaxEditor},
+};
 use test_fixture::WithFixture;
 use test_utils::{assert_eq_text, extract_offset};
 
@@ -447,76 +451,119 @@ fn assist_order_field_struct() {
     assert_eq!(assists.next().map(|it| it.label.to_string()), None);
 }
 
-#[test]
-fn move_and_edit_across_files() {
-    use crate::{AssistContext, Assists};
+enum Editor {
+    SyntaxEditor,
+    TreeMutator,
+}
+
+fn move_and_edit_demo(editor: Editor, acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     use syntax::ast::HasName;
     use syntax::{AstNode, ast, ted};
 
-    fn move_and_edit_demo(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
-        let let_stmt = ctx.find_node_at_offset::<ast::LetStmt>()?;
-        let target = let_stmt.syntax();
+    let let_stmt = ctx.find_node_at_offset::<ast::LetStmt>()?;
+    let target = let_stmt.syntax();
 
-        let (name, init) = if let Some(ls) = ast::LetStmt::cast(target.clone()) {
-            let name = if let Some(ast::Pat::IdentPat(pat)) = ls.pat() { pat.name() } else { None };
-            let init = ls.initializer();
-            (name, init)
-        } else {
-            (None, None)
-        };
+    let (name, init) = if let Some(ls) = ast::LetStmt::cast(target.clone()) {
+        let name = if let Some(ast::Pat::IdentPat(pat)) = ls.pat() { pat.name() } else { None };
+        let init = ls.initializer();
+        (name, init)
+    } else {
+        (None, None)
+    };
 
-        let target = target.text_range();
+    let target = target.text_range();
 
-        acc.add(
-            crate::AssistId::refactor("move_and_edit_across_files_demo"),
-            "Move and edit element into another file",
-            target,
-            |builder| {
-                // Build an edited, detached clone of the selected `let` statement.
+    acc.add(
+        crate::AssistId::refactor("move_and_edit_across_files_demo"),
+        "Move and edit element into another file",
+        target,
+        |builder| {
+            let name = name.unwrap();
+            let init = init.unwrap();
+
+            let edit_with_syntax_editor = || {
+                let mut editor = SyntaxEditor::new(let_stmt.syntax().clone());
+                let make = SyntaxFactory::without_mappings();
+                editor.replace(name.syntax(), make.name("moved_var").syntax());
+                editor.replace(init.syntax(), make.expr_literal("42").syntax());
+                editor.finish().new_root().clone_subtree()
+            };
+
+            let edit_with_tree_mutator = || {
                 let tm = TreeMutator::new(let_stmt.syntax());
                 let make = SyntaxFactory::without_mappings();
                 let m_stmt = tm.make_syntax_mut(let_stmt.syntax());
-                let name = tm.make_syntax_mut(name.as_ref().unwrap().syntax());
-                let init = tm.make_syntax_mut(init.as_ref().unwrap().syntax());
+                let name = tm.make_syntax_mut(name.syntax());
+                let init = tm.make_syntax_mut(init.syntax());
                 ted::replace(name, make.name("moved_var").syntax());
                 ted::replace(init, make.expr_literal("42").syntax());
-                let edited = m_stmt.clone_subtree();
+                m_stmt.clone_subtree()
+            };
 
-                // Delete from current file.
-                let mut ed1 = builder.make_editor(ctx.source_file().syntax());
-                ed1.delete(let_stmt.syntax());
-                builder.add_file_edits(ctx.file_id().file_id(ctx.db()), ed1);
+            // Build an edited, detached clone of the selected `let` statement.
+            let edited = match editor {
+                Editor::SyntaxEditor => edit_with_syntax_editor(),
+                Editor::TreeMutator => edit_with_tree_mutator(),
+            };
 
-                // Insert into module `crate::src2` at the end (inside its first function body for validity).
-                if let Some(scope) = ctx.sema.scope(let_stmt.syntax()) {
-                    let current_module = scope.module();
-                    let root = current_module.krate().root_module();
-                    if let Some(src2_mod) = root
-                        .children(ctx.db())
-                        .find(|m| m.name(ctx.db()).is_some_and(|n| n.as_str() == "src2"))
-                    {
-                        if let Some(file_eid) = src2_mod.as_source_file_id(ctx.db()) {
-                            let src2_file = ctx.sema.parse(file_eid);
-                            if let Some(f) =
-                                src2_file.syntax().descendants().find_map(ast::Fn::cast)
-                                && let Some(body) = f.body()
-                                && let Some(list) = body.stmt_list()
-                                && let Some(r_curly) = list.r_curly_token()
-                            {
-                                builder.edit_file(file_eid.file_id(ctx.db()));
-                                let insert_offset = r_curly.text_range().start();
-                                let text = format!(" {}", edited.to_string());
-                                builder.insert(insert_offset, text);
-                            }
+            // Delete from current file.
+            let mut ed1 = builder.make_editor(ctx.source_file().syntax());
+            ed1.delete(let_stmt.syntax());
+            builder.add_file_edits(ctx.file_id().file_id(ctx.db()), ed1);
+
+            // Insert into module `crate::src2` at the end (inside its first function body for validity).
+            if let Some(scope) = ctx.sema.scope(let_stmt.syntax()) {
+                let current_module = scope.module();
+                let root = current_module.krate().root_module();
+                if let Some(src2_mod) = root
+                    .children(ctx.db())
+                    .find(|m| m.name(ctx.db()).is_some_and(|n| n.as_str() == "src2"))
+                {
+                    if let Some(file_eid) = src2_mod.as_source_file_id(ctx.db()) {
+                        let src2_file = ctx.sema.parse(file_eid);
+                        if let Some(f) = src2_file.syntax().descendants().find_map(ast::Fn::cast)
+                            && let Some(body) = f.body()
+                            && let Some(list) = body.stmt_list()
+                            && let Some(r_curly) = list.r_curly_token()
+                        {
+                            builder.edit_file(file_eid.file_id(ctx.db()));
+                            let insert_offset = r_curly.text_range().start();
+                            let text = format!(" {}", edited.to_string());
+                            builder.insert(insert_offset, text);
                         }
                     }
                 }
-            },
-        )
-    }
+            }
+        },
+    )
+}
 
+#[test]
+fn move_and_edit_across_files_with_tree_mutator() {
     check_assist(
-        move_and_edit_demo,
+        |acc, ctx| move_and_edit_demo(Editor::TreeMutator, acc, ctx),
+        r#"
+//- /main.rs
+mod src1;
+mod src2;
+//- /src1.rs
+fn main() { $0let x = 1; }
+//- /src2.rs
+fn foo() {}
+"#,
+        r#"
+//- /src1.rs
+fn main() {  }
+//- /src2.rs
+fn foo() { let moved_var = 42;}
+"#,
+    );
+}
+
+#[test]
+fn move_and_edit_across_files_with_syntax_editor() {
+    check_assist(
+        |acc, ctx| move_and_edit_demo(Editor::SyntaxEditor, acc, ctx),
         r#"
 //- /main.rs
 mod src1;
