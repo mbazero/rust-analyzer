@@ -123,6 +123,13 @@ impl SyntaxEditor {
         edit_algo::apply_edits(self)
     }
 
+    pub fn finish_extract<const N: usize>(
+        self,
+        to_extract: [&SyntaxElement; N],
+    ) -> (SyntaxEdit, [SyntaxElement; N]) {
+        edit_algo::apply_edits_and_extract(self, to_extract)
+    }
+
     pub fn add_mappings(&mut self, other: SyntaxMapping) {
         self.mappings.merge(other);
     }

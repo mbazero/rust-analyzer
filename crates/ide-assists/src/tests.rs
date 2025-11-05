@@ -482,11 +482,14 @@ fn move_and_edit_demo(editor: Editor, acc: &mut Assists, ctx: &AssistContext<'_>
             let init = init.unwrap();
 
             let edit_with_syntax_editor = || {
-                let mut editor = SyntaxEditor::new(let_stmt.syntax().clone());
+                let mut editor = SyntaxEditor::new(let_stmt.syntax().ancestors().last().unwrap());
                 let make = SyntaxFactory::without_mappings();
                 editor.replace(name.syntax(), make.name("moved_var").syntax());
                 editor.replace(init.syntax(), make.expr_literal("42").syntax());
-                editor.finish().new_root().clone_subtree()
+
+                let (edit, [edited_let]) =
+                    editor.finish_extract([&let_stmt.syntax().clone().into()]);
+                edited_let.into_node().unwrap()
             };
 
             let edit_with_tree_mutator = || {

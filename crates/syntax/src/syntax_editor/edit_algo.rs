@@ -18,6 +18,13 @@ use crate::{
 use super::{SyntaxEdit, SyntaxEditor};
 
 pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
+    apply_edits_and_extract(editor, []).0
+}
+
+pub(super) fn apply_edits_and_extract<const N: usize>(
+    editor: SyntaxEditor,
+    extract_elements: [&SyntaxElement; N],
+) -> (SyntaxEdit, [SyntaxElement; N]) {
     // Algorithm overview:
     //
     // - Sort changes by (range, type)
@@ -84,12 +91,15 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
     if !disjoint_replaces_ranges {
         report_intersecting_changes(&changes, get_node_depth, &root);
 
-        return SyntaxEdit {
-            old_root: root.clone(),
-            new_root: root,
-            annotations: Default::default(),
-            changed_elements: vec![],
-        };
+        return (
+            SyntaxEdit {
+                old_root: root.clone(),
+                new_root: root,
+                annotations: Default::default(),
+                changed_elements: vec![],
+            },
+            extract_elements.map(|e| e.clone()),
+        );
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -149,6 +159,7 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
 
     // Map change targets to the correct syntax nodes
     let tree_mutator = TreeMutator::new(&root);
+    let extracted_elements = extract_elements.map(|e| tree_mutator.make_element_mut(e));
     let mut changed_elements = vec![];
 
     for index in independent_changes {
@@ -308,12 +319,14 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
         annotation_groups.entry(annotation).or_insert(vec![]).push(element);
     }
 
-    SyntaxEdit {
+    let edit = SyntaxEdit {
         old_root: tree_mutator.immutable,
         new_root: root,
         changed_elements,
         annotations: annotation_groups,
-    }
+    };
+
+    (edit, extracted_elements)
 }
 
 fn report_intersecting_changes(
