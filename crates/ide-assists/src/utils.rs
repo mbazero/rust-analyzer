@@ -13,6 +13,7 @@ use ide_db::{
     assists::ExprFillDefaultMode,
     famous_defs::FamousDefs,
     path_transform::PathTransform,
+    source_change::TreeMutator,
     syntax_helpers::{node_ext::preorder_expr, prettify_macro_expansion},
 };
 use stdx::format_to;
