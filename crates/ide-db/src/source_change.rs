@@ -75,10 +75,15 @@ impl SourceChange {
         edit: TextEdit,
         snippet_edit: Option<SnippetEdit>,
     ) {
-        match self.source_file_edits.entry(file_id.into()) {
+        let file_id = file_id.into();
+        match self.source_file_edits.entry(file_id) {
             Entry::Occupied(mut entry) => {
                 let value = entry.get_mut();
-                never!(value.0.union(edit).is_err(), "overlapping edits for same file");
+                // TODO: Restore
+                if let Err(err) = value.0.union(edit) {
+                    panic!("overlapping edits for same file: {err:?}")
+                }
+                // never!(value.0.union(edit).is_err(), "overlapping edits for same file");
                 never!(
                     value.1.is_some() && snippet_edit.is_some(),
                     "overlapping snippet edits for same file"

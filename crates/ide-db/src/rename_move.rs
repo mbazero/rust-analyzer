@@ -21,8 +21,10 @@ use syntax::ast;
 use syntax::ast::HasName;
 use syntax::ast::PathSegmentKind;
 use syntax::ast::edit::IndentLevel;
+use syntax::ast::make;
 use syntax::ast::make::path_from_text_with_edition;
 use syntax::ast::make::tokens;
+use syntax::syntax_editor::Detach;
 use syntax::ted;
 
 use crate::{RootDatabase, defs::Definition, source_change::SourceChange};
@@ -81,6 +83,9 @@ impl RenameMoveAdt {
         let dst_mod_node = dst_mod_source.value.node();
         let dst_file_id = dst_mod_source.file_id.file_id()?.file_id(sema.db);
 
+        dbg!(src_file_id);
+        dbg!(dst_file_id);
+
         // TODO: Remove
         #[allow(clippy::print_stdout)]
         if std::env::var("SS") == Ok("1".to_owned()) {
@@ -89,17 +94,17 @@ impl RenameMoveAdt {
         }
 
         let adt_ast = adt_source.value;
-        // TODO: Rename with SyntaxEditor
-        let renamed_adt_ast = {
-            let clone = adt_ast.clone_for_update();
-            if let Some(name) = clone.name() {
-                let replacement =
-                    syntax::ast::make::name(&self.new_name.display(sema.db, edition).to_string())
-                        .clone_for_update();
-                ted::replace(name.syntax(), replacement.syntax());
-            }
-            clone
-        };
+        // // TODO: Rename with SyntaxEditor
+        // let renamed_adt_ast = {
+        //     let clone = adt_ast.clone_for_update();
+        //     if let Some(name) = clone.name() {
+        //         let replacement =
+        //             syntax::ast::make::name(&self.new_name.display(sema.db, edition).to_string())
+        //                 .clone_for_update();
+        //         ted::replace(name.syntax(), replacement.syntax());
+        //     }
+        //     clone
+        // };
         let impl_asts = self
             .impls_to_move
             .into_iter()
@@ -111,11 +116,17 @@ impl RenameMoveAdt {
         // Delete items from origin
         // TODO: use edit::remove item style pattern
         builder.apply_file_edits(src_file_id, &src_mod_node, |editor| {
+            // // Rename ast
+            if let Some(name) = adt_ast.name() {
+                let replacement =
+                    syntax::ast::make::name(&self.new_name.display(sema.db, edition).to_string())
+                        .clone_for_update();
+                editor.replace(name.syntax(), replacement.syntax());
+            }
+
             // TODO: Do we need clone_for_update?
-            let ranges =
-                chain![[adt_ast.syntax()], impl_asts.iter().map(ast::Impl::syntax)].map(|node| {
-                    SyntaxElement::from(node.clone_for_update()).range_with_neighboring_ws()
-                });
+            let ranges = chain![[adt_ast.syntax()], impl_asts.iter().map(ast::Impl::syntax)]
+                .map(|node| SyntaxElement::from(node.clone()).range_with_neighboring_ws());
 
             merge_element_ranges(ranges).into_iter().for_each(|range| {
                 // TODO: Fix whitespace handling for inline mods
@@ -142,33 +153,17 @@ impl RenameMoveAdt {
                     _ => vec![],
                 };
 
-                editor.replace_all(range, replacement);
+                editor.replace_all_detach(range, replacement, Detach(true));
             });
         });
 
         // TODO: Update internal references
-
-        // Move items to target
-        let items = chain![[renamed_adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
-        match dst_mod_source.value {
-            ModuleSource::SourceFile(source_file) => {
-                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
-                    source_file.add_item_after_headers(editor, items);
-                })
-            }
-            ModuleSource::Module(module) => {
-                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
-                    module.add_item_after_headers(editor, items);
-                })
-            }
-            ModuleSource::BlockExpr(_) => {
-                // TODO: Validate earlier
-                return None;
-            }
-        }
+        dbg!(adt_ast.name());
 
         // Update definition usages
         let def = Definition::Adt(self.adt);
+        let total_usages = def.usages(sema).all().iter().flat_map(|(_, refs)| refs).count();
+        dbg!(total_usages);
         let usages = def.usages(sema).all();
         for (file_id, refs) in usages.iter() {
             // Special case to update refs in origin module
@@ -181,23 +176,36 @@ impl RenameMoveAdt {
             // Qualified name ref update
             // - Merge the paths somehow
             let file_id = file_id.file_id(sema.db);
+            // println!("Before edit_file: {file_id:?}");
+            // builder.edit_file(file_id);
+            // println!("After edit_file: {file_id:?}");
+
             for FileReference { range, name, category } in refs {
-                builder.edit_file(file_id);
+                println!("Usage: {range:?} {name:?} {category:?}");
+                // println!("Usage: ")
                 match name {
-                    FileReferenceNode::Name(_) => {
-                        builder.replace(
-                            *range,
-                            format!("{}", self.new_name.display(sema.db, edition)),
-                        );
+                    FileReferenceNode::Name(name) => {
+                        println!("FileRef::Name");
+                        let new_name =
+                            make::name(&format!("{}", self.new_name.display(sema.db, edition)))
+                                .clone_for_update();
+                        dbg!(&new_name);
+                        builder.apply_file_edits(file_id, name.syntax(), |editor| {
+                            editor.replace(name.syntax(), new_name.syntax());
+                        });
                     }
                     FileReferenceNode::NameRef(name_ref) => {
+                        println!("FileRef::NameRef");
                         let path = full_path_of_name_ref(name_ref);
+                        dbg!(&path);
                         let import_scope =
                             ImportScope::find_insert_use_container(name_ref.syntax(), sema);
 
                         // TODO: If the import is non-tree normal import, maybe just replace the full path in the path case
                         if category.contains(ReferenceCategory::IMPORT) {
+                            println!("Ref contains import");
                             if let Some(import_scope) = import_scope {
+                                println!("Import scope found");
                                 let import_scope = builder.make_import_scope_mut(import_scope);
 
                                 if let Some(leaf_use_tree) =
@@ -219,7 +227,9 @@ impl RenameMoveAdt {
                                 insert_use(&import_scope, path, &cfg);
                             }
                         } else if let Some(path) = path {
+                            println!("Path is some: {path}");
                             if path.qualifier().is_some() {
+                                println!("Path qualifier is some");
                                 let mut segments = Vec::new();
                                 let mut current = Some(path.clone());
                                 while let Some(p) = current {
@@ -273,18 +283,34 @@ impl RenameMoveAdt {
                                 }
 
                                 let new_text = new_segments.join("::");
-                                builder.replace(path.syntax().text_range(), new_text);
+                                let new_path = make::path_from_text(&new_text);
+                                dbg!(&new_text, &new_path);
+                                builder.apply_file_edits(file_id, path.syntax(), |editor| {
+                                    editor.replace(path.syntax(), new_path.syntax());
+                                });
                             } else {
-                                builder.replace(
-                                    *range,
-                                    format!("{}", self.new_name.display(sema.db, edition)),
-                                );
+                                println!("Path qualifier is none");
+                                let new_name_ref = make::name_ref(&format!(
+                                    "{}",
+                                    self.new_name.display(sema.db, edition)
+                                ))
+                                .clone_for_update();
+                                dbg!(name_ref.syntax());
+                                dbg!(new_name_ref.syntax());
+                                builder.apply_file_edits(file_id, name_ref.syntax(), |editor| {
+                                    editor.replace(name_ref.syntax(), new_name_ref.syntax());
+                                });
                             }
                         } else {
-                            builder.replace(
-                                *range,
-                                format!("{}", self.new_name.display(sema.db, edition)),
-                            );
+                            println!("Not import and path none");
+                            let new_name_ref = make::name_ref(&format!(
+                                "{}",
+                                self.new_name.display(sema.db, edition)
+                            ))
+                            .clone_for_update();
+                            builder.apply_file_edits(file_id, name_ref.syntax(), |editor| {
+                                editor.replace(name_ref.syntax(), new_name_ref.syntax());
+                            });
                         }
                     }
                     FileReferenceNode::Lifetime(_) | FileReferenceNode::FormatStringEntry(_, _) => {
@@ -294,6 +320,26 @@ impl RenameMoveAdt {
                 }
             }
         }
+        
+        // Move items to target
+        let items = chain![[adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
+        match dst_mod_source.value {
+            ModuleSource::SourceFile(source_file) => {
+                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
+                    source_file.add_item_after_headers(editor, items);
+                })
+            }
+            ModuleSource::Module(module) => {
+                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
+                    module.add_item_after_headers(editor, items);
+                })
+            }
+            ModuleSource::BlockExpr(_) => {
+                // TODO: Validate earlier
+                return None;
+            }
+        }
+
 
         Some(builder.finish())
     }

@@ -11,7 +11,7 @@ use std::ops::RangeInclusive;
 use either::Either;
 use rowan::{Direction, GreenNodeBuilder, Language};
 
-use crate::{Parse, SyntaxError, SyntaxKind, TextSize};
+use crate::{ted::Element, Parse, SyntaxError, SyntaxKind, TextSize};
 
 pub(crate) use rowan::{GreenNode, GreenToken, NodeOrToken};
 

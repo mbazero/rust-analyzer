@@ -7,7 +7,7 @@
 use std::{
     fmt, iter,
     num::NonZeroU32,
-    ops::RangeInclusive,
+    ops::{Deref, RangeInclusive},
     sync::atomic::{AtomicU32, Ordering},
 };
 
@@ -80,7 +80,7 @@ impl SyntaxEditor {
             !matches!(&element, SyntaxElement::Node(node) if node == &self.root),
             "should not delete root node"
         );
-        self.changes.push(Change::Replace(element.syntax_element(), None));
+        self.changes.push(Change::Replace(element.syntax_element(), None, Detach(false)));
     }
 
     pub fn delete_all(&mut self, range: RangeInclusive<SyntaxElement>) {
@@ -90,13 +90,17 @@ impl SyntaxEditor {
         }
 
         debug_assert!(is_ancestor_or_self_of_element(range.start(), &self.root));
-        self.changes.push(Change::ReplaceAll(range, Vec::new()))
+        self.changes.push(Change::ReplaceAll(range, Vec::new(), Detach(false)))
     }
 
     pub fn replace(&mut self, old: impl Element, new: impl Element) {
         let old = old.syntax_element();
         debug_assert!(is_ancestor_or_self_of_element(&old, &self.root));
-        self.changes.push(Change::Replace(old.syntax_element(), Some(new.syntax_element())));
+        self.changes.push(Change::Replace(
+            old.syntax_element(),
+            Some(new.syntax_element()),
+            Detach(false),
+        ));
     }
 
     pub fn replace_with_many(&mut self, old: impl Element, new: Vec<SyntaxElement>) {
@@ -106,17 +110,26 @@ impl SyntaxEditor {
             !(matches!(&old, SyntaxElement::Node(node) if node == &self.root) && new.len() > 1),
             "cannot replace root node with many elements"
         );
-        self.changes.push(Change::ReplaceWithMany(old.syntax_element(), new));
+        self.changes.push(Change::ReplaceWithMany(old.syntax_element(), new, Detach(false)));
     }
 
     pub fn replace_all(&mut self, range: RangeInclusive<SyntaxElement>, new: Vec<SyntaxElement>) {
+        self.replace_all_detach(range, new, Detach(false));
+    }
+
+    pub fn replace_all_detach(
+        &mut self,
+        range: RangeInclusive<SyntaxElement>,
+        new: Vec<SyntaxElement>,
+        detach: Detach,
+    ) {
         if range.start() == range.end() {
             self.replace_with_many(range.start(), new);
             return;
         }
 
         debug_assert!(is_ancestor_or_self_of_element(range.start(), &self.root));
-        self.changes.push(Change::ReplaceAll(range, new))
+        self.changes.push(Change::ReplaceAll(range, new, detach));
     }
 
     pub fn finish(self) -> SyntaxEdit {
@@ -133,6 +146,7 @@ pub struct SyntaxEdit {
     old_root: SyntaxNode,
     new_root: SyntaxNode,
     changed_elements: Vec<SyntaxElement>,
+    detached_changed_elements: Vec<SyntaxElement>,
     annotations: FxHashMap<SyntaxAnnotation, Vec<SyntaxElement>>,
 }
 
@@ -153,6 +167,10 @@ impl SyntaxEdit {
     /// Note that for syntax nodes, only the upper-most parent of a set of
     /// changes is included, not any child elements that may have been modified.
     pub fn changed_elements(&self) -> &[SyntaxElement] {
+        self.changed_elements.as_slice()
+    }
+
+    pub fn detached_changed_elements(&self) -> &[SyntaxElement] {
         self.changed_elements.as_slice()
     }
 
@@ -237,6 +255,9 @@ impl Position {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Detach(pub bool);
+
 #[derive(Debug)]
 enum Change {
     /// Inserts a single element at the specified position.
@@ -244,12 +265,12 @@ enum Change {
     /// Inserts many elements in-order at the specified position.
     InsertAll(Position, Vec<SyntaxElement>),
     /// Represents both a replace single element and a delete element operation.
-    Replace(SyntaxElement, Option<SyntaxElement>),
+    Replace(SyntaxElement, Option<SyntaxElement>, Detach),
     /// Replaces a single element with many elements.
-    ReplaceWithMany(SyntaxElement, Vec<SyntaxElement>),
+    ReplaceWithMany(SyntaxElement, Vec<SyntaxElement>, Detach),
     /// Replaces a range of elements with another list of elements.
     /// Range will always have start != end.
-    ReplaceAll(RangeInclusive<SyntaxElement>, Vec<SyntaxElement>),
+    ReplaceAll(RangeInclusive<SyntaxElement>, Vec<SyntaxElement>, Detach),
 }
 
 impl Change {
@@ -262,8 +283,10 @@ impl Change {
                 ),
                 PositionRepr::After(child) => TextRange::at(child.text_range().end(), 0.into()),
             },
-            Change::Replace(target, _) | Change::ReplaceWithMany(target, _) => target.text_range(),
-            Change::ReplaceAll(range, _) => {
+            Change::Replace(target, _, _) | Change::ReplaceWithMany(target, _, _) => {
+                target.text_range()
+            }
+            Change::ReplaceAll(range, _, _) => {
                 range.start().text_range().cover(range.end().text_range())
             }
         }
@@ -272,19 +295,19 @@ impl Change {
     fn target_parent(&self) -> SyntaxNode {
         match self {
             Change::Insert(target, _) | Change::InsertAll(target, _) => target.parent(),
-            Change::Replace(target, _) | Change::ReplaceWithMany(target, _) => match target {
+            Change::Replace(target, _, _) | Change::ReplaceWithMany(target, _, _) => match target {
                 SyntaxElement::Node(target) => target.parent().unwrap_or_else(|| target.clone()),
                 SyntaxElement::Token(target) => target.parent().unwrap(),
             },
-            Change::ReplaceAll(target, _) => target.start().parent().unwrap(),
+            Change::ReplaceAll(target, _, _) => target.start().parent().unwrap(),
         }
     }
 
     fn change_kind(&self) -> ChangeKind {
         match self {
             Change::Insert(_, _) | Change::InsertAll(_, _) => ChangeKind::Insert,
-            Change::Replace(_, _) | Change::ReplaceWithMany(_, _) => ChangeKind::Replace,
-            Change::ReplaceAll(_, _) => ChangeKind::ReplaceRange,
+            Change::Replace(_, _, _) | Change::ReplaceWithMany(_, _, _) => ChangeKind::Replace,
+            Change::ReplaceAll(_, _, _) => ChangeKind::ReplaceRange,
         }
     }
 }
@@ -320,18 +343,18 @@ impl fmt::Display for Change {
                     .insert_str(target_range.into(), &format!("\x1b[42m{insertion}\x1b[0m\x1b[K"));
                 f.write_str(&parent_str)
             }
-            Change::Replace(old, new) => {
+            Change::Replace(old, new, _) => {
                 if let Some(new) = new {
                     write!(f, "\x1b[41m{old}\x1b[42m{new}\x1b[0m\x1b[K")
                 } else {
                     write!(f, "\x1b[41m{old}\x1b[0m\x1b[K")
                 }
             }
-            Change::ReplaceWithMany(old, vec) => {
+            Change::ReplaceWithMany(old, vec, _) => {
                 let new: String = vec.iter().map(|it| it.to_string()).collect();
                 write!(f, "\x1b[41m{old}\x1b[42m{new}\x1b[0m\x1b[K")
             }
-            Change::ReplaceAll(range, vec) => {
+            Change::ReplaceAll(range, vec, _) => {
                 let parent = range.start().parent().unwrap();
                 let parent_str = parent.to_string();
                 let pre_range =
