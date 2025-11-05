@@ -489,7 +489,10 @@ fn move_and_edit_demo(editor: Editor, acc: &mut Assists, ctx: &AssistContext<'_>
 
                 let (edit, [edited_let]) =
                     editor.finish_extract([&let_stmt.syntax().clone().into()]);
-                edited_let.into_node().unwrap()
+                dbg!(edit.old_root());
+                dbg!(edit.new_root());
+                dbg!(&edited_let);
+                edited_let.unwrap().into_node().unwrap()
             };
 
             let edit_with_tree_mutator = || {

@@ -126,7 +126,7 @@ impl SyntaxEditor {
     pub fn finish_extract<const N: usize>(
         self,
         to_extract: [&SyntaxElement; N],
-    ) -> (SyntaxEdit, [SyntaxElement; N]) {
+    ) -> (SyntaxEdit, [Option<SyntaxElement>; N]) {
         edit_algo::apply_edits_and_extract(self, to_extract)
     }
 

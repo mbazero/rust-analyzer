@@ -24,7 +24,7 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
 pub(super) fn apply_edits_and_extract<const N: usize>(
     editor: SyntaxEditor,
     extract_elements: [&SyntaxElement; N],
-) -> (SyntaxEdit, [SyntaxElement; N]) {
+) -> (SyntaxEdit, [Option<SyntaxElement>; N]) {
     // Algorithm overview:
     //
     // - Sort changes by (range, type)
@@ -98,7 +98,7 @@ pub(super) fn apply_edits_and_extract<const N: usize>(
                 annotations: Default::default(),
                 changed_elements: vec![],
             },
-            extract_elements.map(|e| e.clone()),
+            extract_elements.map(|e| Some(e.clone())),
         );
     }
 
@@ -113,6 +113,7 @@ pub(super) fn apply_edits_and_extract<const N: usize>(
     let mut dependent_changes = vec![];
     let mut independent_changes = vec![];
     let mut outdated_changes = vec![];
+    let mut replaced_ranges = vec![];
 
     for (change_index, change) in changes.iter().enumerate() {
         // Check if this change is dependent on another change (i.e. it's contained within another range)
@@ -148,10 +149,15 @@ pub(super) fn apply_edits_and_extract<const N: usize>(
         match change {
             Change::Replace(SyntaxElement::Node(target), _)
             | Change::ReplaceWithMany(SyntaxElement::Node(target), _) => {
-                changed_ancestors.push_back(ChangedAncestor::single(target, change_index))
+                changed_ancestors.push_back(ChangedAncestor::single(target, change_index));
+                replaced_ranges.push(target.text_range());
             }
             Change::ReplaceAll(range, _) => {
-                changed_ancestors.push_back(ChangedAncestor::multiple(range, change_index))
+                changed_ancestors.push_back(ChangedAncestor::multiple(range, change_index));
+                replaced_ranges.push(TextRange::new(
+                    range.start().text_range().start(),
+                    range.end().text_range().end(),
+                ));
             }
             _ => (),
         }
@@ -159,7 +165,13 @@ pub(super) fn apply_edits_and_extract<const N: usize>(
 
     // Map change targets to the correct syntax nodes
     let tree_mutator = TreeMutator::new(&root);
-    let extracted_elements = extract_elements.map(|e| tree_mutator.make_element_mut(e));
+    let extracted_elements = extract_elements.map(|e| {
+        if replaced_ranges.iter().any(|r| r.contains_range(e.text_range())) {
+            None
+        } else {
+            Some(tree_mutator.make_element_mut(e))
+        }
+    });
     let mut changed_elements = vec![];
 
     for index in independent_changes {
