@@ -41,6 +41,89 @@ pub struct RenameMoveAdt {
     dst_path: String, // HACK!
 }
 
+pub struct RenameMoveConfig<'a> {
+    sema: &'a Semantics<'a, RootDatabase>,
+    new_name: Name,
+    origin_mod: Module,
+    target_mod: Module,
+    target_path: &'a str, // HACK: Fix this
+}
+
+pub enum RenameMoveDefinition {
+    Module(hir::Module),
+    Function(hir::Function),
+    Adt(hir::Adt),
+    Const(hir::Const),
+    Static(hir::Static),
+    Trait(hir::Trait),
+}
+
+impl RenameMoveDefinition {
+    pub fn new(def: Definition) -> Option<Self> {
+        match def {
+            Definition::Module(m) => Self::Module(m).into(),
+            Definition::Function(f) => Self::Function(f).into(),
+            Definition::Adt(a) => Self::Adt(a).into(),
+            Definition::Const(c) => Self::Const(c).into(),
+            Definition::Static(s) => Self::Static(s).into(),
+            Definition::Trait(t) => Self::Trait(t).into(),
+            _ => None,
+        }
+    }
+
+    pub fn rename_move(self, config: RenameMoveConfig) -> Option<SourceChange> {
+        match self {
+            RenameMoveDefinition::Module(module) => todo!(),
+            RenameMoveDefinition::Function(function) => todo!(),
+            RenameMoveDefinition::Adt(adt) => rename_move_adt(adt, config),
+            RenameMoveDefinition::Const(_) => todo!(),
+            RenameMoveDefinition::Static(_) => todo!(),
+            RenameMoveDefinition::Trait(_) => todo!(),
+        }
+    }
+}
+
+fn rename_move_adt(
+    adt: hir::Adt,
+    RenameMoveConfig { sema, new_name, origin_mod, target_mod, target_path }: RenameMoveConfig,
+) -> Option<SourceChange> {
+    let edition = origin_mod.krate().edition(sema.db);
+    let origin_file_id = origin_mod.as_source_file_id(sema.db)?.file_id(sema.db);
+    let origin_mod_node = origin_mod.definition_source(sema.db).value.node();
+
+    let target_mod_source = target_mod.definition_source(sema.db);
+    let target_mod_node = target_mod_source.value.node();
+    let target_file_id = target_mod_source.file_id.file_id()?.file_id(sema.db);
+
+    // let impls = hir::Impl::all_in_module(sema.db, origin_mod)
+    //     .into_iter()
+    //     .filter(|imp| {
+    //         imp.self_ty(sema.db).as_adt() == Some(adt)
+    //             && imp.source(sema.db).is_some_and(|src| !src.file_id.is_macro())
+    //     })
+    //     .collect();
+    //
+    todo!()
+
+    // Edit ADT def
+    // - Def name
+    // - Def visibilty
+    // - Record visibility
+
+    // Def impls
+    // - Assoc const visibility
+    // - Assoc fn visibility
+    // - Method visibilty
+    //
+    // Trait impls
+    // - NOTHING! -> visibilty inherited from def
+
+
+
+}
+
+
+
 impl RenameMoveAdt {
     pub fn new(
         sema: &Semantics<'_, RootDatabase>,
@@ -108,9 +191,55 @@ impl RenameMoveAdt {
 
         let mut builder = SourceChangeBuilder::new(src_file_id);
 
+        // Out ref resolution
+        // Compute mapping between each out-ref and it's resolution item
+        //   - Itself for fully qualified path
+        //   - An inner use statement
+        //   - An outer use statement
+        //
+        // As final step after the move:
+        // - Loop through each mapping and apply appropriate resolution
+        //   - Fully qualified path
+        //      - Update inline
+        //   - Inner use statement
+        //      - Remove old and insert new
+        //   - Outer use
+        //      - Remove old from origin file
+        //          - Only if there are no other refs using the use!
+        //      - Insert new into target file
+
+        // Update mutable clone of items to move
+        //
+        // SKIP OUT-REF RESOLUTION HERE, THAT WILL BE HANDLED AT THE END
+        //
+        // ADT def edits
+        // - Def name
+        // - Def visibilty
+        // - Record visibility
+        //
+        // Trait def edits
+        // - Def name
+        // - Def visibiilty
+        //
+        // Const def edits
+        // - Def name
+        // - Def visibilty
+        //
+        // Static def edits
+        // - Def name
+        // - Def visibilty
+        //
+        // Impl block edits
+        // - Assoc const visibility
+        // - Assoc fn visibility
+        // - Method visibility
+        //
+        // Impl trait block edits
+        // - NOTHING! -> visibility inherited from def
+
         // Delete items from origin
         // TODO: use edit::remove item style pattern
-        builder.apply_file_edits(src_file_id, &src_mod_node, |editor| {
+        builder.apply_edits_in_file(src_file_id, &src_mod_node, |editor| {
             // TODO: Do we need clone_for_update?
             let ranges =
                 chain![[adt_ast.syntax()], impl_asts.iter().map(ast::Impl::syntax)].map(|node| {
@@ -152,12 +281,12 @@ impl RenameMoveAdt {
         let items = chain![[renamed_adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
         match dst_mod_source.value {
             ModuleSource::SourceFile(source_file) => {
-                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
+                builder.apply_edits_in_file(dst_file_id, &dst_mod_node, move |editor| {
                     source_file.add_item_after_headers(editor, items);
                 })
             }
             ModuleSource::Module(module) => {
-                builder.apply_file_edits(dst_file_id, &dst_mod_node, move |editor| {
+                builder.apply_edits_in_file(dst_file_id, &dst_mod_node, move |editor| {
                     module.add_item_after_headers(editor, items);
                 })
             }

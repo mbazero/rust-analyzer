@@ -281,6 +281,28 @@ impl SourceChangeBuilder {
         self.file_id = file_id.into();
     }
 
+    pub fn apply_edits_in_file<F>(
+        &mut self,
+        file_id: impl Into<FileId>,
+        node: &SyntaxNode,
+        edit_fn: F,
+    ) where
+        F: FnOnce(&mut SyntaxEditor),
+    {
+        let mut editor = self.make_editor(node);
+        edit_fn(&mut editor);
+        self.add_file_edits(file_id, editor);
+    }
+
+    pub fn apply_edits_and_detach_mut<F>(&self, node: &SyntaxNode, edit_fn: F) -> SyntaxNode
+    where
+        F: FnOnce(&mut SyntaxEditor),
+    {
+        let mut editor = self.make_editor(node);
+        edit_fn(&mut editor);
+        editor.finish_detach_mut(node)
+    }
+
     pub fn make_editor(&self, node: &SyntaxNode) -> SyntaxEditor {
         SyntaxEditor::new(node.ancestors().last().unwrap_or_else(|| node.clone()))
     }
@@ -292,15 +314,6 @@ impl SourceChangeBuilder {
                 entry.insert(edit);
             }
         }
-    }
-
-    pub fn apply_file_edits<F>(&mut self, file_id: impl Into<FileId>, node: &SyntaxNode, edit_fn: F)
-    where
-        F: FnOnce(&mut SyntaxEditor),
-    {
-        let mut editor = self.make_editor(node);
-        edit_fn(&mut editor);
-        self.add_file_edits(file_id, editor);
     }
 
     pub fn make_placeholder_snippet(&mut self, _cap: SnippetCap) -> SyntaxAnnotation {

@@ -123,6 +123,23 @@ impl SyntaxEditor {
         edit_algo::apply_edits(self)
     }
 
+    /// Apply edits and return a detached, mutated clone of the provided node. Note, if the edit
+    /// fails or if the node was deleted as part of the edit application, the returned node will be
+    /// a detached, unmodified clone.
+    pub fn finish_detach_mut(self, node: &SyntaxNode) -> SyntaxNode {
+        debug_assert!(is_ancestor_or_self_of_element(&node.syntax_element(), &self.root));
+        let new_node = match edit_algo::compile_edits(self) {
+            Ok(compiled_edits) => {
+                let new_node = compiled_edits.tree_mutator.make_syntax_mut(node);
+                compiled_edits.apply();
+                new_node
+            }
+            Err(_) => node.clone_subtree(),
+        };
+        new_node.detach();
+        new_node
+    }
+
     pub fn add_mappings(&mut self, other: SyntaxMapping) {
         self.mappings.merge(other);
     }
