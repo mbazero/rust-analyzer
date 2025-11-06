@@ -304,7 +304,7 @@ impl SourceChangeBuilder {
     }
 
     pub fn make_editor(&self, node: &SyntaxNode) -> SyntaxEditor {
-        SyntaxEditor::new(node.ancestors().last().unwrap_or_else(|| node.clone()))
+        SyntaxEditor::from_last_ancestor(node)
     }
 
     pub fn add_file_edits(&mut self, file_id: impl Into<FileId>, edit: SyntaxEditor) {

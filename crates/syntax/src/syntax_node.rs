@@ -78,7 +78,10 @@ impl SyntaxTreeBuilder {
     }
 }
 
-pub trait SyntaxElementExt {
+pub trait SyntaxElementExt
+where
+    Self: Sized,
+{
     fn siblings_with_tokens(&self, direction: Direction) -> impl Iterator<Item = SyntaxElement>;
 
     fn neighbor(&self, direction: Direction) -> Option<SyntaxElement> {

@@ -6,13 +6,16 @@ use crate::search::FileReference;
 use crate::search::FileReferenceNode;
 use crate::search::ReferenceCategory;
 use crate::source_change::SourceChangeBuilder;
+use crate::source_change::TreeMutator;
 use crate::syntax_helpers::node_ext::full_path_of_name_ref;
 use hir::HasSource;
 use hir::ModuleSource;
 use hir::PrefixKind;
+use hir::Visibility;
 use hir::{Module, Name, Semantics};
 use itertools::chain;
 use parser::T;
+use span::Edition;
 use syntax::AstNode;
 use syntax::SyntaxElement;
 use syntax::SyntaxElementExt;
@@ -23,6 +26,8 @@ use syntax::ast::PathSegmentKind;
 use syntax::ast::edit::IndentLevel;
 use syntax::ast::make::path_from_text_with_edition;
 use syntax::ast::make::tokens;
+use syntax::ast::syntax_factory::SyntaxFactory;
+use syntax::syntax_editor::SyntaxEditor;
 use syntax::ted;
 
 use crate::{RootDatabase, defs::Definition, source_change::SourceChange};
@@ -47,6 +52,12 @@ pub struct RenameMoveConfig<'a> {
     origin_mod: Module,
     target_mod: Module,
     target_path: &'a str, // HACK: Fix this
+    required_vis: Visibility,
+}
+
+struct Context<'a> {
+    sema: &'a Semantics<'a, RootDatabase>,
+    edition: Edition,
 }
 
 pub enum RenameMoveDefinition {
@@ -83,9 +94,40 @@ impl RenameMoveDefinition {
     }
 }
 
+struct AdtEditor<'a> {
+    ctx: Context<'a>,
+    editor: SyntaxEditor,
+    make: SyntaxFactory,
+    hir: hir::Adt,
+    ast: ast::Adt,
+}
+
+impl<'a> AdtEditor<'a> {
+    fn new(ctx: Context<'a>, hir: hir::Adt) -> Option<Self> {
+        let ast = hir.source(ctx.sema.db)?.value;
+        let editor = SyntaxEditor::from_last_ancestor(ast.syntax());
+        let make = SyntaxFactory::without_mappings();
+        Self { ctx, editor, make, hir, ast }.into()
+    }
+
+    fn set_name(&mut self, new_name: impl AsRef<str>) -> Option<&mut Self> {
+        let new_name = self.make.name(new_name.as_ref());
+        self.editor.replace(self.ast.name()?.syntax(), new_name.syntax());
+        Some(self)
+    }
+
+    fn set_def_vis(&mut self, vis: hir::Visibility) -> Option<&mut Self> {
+        todo!()
+    }
+
+    fn set_record_vis(&mut self, vis: hir::Visibility) -> Option<&mut Self> {
+        todo!()
+    }
+}
+
 fn rename_move_adt(
     adt: hir::Adt,
-    RenameMoveConfig { sema, new_name, origin_mod, target_mod, target_path }: RenameMoveConfig,
+    RenameMoveConfig { sema, new_name, origin_mod, target_mod, target_path, required_vis }: RenameMoveConfig,
 ) -> Option<SourceChange> {
     let edition = origin_mod.krate().edition(sema.db);
     let origin_file_id = origin_mod.as_source_file_id(sema.db)?.file_id(sema.db);
@@ -103,7 +145,6 @@ fn rename_move_adt(
     //     })
     //     .collect();
     //
-    todo!()
 
     // Edit ADT def
     // - Def name
@@ -117,12 +158,9 @@ fn rename_move_adt(
     //
     // Trait impls
     // - NOTHING! -> visibilty inherited from def
-
-
-
+    //
+    todo!()
 }
-
-
 
 impl RenameMoveAdt {
     pub fn new(
@@ -443,4 +481,36 @@ fn get_lca_mod(sema: &Semantics<'_, RootDatabase>, mod_a: Module, mod_b: Module)
         }
     }
     lca
+}
+
+#[cfg(test)]
+mod tests {
+    use hir::Semantics;
+    use syntax::{AstNode, ast};
+    use test_fixture::WithFixture;
+
+    use crate::RootDatabase;
+
+    #[test]
+    fn test_adt_editor() {
+        let fixture = r#"
+            struct FooStruct {
+                a: i32,
+                b: String,
+                c: Vec<f64>,
+            }
+            "#;
+
+        let (db, file) = RootDatabase::with_single_file(fixture);
+        let krate = db.test_crate();
+        let sema = Semantics::new(&db);
+        let sf = sema.parse(file);
+
+        let adt = sf
+            .syntax()
+            .descendants()
+            .find_map(ast::Adt::cast)
+            .and_then(|a| sema.to_adt_def(&a))
+            .unwrap();
+    }
 }

@@ -6,12 +6,13 @@ use crate::{
     AstToken, Direction, SyntaxElement, SyntaxElementExt, SyntaxKind, SyntaxNode, SyntaxToken, T,
     algo::neighbor,
     ast::{
-        self, AstNode, Fn, GenericParam, HasGenericParams, HasModuleItem, HasName,
+        self, AstNode, Fn, GenericParam, HasGenericParams, HasModuleItem, HasName, HasVisibility,
         edit::{AstNodeEdit, IndentLevel},
         make::{self, tokens},
         syntax_factory::SyntaxFactory,
     },
-    syntax_editor::{Position, SyntaxEditor},
+    syntax_editor::{Element, Position, SyntaxEditor},
+    ted,
 };
 
 impl SyntaxEditor {
@@ -393,13 +394,55 @@ impl Removable for ast::UseTree {
     }
 }
 
+pub trait SetName: ast::HasName {
+    fn set_name(&self, editor: &mut SyntaxEditor, new_name: ast::Name) {
+        if let Some(name) = self.name() {
+            editor.replace(name.syntax(), new_name.syntax());
+        }
+    }
+}
+
+impl<T: ast::HasName> SetName for T {}
+
+// TODO: In PR, note that this was copied from HasVisibilityEdit
+// - Also discuss idea of having common editor facade
+pub trait SetVisibility: ast::HasVisibility {
+    fn set_visibility(&self, editor: &mut SyntaxEditor, new_vis: Option<ast::Visibility>) {
+        match (self.visibility(), new_vis) {
+            (Some(cur_vis), Some(new_vis)) => editor.replace(cur_vis.syntax(), new_vis.syntax()),
+            (Some(cur_vis), None) => {
+                editor.delete(cur_vis.syntax());
+            }
+            (None, Some(new_vis)) => {
+                if let Some(insert_before) = self
+                    .syntax()
+                    .children_with_tokens()
+                    .find(|it| {
+                        !matches!(
+                            it.kind(),
+                            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::ATTR
+                        )
+                    })
+                    .or_else(|| self.syntax().first_child_or_token())
+                {
+                    editor.insert_with_ws(Position::before(insert_before), new_vis.syntax());
+                }
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+impl<T: HasVisibility> SetVisibility for T {}
+
 #[cfg(test)]
 mod tests {
     use parser::Edition;
+    use rustc_hash::FxHashMap;
     use stdx::trim_indent;
     use test_utils::assert_eq_text;
 
-    use crate::SourceFile;
+    use crate::{SourceFile, ast};
 
     use super::*;
 
@@ -511,12 +554,69 @@ enum Foo {
         );
     }
 
-    fn check_add_variant(before: &str, expected: &str, variant: ast::Variant) {
-        let enum_ = ast_from_text::<ast::Enum>(before);
-        let mut editor = SyntaxEditor::new(enum_.syntax().clone());
-        if let Some(it) = enum_.variant_list() {
-            it.add_variant(&mut editor, &variant)
+    #[test]
+    fn test_set_name() {
+        let cases = [
+            ("BarStruct", r#"struct FooStruct { f1: f64 }"#, r#"struct BarStruct { f1: f64 }"#),
+            ("BarEnum", r#"enum FooEnum { Alpha, Beta }"#, r#"enum BarEnum { Alpha, Beta }"#),
+            (
+                "BarUnion",
+                r#"union FooUnion { f1: u32, f2: u32 }"#,
+                r#"union BarUnion { f1: u32, f2: u32 }"#,
+            ),
+            ("BAR_CONST", r#"const FOO_CONST: usize = 0;"#, r#"const BAR_CONST: usize = 0;"#),
+            ("BAR_STATIC", r#"static FOO_STATIC: i32 = 0;"#, r#"static BAR_STATIC: i32 = 0;"#),
+        ];
+
+        let make = SyntaxFactory::without_mappings();
+        for (new_name, before, expected) in cases {
+            let new_name = make.name(new_name);
+            check_node::<ast::AnyHasName>(before, expected, |editor, node| {
+                node.set_name(editor, new_name);
+            })
         }
+    }
+
+    #[test]
+    fn test_set_visibility() {
+        let exp_by_vis: FxHashMap<_, _> = [
+            (r#"struct FooStruct;"#),
+            (r#"pub struct FooStruct;"#),
+            (r#"pub(crate) struct FooStruct;"#),
+            (r#"pub(super) struct FooStruct;"#),
+            (r#"pub(in crate::foo) struct FooStruct;"#),
+        ]
+        .into_iter()
+        .map(|text| (ast_from_text::<ast::AnyHasVisibility>(text).visibility(), text))
+        .collect();
+
+        for &before in exp_by_vis.values() {
+            for new_vis in exp_by_vis.keys() {
+                let expected = exp_by_vis[new_vis];
+                check_node::<ast::AnyHasVisibility>(before, expected, |editor, node| {
+                    let new_vis = new_vis.as_ref().map(|v| v.clone_for_update());
+                    node.set_visibility(editor, new_vis);
+                })
+            }
+        }
+    }
+
+    fn check_add_variant(before: &str, expected: &str, variant: ast::Variant) {
+        check_node::<ast::Enum>(before, expected, |editor, enum_| {
+            if let Some(it) = enum_.variant_list() {
+                it.add_variant(editor, &variant)
+            }
+        });
+    }
+
+    fn check_node<N: AstNode>(
+        before: &str,
+        expected: &str,
+        check_fn: impl FnOnce(&mut SyntaxEditor, N),
+    ) {
+        let node = ast_from_text::<N>(before);
+        let mut editor = SyntaxEditor::new(node.syntax().clone());
+        check_fn(&mut editor, node);
         let edit = editor.finish();
         let after = edit.new_root.to_string();
         assert_eq_text!(&trim_indent(expected.trim()), &trim_indent(after.trim()));

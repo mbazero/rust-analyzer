@@ -11,16 +11,17 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use rowan::TextRange;
+use itertools::chain;
+use rowan::{TextRange, cursor::SyntaxElementChildren};
 use rustc_hash::FxHashMap;
 
-use crate::{SyntaxElement, SyntaxNode, SyntaxToken};
+use crate::{SyntaxElement, SyntaxNode, SyntaxToken, ted::ws_between};
 
 mod edit_algo;
 mod edits;
 mod mapping;
 
-pub use edits::Removable;
+pub use edits::{Removable, SetName, SetVisibility};
 pub use mapping::{SyntaxMapping, SyntaxMappingBuilder};
 
 #[derive(Debug)]
@@ -35,6 +36,10 @@ impl SyntaxEditor {
     /// Creates a syntax editor to start editing from `root`
     pub fn new(root: SyntaxNode) -> Self {
         Self { root, changes: vec![], mappings: SyntaxMapping::default(), annotations: vec![] }
+    }
+
+    pub fn from_last_ancestor(node: &SyntaxNode) -> Self {
+        Self::new(node.ancestors().last().unwrap_or_else(|| node.clone()))
     }
 
     pub fn add_annotation(&mut self, element: impl Element, annotation: SyntaxAnnotation) {
@@ -68,9 +73,43 @@ impl SyntaxEditor {
         self.changes.push(Change::Insert(position, element.syntax_element()))
     }
 
+    pub fn insert_with_ws(&mut self, position: Position, element: impl Element) {
+        self.insert_all_with_ws(position, vec![element.syntax_element()]);
+    }
+
     pub fn insert_all(&mut self, position: Position, elements: Vec<SyntaxElement>) {
         debug_assert!(is_ancestor_or_self(&position.parent(), &self.root));
         self.changes.push(Change::InsertAll(position, elements))
+    }
+
+    pub fn insert_all_with_ws(&mut self, position: Position, elements: Vec<SyntaxElement>) {
+        let ws_before = match (&position.repr, elements.first()) {
+            (PositionRepr::After(before), Some(first)) => ws_between(before, first),
+            _ => None,
+        };
+
+        let ws_after = match (elements.last(), &position.repr) {
+            (Some(last), PositionRepr::FirstChild(parent)) => {
+                parent.first_child_or_token().and_then(|after| ws_between(last, &after))
+            }
+            (Some(last), PositionRepr::After(sibling)) => {
+                sibling.next_sibling_or_token().and_then(|after| ws_between(last, &after))
+            }
+            _ => None,
+        };
+
+        self.insert_all(
+            position,
+            chain![ws_before.map(Into::into), elements, ws_after.map(Into::into)].collect(),
+        );
+    }
+
+    pub fn insert_all_some(
+        &mut self,
+        position: Position,
+        elements: impl IntoIterator<Item = Option<SyntaxElement>>,
+    ) {
+        self.insert_all(position, elements.into_iter().flatten().collect());
     }
 
     pub fn delete(&mut self, element: impl Element) {

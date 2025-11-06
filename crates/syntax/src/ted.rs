@@ -10,6 +10,7 @@ use rowan::TextSize;
 use crate::{
     SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{self, AstNode, edit::IndentLevel, make},
+    syntax_editor,
 };
 
 /// Utility trait to allow calling `ted` functions with references or owned
@@ -164,27 +165,9 @@ fn ws_before(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
         PositionRepr::FirstChild(_) => return None,
         PositionRepr::After(it) => it,
     };
-
-    if prev.kind() == T!['{']
-        && new.kind() == SyntaxKind::USE
-        && let Some(item_list) = prev.parent().and_then(ast::ItemList::cast)
-    {
-        let mut indent = IndentLevel::from_element(&item_list.syntax().clone().into());
-        indent.0 += 1;
-        return Some(make::tokens::whitespace(&format!("\n{indent}")));
-    }
-
-    if prev.kind() == T!['{']
-        && ast::Stmt::can_cast(new.kind())
-        && let Some(stmt_list) = prev.parent().and_then(ast::StmtList::cast)
-    {
-        let mut indent = IndentLevel::from_element(&stmt_list.syntax().clone().into());
-        indent.0 += 1;
-        return Some(make::tokens::whitespace(&format!("\n{indent}")));
-    }
-
     ws_between(prev, new)
 }
+
 fn ws_after(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
     let next = match &position.repr {
         PositionRepr::FirstChild(parent) => parent.first_child_or_token()?,
@@ -192,7 +175,26 @@ fn ws_after(position: &Position, new: &SyntaxElement) -> Option<SyntaxToken> {
     };
     ws_between(new, &next)
 }
-fn ws_between(left: &SyntaxElement, right: &SyntaxElement) -> Option<SyntaxToken> {
+
+pub fn ws_between(left: &SyntaxElement, right: &SyntaxElement) -> Option<SyntaxToken> {
+    if left.kind() == T!['{']
+        && right.kind() == SyntaxKind::USE
+        && let Some(item_list) = left.parent().and_then(ast::ItemList::cast)
+    {
+        let mut indent = IndentLevel::from_element(&item_list.syntax().clone().into());
+        indent.0 += 1;
+        return Some(make::tokens::whitespace(&format!("\n{indent}")));
+    }
+
+    if left.kind() == T!['{']
+        && ast::Stmt::can_cast(right.kind())
+        && let Some(stmt_list) = left.parent().and_then(ast::StmtList::cast)
+    {
+        let mut indent = IndentLevel::from_element(&stmt_list.syntax().clone().into());
+        indent.0 += 1;
+        return Some(make::tokens::whitespace(&format!("\n{indent}")));
+    }
+
     if left.kind() == SyntaxKind::WHITESPACE || right.kind() == SyntaxKind::WHITESPACE {
         return None;
     }
