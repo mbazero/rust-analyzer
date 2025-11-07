@@ -8,25 +8,34 @@ use crate::search::ReferenceCategory;
 use crate::source_change::SourceChangeBuilder;
 use crate::source_change::TreeMutator;
 use crate::syntax_helpers::node_ext::full_path_of_name_ref;
+use hir::EditionedFileId;
 use hir::HasSource;
+use hir::InFile;
+use hir::InFileWrapper;
 use hir::ModuleSource;
 use hir::PrefixKind;
 use hir::Visibility;
 use hir::{Module, Name, Semantics};
 use itertools::chain;
 use parser::T;
+use rustc_hash::FxHashMap;
 use span::Edition;
 use syntax::AstNode;
 use syntax::SyntaxElement;
 use syntax::SyntaxElementExt;
 use syntax::algo::merge_element_ranges;
 use syntax::ast;
+use syntax::ast::AnyHasVisibility;
 use syntax::ast::HasName;
+use syntax::ast::NameRef;
 use syntax::ast::PathSegmentKind;
 use syntax::ast::edit::IndentLevel;
+use syntax::ast::make;
 use syntax::ast::make::path_from_text_with_edition;
 use syntax::ast::make::tokens;
 use syntax::ast::syntax_factory::SyntaxFactory;
+use syntax::syntax_editor::SetName;
+use syntax::syntax_editor::SetVisibility;
 use syntax::syntax_editor::SyntaxEditor;
 use syntax::ted;
 
@@ -52,7 +61,8 @@ pub struct RenameMoveConfig<'a> {
     origin_mod: Module,
     target_mod: Module,
     target_path: &'a str, // HACK: Fix this
-    required_vis: Visibility,
+    required_vis: Option<ast::Visibility>,
+    include_impls: bool,
 }
 
 struct Context<'a> {
@@ -94,6 +104,11 @@ impl RenameMoveDefinition {
     }
 }
 
+pub struct ItemUpdate {
+    new_name: String,
+    new_visibilities: FxHashMap<AnyHasVisibility, Visibility>,
+}
+
 struct AdtEditor<'a> {
     ctx: Context<'a>,
     editor: SyntaxEditor,
@@ -127,9 +142,19 @@ impl<'a> AdtEditor<'a> {
 
 fn rename_move_adt(
     adt: hir::Adt,
-    RenameMoveConfig { sema, new_name, origin_mod, target_mod, target_path, required_vis }: RenameMoveConfig,
+    RenameMoveConfig {
+        sema,
+        new_name,
+        origin_mod,
+        target_mod,
+        target_path,
+        required_vis,
+        include_impls,
+    }: RenameMoveConfig,
 ) -> Option<SourceChange> {
-    let edition = origin_mod.krate().edition(sema.db);
+    // TODO: Can get all of these directly from the adt
+    let InFileWrapper { file_id: adt_file_id, value: adt_ast } = adt.source(sema.db)?;
+    let origin_mod = adt.module(sema.db);
     let origin_file_id = origin_mod.as_source_file_id(sema.db)?.file_id(sema.db);
     let origin_mod_node = origin_mod.definition_source(sema.db).value.node();
 
@@ -137,28 +162,133 @@ fn rename_move_adt(
     let target_mod_node = target_mod_source.value.node();
     let target_file_id = target_mod_source.file_id.file_id()?.file_id(sema.db);
 
-    // let impls = hir::Impl::all_in_module(sema.db, origin_mod)
-    //     .into_iter()
-    //     .filter(|imp| {
-    //         imp.self_ty(sema.db).as_adt() == Some(adt)
-    //             && imp.source(sema.db).is_some_and(|src| !src.file_id.is_macro())
-    //     })
-    //     .collect();
-    //
+    let edition = origin_mod.krate().edition(sema.db);
+    let new_name_str = format!("{}", new_name.display(sema.db, edition));
 
-    // Edit ADT def
-    // - Def name
-    // - Def visibilty
-    // - Record visibility
+    let mut scb = SourceChangeBuilder::new(origin_file_id);
+    let make = SyntaxFactory::without_mappings();
 
-    // Def impls
-    // - Assoc const visibility
-    // - Assoc fn visibility
-    // - Method visibilty
-    //
-    // Trait impls
-    // - NOTHING! -> visibilty inherited from def
-    //
+    // Update adt
+    let new_adt = scb.apply_edits_and_detach_mut(&adt_ast, |editor| {
+        adt_ast.set_name(editor, make::name(&new_name_str));
+        adt_ast.set_visibility(editor, required_vis.as_ref());
+        // TODO: Replace set_vis_if_some with intelligent visibility upgrading
+        match &adt_ast {
+            ast::Adt::Enum(_) => {
+                // Enum variant fields inherit definition visibility
+            }
+            ast::Adt::Struct(strukt) => strukt.field_list().into_iter().for_each(|fl| match fl {
+                ast::FieldList::RecordFieldList(rfl) => {
+                    rfl.fields()
+                        .for_each(|f| f.set_visibility_if_some(editor, required_vis.as_ref()));
+                }
+                ast::FieldList::TupleFieldList(tfl) => {
+                    tfl.fields()
+                        .for_each(|f| f.set_visibility_if_some(editor, required_vis.as_ref()));
+                }
+            }),
+            ast::Adt::Union(union) => {
+                union.record_field_list().into_iter().flat_map(|rfl| rfl.fields()).for_each(|f| {
+                    f.set_visibility_if_some(editor, required_vis.as_ref());
+                })
+            }
+        }
+    });
+
+    // Update impls
+    let adt_impls: Vec<_> = hir::Impl::all_in_module(sema.db, origin_mod)
+        .into_iter()
+        .filter_map(|imp| {
+            if imp.self_ty(sema.db).as_adt() == Some(adt)
+                && imp.source(sema.db).is_some_and(|src| !src.file_id.is_macro())
+            {
+                Some(imp.source(sema.db)?.value)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let new_adt_impls: Vec<_> = adt_impls
+        .iter()
+        .map(|imp_ast| {
+            if imp_ast.trait_().is_some() {
+                return imp_ast.clone();
+            }
+            scb.apply_edits_and_detach_mut(imp_ast, |editor| {
+                imp_ast.assoc_item_list().into_iter().flat_map(|ail| ail.assoc_items()).for_each(
+                    |assoc| match assoc {
+                        ast::AssocItem::Const(c) => {
+                            c.set_visibility_if_some(editor, required_vis.as_ref())
+                        }
+                        ast::AssocItem::Fn(f) => {
+                            f.set_visibility_if_some(editor, required_vis.as_ref())
+                        }
+                        ast::AssocItem::MacroCall(_) => {}
+                        ast::AssocItem::TypeAlias(ta) => {
+                            ta.set_visibility_if_some(editor, required_vis.as_ref())
+                        }
+                    },
+                )
+            })
+        })
+        .collect();
+
+    // Delete items from origin
+    // TODO: use edit::remove_items style pattern as below
+    scb.apply_edits_in_file(origin_file_id, &origin_mod_node, |editor| {
+        // TODO: Do we need clone_for_update?
+        let ranges = chain![[adt_ast.syntax()], adt_impls.iter().map(ast::Impl::syntax)]
+            .map(|node| SyntaxElement::from(node.clone_for_update()).range_with_neighboring_ws());
+
+        merge_element_ranges(ranges).into_iter().for_each(|range| {
+            // TODO: Fix whitespace handling for inline mods
+            // - Need to match against both prev and next tokens as curlies
+            // - Will need to add proper indent if there's something after a l_curly because the indent will have been deleted above
+            // - Logic will be easiest if you split by Module or SourceFile like for the addition edits
+
+            let indent = IndentLevel::from_element(range.start());
+
+            let replacement = match (
+                range.start().prev_sibling_or_token().map(|s| s.kind()),
+                range.end().next_sibling_or_token().map(|s| s.kind()),
+            ) {
+                (Some(T!['{']), Some(T!['}'])) => vec![],
+                (Some(T!['{']), Some(_)) => {
+                    vec![tokens::whitespace_indent("\n", indent).into()]
+                }
+                (Some(_), Some(T!['}'])) => {
+                    vec![tokens::whitespace_indent("\n", indent).into()]
+                }
+                (Some(_), Some(_)) => {
+                    vec![tokens::whitespace_indent("\n\n", indent).into()]
+                }
+                _ => vec![],
+            };
+
+            editor.replace_all(range, replacement);
+        });
+    });
+
+    // Move items to target
+    let items = chain![[new_adt.into()], new_adt_impls.into_iter().map(ast::Item::from)];
+    match target_mod_source.value {
+        ModuleSource::SourceFile(source_file) => {
+            scb.apply_edits_in_file(target_file_id, &target_mod_node, move |editor| {
+                source_file.add_item_after_headers(editor, items);
+            })
+        }
+        ModuleSource::Module(module) => {
+            scb.apply_edits_in_file(target_file_id, &target_mod_node, move |editor| {
+                module.add_item_after_headers(editor, items);
+            })
+        }
+        ModuleSource::BlockExpr(_) => {
+            // TODO: Validate earlier
+            return None;
+        }
+    }
+
     todo!()
 }
 
@@ -483,34 +613,163 @@ fn get_lca_mod(sema: &Semantics<'_, RootDatabase>, mod_a: Module, mod_b: Module)
     lca
 }
 
+#[derive(Debug)]
+enum NameRefKind {
+    InUseTree(ast::UseTree),
+    Qualified(ast::Path),
+    UnQualified,
+}
+
+#[derive(Debug)]
+struct RefsInFile {
+    names: Vec<Name>,
+    name_refs: Vec<(NameRef, NameRefKind)>,
+}
+
+#[derive(Debug)]
+enum ExternalRef {
+    Name(ast::Name),
+    NameRef(ast::NameRef, NameRefKind),
+}
+
+#[derive(Debug)]
+struct ExternalRefs {
+    refs: FxHashMap<EditionedFileId, Vec<ExternalRef>>,
+}
+
+impl ExternalRefs {
+    fn compute(sema: &Semantics<'_, RootDatabase>, def: Definition) -> Self {
+        let refs = def
+            .usages(sema)
+            .all()
+            .into_iter()
+            .map(|(file_id, file_refs)| {
+                let file_refs = file_refs
+                    .into_iter()
+                    .filter_map(|FileReference { name, .. }| match name {
+                        FileReferenceNode::Name(name) => ExternalRef::Name(name).into(),
+                        FileReferenceNode::NameRef(name_ref) => {
+                            let kind = if let Some(use_tree) =
+                                name_ref.syntax().ancestors().filter_map(ast::UseTree::cast).last()
+                            {
+                                NameRefKind::InUseTree(use_tree)
+                            } else if let Some(qualifier) =
+                                full_path_of_name_ref(&name_ref).and_then(|p| p.qualifier())
+                            {
+                                NameRefKind::Qualified(qualifier)
+                            } else {
+                                NameRefKind::UnQualified
+                            };
+                            ExternalRef::NameRef(name_ref, kind).into()
+                        }
+                        FileReferenceNode::Lifetime(_) => None,
+                        FileReferenceNode::FormatStringEntry(_, _) => None,
+                    })
+                    .collect();
+                (file_id, file_refs)
+            })
+            .collect();
+
+        Self { refs }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use hir::Semantics;
-    use syntax::{AstNode, ast};
+    use rustc_hash::{FxHashMap, FxHashSet};
+    use syntax::{
+        AstNode, SourceFile,
+        ast::{self, HasModuleItem},
+    };
     use test_fixture::WithFixture;
 
-    use crate::RootDatabase;
+    use crate::{
+        RootDatabase,
+        defs::Definition,
+        rename_move::ExternalRefs,
+        search::{FileReference, FileReferenceNode},
+        syntax_helpers::node_ext::full_path_of_name_ref,
+    };
 
     #[test]
-    fn test_adt_editor() {
+    fn test_print_syntax() {
         let fixture = r#"
-            struct FooStruct {
-                a: i32,
-                b: String,
-                c: Vec<f64>,
-            }
-            "#;
+//- /main.rs
+pub mod foo;
+pub mod bar;
+pub mod baz;
+pub mod buz;
 
-        let (db, file) = RootDatabase::with_single_file(fixture);
+//- /foo.rs
+pub struct Alpha;
+pub struct Beta;
+pub struct Gamma;
+pub struct Delta;
+
+//- /bar.rs
+use crate::foo::Alpha;
+use super::foo::Beta;
+
+fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
+    (a, b)
+}
+
+//- /baz.rs
+use crate::foo::{Alpha, Beta};
+
+fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
+    (a, b)
+}
+
+//- /buz.rs
+use crate::foo::*;
+
+fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
+    (a, b)
+}
+"#;
+
+        let (db, files) = RootDatabase::with_many_files(fixture);
         let krate = db.test_crate();
         let sema = Semantics::new(&db);
-        let sf = sema.parse(file);
 
-        let adt = sf
-            .syntax()
-            .descendants()
-            .find_map(ast::Adt::cast)
-            .and_then(|a| sema.to_adt_def(&a))
-            .unwrap();
+        // TODO: Find in refs in glob
+        // - Actually, we could potentially determine if 
+
+        let sfs: FxHashMap<_, _> = ["main", "foo", "bar", "baz", "buz"]
+            .into_iter()
+            .zip(&files)
+            .map(|(name, file)| (name, sema.parse(*file)))
+            .collect();
+
+        dbg!(sfs["buz"].syntax());
+
+        let file_names: FxHashMap<_, _> = sfs
+            .iter()
+            .map(|(name, sf)| (sema.hir_file_for(sf.syntax()).file_id().unwrap(), *name))
+            .collect();
+
+        let defs: Vec<_> = sfs["foo"]
+            .items()
+            .filter_map(|i| ast::Adt::cast(i.syntax().clone()))
+            .map(|adt| sema.to_adt_def(&adt).unwrap())
+            .map(|adt| Definition::Adt(adt))
+            .collect();
+
+        let [alpha, beta, gamma, delta] = defs.try_into().unwrap();
+
+        let alpha_refs: FxHashMap<_, _> = ExternalRefs::compute(&sema, alpha)
+            .refs
+            .into_iter()
+            .map(|(file_id, refs)| (file_names[&file_id], refs))
+            .collect();
+
+        dbg!(&alpha_refs["buz"]);
+
+        // dbg!(defs);
+
+        // dbg!(&bar.syntax());
+        // dbg!(&baz.syntax());
     }
 }

@@ -15,6 +15,7 @@ use nohash_hasher::IntMap;
 use rustc_hash::FxHashMap;
 use span::FileId;
 use stdx::never;
+use syntax::ast;
 use syntax::{
     AstNode, SyntaxElement, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize,
     syntax_editor::{SyntaxAnnotation, SyntaxEditor},
@@ -294,13 +295,15 @@ impl SourceChangeBuilder {
         self.add_file_edits(file_id, editor);
     }
 
-    pub fn apply_edits_and_detach_mut<F>(&self, node: &SyntaxNode, edit_fn: F) -> SyntaxNode
+    pub fn apply_edits_and_detach_mut<N, F>(&self, node: &N, edit_fn: F) -> N
     where
+        N: ast::AstNode,
         F: FnOnce(&mut SyntaxEditor),
     {
-        let mut editor = self.make_editor(node);
+        let node_syntax = node.syntax();
+        let mut editor = self.make_editor(&node.syntax());
         edit_fn(&mut editor);
-        editor.finish_detach_mut(node)
+        N::cast(editor.finish_detach_mut(node_syntax)).unwrap()
     }
 
     pub fn make_editor(&self, node: &SyntaxNode) -> SyntaxEditor {

@@ -407,7 +407,7 @@ impl<T: ast::HasName> SetName for T {}
 // TODO: In PR, note that this was copied from HasVisibilityEdit
 // - Also discuss idea of having common editor facade
 pub trait SetVisibility: ast::HasVisibility {
-    fn set_visibility(&self, editor: &mut SyntaxEditor, new_vis: Option<ast::Visibility>) {
+    fn set_visibility(&self, editor: &mut SyntaxEditor, new_vis: Option<&ast::Visibility>) {
         match (self.visibility(), new_vis) {
             (Some(cur_vis), Some(new_vis)) => editor.replace(cur_vis.syntax(), new_vis.syntax()),
             (Some(cur_vis), None) => {
@@ -429,6 +429,12 @@ pub trait SetVisibility: ast::HasVisibility {
                 }
             }
             (None, None) => {}
+        }
+    }
+
+    fn set_visibility_if_some(&self, editor: &mut SyntaxEditor, new_vis: Option<&ast::Visibility>) {
+        if self.visibility().is_some() {
+            self.set_visibility(editor, new_vis);
         }
     }
 }
