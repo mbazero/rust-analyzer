@@ -72,6 +72,9 @@ pub struct FileReference {
     /// The node of the reference in the (macro-)file
     pub name: FileReferenceNode,
     pub category: ReferenceCategory,
+    /// The import that resolved this reference, if any.
+    /// This is `Some` when the reference was resolved through an import.
+    pub import: Option<hir::ImportInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -1092,7 +1095,7 @@ impl<'a> FindUsages<'a> {
         };
 
         match NameRefClass::classify(self.sema, name_ref) {
-            Some(NameRefClass::Definition(Definition::SelfType(impl_), _))
+            Some(NameRefClass::Definition(Definition::SelfType(impl_), _, import))
                 if ty_eq(impl_.self_ty(self.sema.db)) =>
             {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
@@ -1100,6 +1103,7 @@ impl<'a> FindUsages<'a> {
                     range,
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: ReferenceCategory::empty(),
+                    import,
                 };
                 sink(file_id, reference)
             }
@@ -1113,7 +1117,7 @@ impl<'a> FindUsages<'a> {
         sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
     ) -> bool {
         match NameRefClass::classify(self.sema, name_ref) {
-            Some(NameRefClass::Definition(def @ Definition::Module(_), _)) if def == self.def => {
+            Some(NameRefClass::Definition(def @ Definition::Module(_), _, import)) if def == self.def => {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let category = if is_name_ref_in_import(name_ref) {
                     ReferenceCategory::IMPORT
@@ -1124,6 +1128,7 @@ impl<'a> FindUsages<'a> {
                     range,
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category,
+                    import,
                 };
                 sink(file_id, reference)
             }
@@ -1145,6 +1150,7 @@ impl<'a> FindUsages<'a> {
                 range,
                 name: FileReferenceNode::FormatStringEntry(token, range),
                 category: ReferenceCategory::READ,
+                import: None,
             };
             sink(file_id, reference)
         } else {
@@ -1158,12 +1164,13 @@ impl<'a> FindUsages<'a> {
         sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
     ) -> bool {
         match NameRefClass::classify_lifetime(self.sema, lifetime) {
-            Some(NameRefClass::Definition(def, _)) if def == self.def => {
+            Some(NameRefClass::Definition(def, _, import)) if def == self.def => {
                 let FileRange { file_id, range } = self.sema.original_range(lifetime.syntax());
                 let reference = FileReference {
                     range,
                     name: FileReferenceNode::Lifetime(lifetime.clone()),
                     category: ReferenceCategory::empty(),
+                    import,
                 };
                 sink(file_id, reference)
             }
@@ -1177,7 +1184,7 @@ impl<'a> FindUsages<'a> {
         sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
     ) -> bool {
         match NameRefClass::classify(self.sema, name_ref) {
-            Some(NameRefClass::Definition(def, _))
+            Some(NameRefClass::Definition(def, _, import))
                 if self.def == def
                     // is our def a trait assoc item? then we want to find all assoc items from trait impls of our trait
                     || matches!(self.assoc_item_container, Some(hir::AssocItemContainer::Trait(_)))
@@ -1188,12 +1195,13 @@ impl<'a> FindUsages<'a> {
                     range,
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: ReferenceCategory::new(self.sema, &def, name_ref),
+                    import,
                 };
                 sink(file_id, reference)
             }
             // FIXME: special case type aliases, we can't filter between impl and trait defs here as we lack the substitutions
             // so we always resolve all assoc type aliases to both their trait def and impl defs
-            Some(NameRefClass::Definition(def, _))
+            Some(NameRefClass::Definition(def, _, import))
                 if self.assoc_item_container.is_some()
                     && matches!(self.def, Definition::TypeAlias(_))
                     && convert_to_def_in_trait(self.sema.db, def)
@@ -1204,16 +1212,18 @@ impl<'a> FindUsages<'a> {
                     range,
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: ReferenceCategory::new(self.sema, &def, name_ref),
+                    import,
                 };
                 sink(file_id, reference)
             }
-            Some(NameRefClass::Definition(def, _)) if self.include_self_kw_refs.is_some() => {
+            Some(NameRefClass::Definition(def, _, import)) if self.include_self_kw_refs.is_some() => {
                 if self.include_self_kw_refs == def_to_ty(self.sema, &def) {
                     let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                     let reference = FileReference {
                         range,
                         name: FileReferenceNode::NameRef(name_ref.clone()),
                         category: ReferenceCategory::new(self.sema, &def, name_ref),
+                        import,
                     };
                     sink(file_id, reference)
                 } else {
@@ -1242,6 +1252,7 @@ impl<'a> FindUsages<'a> {
                     range,
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: access,
+                    import: None,
                 };
                 sink(file_id, reference)
             }
@@ -1266,6 +1277,7 @@ impl<'a> FindUsages<'a> {
                     name: FileReferenceNode::Name(name.clone()),
                     // FIXME: mutable patterns should have `Write` access
                     category: ReferenceCategory::READ,
+                    import: None,
                 };
                 sink(file_id, reference)
             }
@@ -1275,6 +1287,7 @@ impl<'a> FindUsages<'a> {
                     range,
                     name: FileReferenceNode::Name(name.clone()),
                     category: ReferenceCategory::empty(),
+                    import: None,
                 };
                 sink(file_id, reference)
             }
@@ -1300,6 +1313,7 @@ impl<'a> FindUsages<'a> {
                     range,
                     name: FileReferenceNode::Name(name.clone()),
                     category: ReferenceCategory::empty(),
+                    import: None,
                 };
                 sink(file_id, reference)
             }

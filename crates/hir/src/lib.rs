@@ -3258,6 +3258,128 @@ impl HasVisibility for Macro {
     }
 }
 
+/// Represents a specific import or glob import that resolved a definition.
+/// This is the public API version that exposes AST nodes instead of internal IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportInfo {
+    /// A direct import like `use foo::Bar;` or `use foo::{Bar, Baz};`
+    Import(InFile<ast::UseTree>),
+    /// A glob import like `use foo::*;`
+    Glob(InFile<ast::UseTree>),
+}
+
+/// Extended version that also includes extern crate declarations.
+/// This is the public API version that exposes AST nodes instead of internal IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportOrExternCrateInfo {
+    Import(InFile<ast::UseTree>),
+    Glob(InFile<ast::UseTree>),
+    ExternCrate(InFile<ast::ExternCrate>),
+}
+
+impl ImportOrExternCrateInfo {
+    /// Convert to `ImportInfo` if this is an import or glob (not an extern crate)
+    pub fn as_import_info(&self) -> Option<ImportInfo> {
+        match self {
+            ImportOrExternCrateInfo::Import(use_tree) => Some(ImportInfo::Import(use_tree.clone())),
+            ImportOrExternCrateInfo::Glob(use_tree) => Some(ImportInfo::Glob(use_tree.clone())),
+            ImportOrExternCrateInfo::ExternCrate(_) => None,
+        }
+    }
+}
+
+impl From<ImportInfo> for ImportOrExternCrateInfo {
+    fn from(info: ImportInfo) -> Self {
+        match info {
+            ImportInfo::Import(use_tree) => ImportOrExternCrateInfo::Import(use_tree),
+            ImportInfo::Glob(use_tree) => ImportOrExternCrateInfo::Glob(use_tree),
+        }
+    }
+}
+
+impl ImportInfo {
+    /// Convert internal `ImportOrGlob` to public `ImportInfo`
+    pub(crate) fn from_import_or_glob(
+        db: &dyn HirDatabase,
+        import: hir_def::item_scope::ImportOrGlob,
+    ) -> Self {
+        use hir_def::item_scope::ImportOrGlob;
+
+        fn get_use_tree(db: &dyn HirDatabase, use_id: hir_def::UseId, idx_val: u32) -> (HirFileId, ast::UseTree) {
+            let loc = use_id.lookup(db);
+            let use_node = loc.id.to_ptr(db).to_node(&loc.id.file_syntax(db));
+
+            // Get root use tree
+            let root_tree = use_node.use_tree().unwrap();
+
+            // Traverse to find the specific tree at the given index
+            // Index 0 is the root, higher indices are in the use_tree_list
+            let use_tree = if idx_val == 0 {
+                root_tree
+            } else if let Some(tree_list) = root_tree.use_tree_list() {
+                tree_list.use_trees().nth((idx_val - 1) as usize).unwrap_or(root_tree)
+            } else {
+                root_tree
+            };
+
+            (loc.id.file_id, use_tree)
+        }
+
+        match import {
+            ImportOrGlob::Import(import_id) => {
+                let (file, use_tree) = get_use_tree(db, import_id.use_, import_id.idx.into_raw().into_u32());
+                ImportInfo::Import(InFile::new(file, use_tree))
+            }
+            ImportOrGlob::Glob(glob_id) => {
+                let (file, use_tree) = get_use_tree(db, glob_id.use_, glob_id.idx.into_raw().into_u32());
+                ImportInfo::Glob(InFile::new(file, use_tree))
+            }
+        }
+    }
+}
+
+impl ImportOrExternCrateInfo {
+    /// Convert internal `ImportOrExternCrate` to public `ImportOrExternCrateInfo`
+    pub(crate) fn from_import_or_extern_crate(
+        db: &dyn HirDatabase,
+        import: hir_def::item_scope::ImportOrExternCrate,
+    ) -> Self {
+        use hir_def::item_scope::ImportOrExternCrate;
+
+        fn get_use_tree(db: &dyn HirDatabase, use_id: hir_def::UseId, idx_val: u32) -> (HirFileId, ast::UseTree) {
+            let loc = use_id.lookup(db);
+            let use_node = loc.id.to_ptr(db).to_node(&loc.id.file_syntax(db));
+            let root_tree = use_node.use_tree().unwrap();
+
+            let use_tree = if idx_val == 0 {
+                root_tree
+            } else if let Some(tree_list) = root_tree.use_tree_list() {
+                tree_list.use_trees().nth((idx_val - 1) as usize).unwrap_or(root_tree)
+            } else {
+                root_tree
+            };
+
+            (loc.id.file_id, use_tree)
+        }
+
+        match import {
+            ImportOrExternCrate::Import(import_id) => {
+                let (file, use_tree) = get_use_tree(db, import_id.use_, import_id.idx.into_raw().into_u32());
+                ImportOrExternCrateInfo::Import(InFile::new(file, use_tree))
+            }
+            ImportOrExternCrate::Glob(glob_id) => {
+                let (file, use_tree) = get_use_tree(db, glob_id.use_, glob_id.idx.into_raw().into_u32());
+                ImportOrExternCrateInfo::Glob(InFile::new(file, use_tree))
+            }
+            ImportOrExternCrate::ExternCrate(extern_crate_id) => {
+                let loc = extern_crate_id.lookup(db);
+                let extern_crate = loc.id.to_ptr(db).to_node(&loc.id.file_syntax(db));
+                ImportOrExternCrateInfo::ExternCrate(InFile::new(loc.id.file_id, extern_crate))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ItemInNs {
     Types(ModuleDef),

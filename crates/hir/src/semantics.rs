@@ -48,9 +48,9 @@ use syntax::{
 use crate::{
     Adjust, Adjustment, Adt, AutoBorrow, BindingMode, BuiltinAttr, Callable, Const, ConstParam,
     Crate, DefWithBody, DeriveHelper, Enum, Field, Function, GenericSubstitution, HasSource, Impl,
-    InFile, InlineAsmOperand, ItemInNs, Label, LifetimeParam, Local, Macro, Module, ModuleDef,
-    Name, OverloadedDeref, ScopeDef, Static, Struct, ToolModule, Trait, TupleField, Type,
-    TypeAlias, TypeParam, Union, Variant, VariantDef,
+    ImportInfo, InFile, InlineAsmOperand, ItemInNs, Label, LifetimeParam, Local, Macro, Module,
+    ModuleDef, Name, OverloadedDeref, ScopeDef, Static, Struct, ToolModule, Trait, TupleField,
+    Type, TypeAlias, TypeParam, Union, Variant, VariantDef,
     db::HirDatabase,
     semantics::source_to_def::{ChildContainer, SourceToDefCache, SourceToDefCtx},
     source_analyzer::{SourceAnalyzer, name_hygiene, resolve_hir_path},
@@ -1834,6 +1834,13 @@ impl<'db> SemanticsImpl<'db> {
         path: &ast::Path,
     ) -> Option<(PathResolution, Option<GenericSubstitution<'db>>)> {
         self.analyze(path.syntax())?.resolve_path(self.db, path)
+    }
+
+    pub fn resolve_path_with_import(
+        &self,
+        path: &ast::Path,
+    ) -> Option<(PathResolution, Option<GenericSubstitution<'db>>, Option<ImportInfo>)> {
+        self.analyze(path.syntax())?.resolve_path_with_import(self.db, path)
     }
 
     pub fn resolve_use_type_arg(&self, name: &ast::NameRef) -> Option<TypeParam> {

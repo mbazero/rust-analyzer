@@ -57,8 +57,8 @@ use triomphe::Arc;
 
 use crate::{
     Adt, AssocItem, BindingMode, BuiltinAttr, BuiltinType, Callable, Const, DeriveHelper, Field,
-    Function, GenericSubstitution, Local, Macro, ModuleDef, Static, Struct, ToolModule, Trait,
-    TupleField, Type, TypeAlias, Variant,
+    Function, GenericSubstitution, ImportInfo, Local, Macro, ModuleDef, Static, Struct, ToolModule,
+    Trait, TupleField, Type, TypeAlias, Variant,
     db::HirDatabase,
     semantics::{PathResolution, PathResolutionPerNs},
 };
@@ -1183,6 +1183,40 @@ impl<'db> SourceAnalyzer<'db> {
             })();
             Some((res, subst))
         }
+    }
+
+    pub(crate) fn resolve_path_with_import(
+        &self,
+        db: &'db dyn HirDatabase,
+        path: &ast::Path,
+    ) -> Option<(PathResolution, Option<GenericSubstitution<'db>>, Option<ImportInfo>)> {
+        // First get the regular resolution
+        let (res, subst) = self.resolve_path(db, path)?;
+
+        // Try to extract import information by lowering the path and resolving it
+        let mut collector = ExprCollector::new(db, self.resolver.module(), self.file_id);
+        let hir_path = collector.lower_path(path.clone(), &mut ExprCollector::impl_trait_error_allocator)?;
+        let (_store, _) = collector.store.finish();
+
+        // Resolve in value namespace first (most common case)
+        let hygiene = name_hygiene(db, InFile::new(self.file_id, path.syntax()));
+        let import_info = if let Some(resolve_result) = self.resolver.resolve_path_in_value_ns(db, &hir_path, hygiene) {
+            match resolve_result {
+                hir_def::resolver::ResolveValueResult::ValueNs(_, import_or_glob) => {
+                    import_or_glob.map(|imp| ImportInfo::from_import_or_glob(db, imp))
+                }
+                hir_def::resolver::ResolveValueResult::Partial(_, _, import_or_extern) => {
+                    import_or_extern.and_then(|imp| imp.import_or_glob()).map(|imp| ImportInfo::from_import_or_glob(db, imp))
+                }
+            }
+        } else if let Some((_, _, import_or_extern)) = self.resolver.resolve_path_in_type_ns(db, &hir_path) {
+            // Try type namespace
+            import_or_extern.and_then(|imp| imp.import_or_glob()).map(|imp| ImportInfo::from_import_or_glob(db, imp))
+        } else {
+            None
+        };
+
+        Some((res, subst, import_info))
     }
 
     pub(crate) fn resolve_hir_path_per_ns(

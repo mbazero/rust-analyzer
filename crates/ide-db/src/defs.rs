@@ -441,7 +441,7 @@ impl<'db> IdentClass<'db> {
                 res.push((Definition::Local(local_def), None));
                 res.push((Definition::Field(field_ref), Some(adt_subst)));
             }
-            IdentClass::NameRefClass(NameRefClass::Definition(it, subst)) => res.push((it, subst)),
+            IdentClass::NameRefClass(NameRefClass::Definition(it, subst, _)) => res.push((it, subst)),
             IdentClass::NameRefClass(NameRefClass::FieldShorthand {
                 local_ref,
                 field_ref,
@@ -482,7 +482,7 @@ impl<'db> IdentClass<'db> {
                 res.push(Definition::Local(local_def));
                 res.push(Definition::Field(field_ref));
             }
-            IdentClass::NameRefClass(NameRefClass::Definition(it, _)) => res.push(it),
+            IdentClass::NameRefClass(NameRefClass::Definition(it, _, _)) => res.push(it),
             IdentClass::NameRefClass(NameRefClass::FieldShorthand {
                 local_ref,
                 field_ref,
@@ -717,7 +717,7 @@ impl OperatorClass {
 /// reference to point to two different defs.
 #[derive(Debug)]
 pub enum NameRefClass<'db> {
-    Definition(Definition, Option<GenericSubstitution<'db>>),
+    Definition(Definition, Option<GenericSubstitution<'db>>, Option<hir::ImportInfo>),
     FieldShorthand {
         local_ref: Local,
         field_ref: Field,
@@ -750,7 +750,7 @@ impl<'db> NameRefClass<'db> {
                 sema.resolve_record_field_with_substitution(&record_field)
         {
             let res = match local {
-                None => NameRefClass::Definition(Definition::Field(field), Some(adt_subst)),
+                None => NameRefClass::Definition(Definition::Field(field), Some(adt_subst), None),
                 Some(local) => {
                     NameRefClass::FieldShorthand { field_ref: field, local_ref: local, adt_subst }
                 }
@@ -765,12 +765,12 @@ impl<'db> NameRefClass<'db> {
                 // Only use this to resolve to macro calls for last segments as qualifiers resolve
                 // to modules below.
                 if let Some(macro_def) = sema.resolve_macro_call(&macro_call) {
-                    return Some(NameRefClass::Definition(Definition::Macro(macro_def), None));
+                    return Some(NameRefClass::Definition(Definition::Macro(macro_def), None, None));
                 }
             }
             return sema
-                .resolve_path_with_subst(&path)
-                .map(|(res, subst)| NameRefClass::Definition(res.into(), subst));
+                .resolve_path_with_import(&path)
+                .map(|(res, subst, import)| NameRefClass::Definition(res.into(), subst, import));
         }
 
         match_ast! {
@@ -779,8 +779,8 @@ impl<'db> NameRefClass<'db> {
                     sema.resolve_method_call_fallback(&method_call)
                         .map(|(def, subst)| {
                             match def {
-                                Either::Left(def) => NameRefClass::Definition(def.into(), subst),
-                                Either::Right(def) => NameRefClass::Definition(def.into(), subst),
+                                Either::Left(def) => NameRefClass::Definition(def.into(), subst, None),
+                                Either::Right(def) => NameRefClass::Definition(def.into(), subst, None),
                             }
                         })
                 },
@@ -788,19 +788,19 @@ impl<'db> NameRefClass<'db> {
                     sema.resolve_field_fallback(&field_expr)
                         .map(|(def, subst)| {
                             match def {
-                                Either::Left(Either::Left(def)) => NameRefClass::Definition(def.into(), subst),
-                                Either::Left(Either::Right(def)) => NameRefClass::Definition(Definition::TupleField(def), subst),
-                                Either::Right(def) => NameRefClass::Definition(def.into(), subst),
+                                Either::Left(Either::Left(def)) => NameRefClass::Definition(def.into(), subst, None),
+                                Either::Left(Either::Right(def)) => NameRefClass::Definition(Definition::TupleField(def), subst, None),
+                                Either::Right(def) => NameRefClass::Definition(def.into(), subst, None),
                             }
                         })
                 },
                 ast::RecordPatField(record_pat_field) => {
                     sema.resolve_record_pat_field_with_subst(&record_pat_field)
-                        .map(|(field, _, subst)| NameRefClass::Definition(Definition::Field(field), Some(subst)))
+                        .map(|(field, _, subst)| NameRefClass::Definition(Definition::Field(field), Some(subst), None))
                 },
                 ast::RecordExprField(record_expr_field) => {
                     sema.resolve_record_field_with_substitution(&record_expr_field)
-                        .map(|(field, _, _, subst)| NameRefClass::Definition(Definition::Field(field), Some(subst)))
+                        .map(|(field, _, _, subst)| NameRefClass::Definition(Definition::Field(field), Some(subst), None))
                 },
                 ast::AssocTypeArg(_) => {
                     // `Trait<Assoc = Ty>`
@@ -818,7 +818,7 @@ impl<'db> NameRefClass<'db> {
                             .find(|alias| alias.name(sema.db).as_str() == name_ref.text().trim_start_matches("r#"))
                         {
                             // No substitution, this can only occur in type position.
-                            return Some(NameRefClass::Definition(Definition::TypeAlias(ty), None));
+                            return Some(NameRefClass::Definition(Definition::TypeAlias(ty), None, None));
                         }
                     None
                 },
@@ -827,19 +827,19 @@ impl<'db> NameRefClass<'db> {
                     sema.resolve_use_type_arg(name_ref)
                         .map(GenericParam::TypeParam)
                         .map(Definition::GenericParam)
-                        .map(|it| NameRefClass::Definition(it, None))
+                        .map(|it| NameRefClass::Definition(it, None, None))
                 },
                 ast::ExternCrate(extern_crate_ast) => {
                     let extern_crate = sema.to_def(&extern_crate_ast)?;
                     let krate = extern_crate.resolved_crate(sema.db)?;
                     Some(if extern_crate_ast.rename().is_some() {
-                        NameRefClass::Definition(Definition::Crate(krate), None)
+                        NameRefClass::Definition(Definition::Crate(krate), None, None)
                     } else {
                         NameRefClass::ExternCrateShorthand { krate, decl: extern_crate }
                     })
                 },
                 ast::AsmRegSpec(_) => {
-                    Some(NameRefClass::Definition(Definition::InlineAsmRegOrRegClass(()), None))
+                    Some(NameRefClass::Definition(Definition::InlineAsmRegOrRegClass(()), None, None))
                 },
                 ast::OffsetOfExpr(_) => {
                     let (def, subst) = sema.resolve_offset_of_field(name_ref)?;
@@ -847,7 +847,7 @@ impl<'db> NameRefClass<'db> {
                         Either::Left(variant) => Definition::Variant(variant),
                         Either::Right(field) => Definition::Field(field),
                     };
-                    Some(NameRefClass::Definition(def, Some(subst)))
+                    Some(NameRefClass::Definition(def, Some(subst), None))
                 },
                 _ => None
             }
@@ -863,6 +863,7 @@ impl<'db> NameRefClass<'db> {
             return Some(NameRefClass::Definition(
                 Definition::BuiltinLifetime(StaticLifetime),
                 None,
+                None,
             ));
         }
         let parent = lifetime.syntax().parent()?;
@@ -870,7 +871,7 @@ impl<'db> NameRefClass<'db> {
             SyntaxKind::BREAK_EXPR | SyntaxKind::CONTINUE_EXPR => sema
                 .resolve_label(lifetime)
                 .map(Definition::Label)
-                .map(|it| NameRefClass::Definition(it, None)),
+                .map(|it| NameRefClass::Definition(it, None, None)),
             SyntaxKind::LIFETIME_ARG
             | SyntaxKind::USE_BOUND_GENERIC_ARGS
             | SyntaxKind::SELF_PARAM
@@ -880,7 +881,7 @@ impl<'db> NameRefClass<'db> {
                 .resolve_lifetime_param(lifetime)
                 .map(GenericParam::LifetimeParam)
                 .map(Definition::GenericParam)
-                .map(|it| NameRefClass::Definition(it, None)),
+                .map(|it| NameRefClass::Definition(it, None, None)),
             _ => None,
         }
     }
