@@ -10,6 +10,7 @@ use crate::source_change::TreeMutator;
 use crate::syntax_helpers::node_ext::full_path_of_name_ref;
 use hir::EditionedFileId;
 use hir::HasSource;
+use hir::ImportResolution;
 use hir::InFile;
 use hir::InFileWrapper;
 use hir::ModuleSource;
@@ -617,7 +618,7 @@ fn get_lca_mod(sema: &Semantics<'_, RootDatabase>, mod_a: Module, mod_b: Module)
 enum NameRefKind {
     InUseTree(ast::UseTree),
     Qualified(ast::Path),
-    UnQualified,
+    UnQualified(Option<ImportResolution>),
 }
 
 #[derive(Debug)]
@@ -628,7 +629,7 @@ struct RefsInFile {
 
 #[derive(Debug)]
 enum ExternalRef {
-    Name(ast::Name),
+    Name(ast::Name, Option<ImportResolution>),
     NameRef(ast::NameRef, NameRefKind),
 }
 
@@ -647,18 +648,26 @@ impl ExternalRefs {
                 let file_refs = file_refs
                     .into_iter()
                     .filter_map(|FileReference { name, .. }| match name {
-                        FileReferenceNode::Name(name) => ExternalRef::Name(name).into(),
+                        FileReferenceNode::Name(name) => {
+                            println!("FOUND NAME!!! {name}");
+                            let path = name.syntax().ancestors().find_map(ast::Path::cast)?;
+                            println!("Name path: {path}");
+                            ExternalRef::Name(name, sema.resolve_import(&path)).into()
+                        }
                         FileReferenceNode::NameRef(name_ref) => {
+                            // TODO: Better in use stament check, per codebase convention
                             let kind = if let Some(use_tree) =
                                 name_ref.syntax().ancestors().filter_map(ast::UseTree::cast).last()
                             {
                                 NameRefKind::InUseTree(use_tree)
-                            } else if let Some(qualifier) =
-                                full_path_of_name_ref(&name_ref).and_then(|p| p.qualifier())
-                            {
-                                NameRefKind::Qualified(qualifier)
                             } else {
-                                NameRefKind::UnQualified
+                                let path = full_path_of_name_ref(&name_ref)?;
+                                println!("NameRef path: {path}");
+                                if let Some(qualifier) = path.qualifier() {
+                                    NameRefKind::Qualified(qualifier)
+                                } else {
+                                    NameRefKind::UnQualified(sema.resolve_import(&path))
+                                }
                             };
                             ExternalRef::NameRef(name_ref, kind).into()
                         }
@@ -677,20 +686,14 @@ impl ExternalRefs {
 #[cfg(test)]
 mod tests {
     use hir::Semantics;
-    use rustc_hash::{FxHashMap, FxHashSet};
+    use rustc_hash::FxHashMap;
     use syntax::{
-        AstNode, SourceFile,
+        AstNode,
         ast::{self, HasModuleItem},
     };
     use test_fixture::WithFixture;
 
-    use crate::{
-        RootDatabase,
-        defs::Definition,
-        rename_move::ExternalRefs,
-        search::{FileReference, FileReferenceNode},
-        syntax_helpers::node_ext::full_path_of_name_ref,
-    };
+    use crate::{RootDatabase, defs::Definition, rename_move::ExternalRefs};
 
     #[test]
     fn test_print_syntax() {
@@ -701,18 +704,35 @@ pub mod bar;
 pub mod baz;
 pub mod buz;
 
+pub fn main() {}
+
 //- /foo.rs
 pub struct Alpha;
 pub struct Beta;
 pub struct Gamma;
 pub struct Delta;
 
+pub enum Epsilon {
+    VariantA,
+    VariantB,
+}
+
 //- /bar.rs
 use crate::foo::Alpha;
 use super::foo::Beta;
+use crate::foo::Epsilon;
 
 fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
     (a, b)
+}
+
+fn eps_fun(eps: Epsilon) {
+    match eps {
+        Epsilon::VariantA => {}
+        Epsilon::VariantB => {}
+    }
+
+    if let Epsilon::VariantA = eps {}
 }
 
 //- /baz.rs
@@ -735,7 +755,7 @@ fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
         let sema = Semantics::new(&db);
 
         // TODO: Find in refs in glob
-        // - Actually, we could potentially determine if 
+        // - Actually, we could potentially determine if
 
         let sfs: FxHashMap<_, _> = ["main", "foo", "bar", "baz", "buz"]
             .into_iter()
@@ -743,7 +763,7 @@ fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
             .map(|(name, file)| (name, sema.parse(*file)))
             .collect();
 
-        dbg!(sfs["buz"].syntax());
+        dbg!(sfs["bar"].syntax());
 
         let file_names: FxHashMap<_, _> = sfs
             .iter()
@@ -757,15 +777,18 @@ fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
             .map(|adt| Definition::Adt(adt))
             .collect();
 
-        let [alpha, beta, gamma, delta] = defs.try_into().unwrap();
+        let [alpha, beta, gamma, delta, epsilon] = defs.try_into().unwrap();
 
-        let alpha_refs: FxHashMap<_, _> = ExternalRefs::compute(&sema, alpha)
+        dbg!(&alpha);
+        dbg!(&epsilon);
+
+        let refs: FxHashMap<_, _> = ExternalRefs::compute(&sema, alpha)
             .refs
             .into_iter()
             .map(|(file_id, refs)| (file_names[&file_id], refs))
             .collect();
 
-        dbg!(&alpha_refs["buz"]);
+        dbg!(refs);
 
         // dbg!(defs);
 
