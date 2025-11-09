@@ -12,11 +12,13 @@ use std::{
 
 use either::Either;
 use hir_def::{
-    DefWithBodyId, FunctionId, MacroId, StructId, TraitId, VariantId,
+    DefWithBodyId, ExternCrateId, FunctionId, Lookup, MacroId, StructId, TraitId, VariantId,
     expr_store::{Body, ExprOrPatSource, path::Path},
     hir::{BindingId, Expr, ExprId, ExprOrPatId, Pat},
+    item_scope::{GlobId, ImportId, ImportOrExternCrate, ImportOrGlob},
     nameres::{ModuleOrigin, crate_def_map},
     resolver::{self, HasResolver, Resolver, TypeNs},
+    src::{HasChildSource, HasSource as _},
     type_ref::Mutability,
 };
 use hir_expand::{
@@ -121,6 +123,36 @@ impl PathResolutionPerNs {
     }
     pub fn any(&self) -> Option<PathResolution> {
         self.type_ns.or(self.value_ns).or(self.macro_ns)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportResolution {
+    Import(InFile<ast::UseTree>),
+    Glob(InFile<ast::UseTree>),
+    ExternCrate(InFile<ast::ExternCrate>),
+}
+
+impl ImportResolution {
+    pub(crate) fn new(
+        db: &dyn HirDatabase,
+        import: impl Into<ImportOrExternCrate>,
+    ) -> Option<Self> {
+        match import.into() {
+            ImportOrExternCrate::Import(ImportId { use_, idx }) => {
+                let src = use_.child_source(db);
+                let use_tree = src.with_value(src.value.get(idx)?.clone());
+                Self::Import(use_tree).into()
+            }
+            ImportOrExternCrate::Glob(GlobId { use_, idx }) => {
+                let src = use_.child_source(db);
+                let use_tree = src.with_value(src.value.get(idx)?.clone());
+                Self::Glob(use_tree).into()
+            }
+            ImportOrExternCrate::ExternCrate(id) => {
+                Self::ExternCrate(id.lookup(db).source(db)).into()
+            }
+        }
     }
 }
 
@@ -1819,6 +1851,10 @@ impl<'db> SemanticsImpl<'db> {
             macro_call_to_macro_id(ctx, macro_call_id)
         })?;
         Some(Macro { id })
+    }
+
+    pub fn resolve_import(&self, path: &ast::Path) -> Option<ImportResolution> {
+        self.analyze(path.syntax())?.resolve_import(self.db, path)
     }
 
     pub fn resolve_path(&self, path: &ast::Path) -> Option<PathResolution> {

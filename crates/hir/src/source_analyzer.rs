@@ -20,7 +20,7 @@ use hir_def::{
     hir::{BindingId, Expr, ExprId, ExprOrPatId, Pat},
     lang_item::LangItem,
     nameres::MacroSubNs,
-    resolver::{HasResolver, Resolver, TypeNs, ValueNs, resolver_for_scope},
+    resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs, resolver_for_scope},
     type_ref::{Mutability, TypeRefId},
 };
 use hir_expand::{
@@ -57,8 +57,8 @@ use triomphe::Arc;
 
 use crate::{
     Adt, AssocItem, BindingMode, BuiltinAttr, BuiltinType, Callable, Const, DeriveHelper, Field,
-    Function, GenericSubstitution, Local, Macro, ModuleDef, Static, Struct, ToolModule, Trait,
-    TupleField, Type, TypeAlias, Variant,
+    Function, GenericSubstitution, ImportResolution, Local, Macro, ModuleDef, Static, Struct,
+    ToolModule, Trait, TupleField, Type, TypeAlias, Variant,
     db::HirDatabase,
     semantics::{PathResolution, PathResolutionPerNs},
 };
@@ -843,6 +843,44 @@ impl<'db> SourceAnalyzer<'db> {
             }
         }
         never!("the `NameRef` is a child of the `OffsetOfExpr`, we should've visited it");
+        None
+    }
+
+    // TODO: NEEDS MAJOR REWORK
+    pub(crate) fn resolve_import(
+        &self,
+        db: &'db dyn HirDatabase,
+        path: &ast::Path,
+    ) -> Option<ImportResolution> {
+        let mut collector = ExprCollector::new(db, self.resolver.module(), self.file_id);
+        let hir_path =
+            collector.lower_path(path.clone(), &mut ExprCollector::impl_trait_error_allocator)?;
+
+        if let Some(import) =
+            self.resolver.resolve_path_in_type_ns(db, &hir_path).and_then(|(_, _, x)| x)
+        {
+            return ImportResolution::new(db, import).into();
+        }
+
+        let hygiene = name_hygiene(db, InFile::new(self.file_id, path.syntax()));
+        if let Some(import) =
+            self.resolver.resolve_path_in_value_ns(db, &hir_path, hygiene).and_then(|res| match res
+            {
+                ResolveValueResult::ValueNs(_, import_or_glob) => import_or_glob.map(Into::into),
+                ResolveValueResult::Partial(_, _, import_or_extern_crate) => import_or_extern_crate,
+            })
+        {
+            return ImportResolution::new(db, import).into();
+        }
+
+        if let Some(import) = self
+            .resolver
+            .resolve_path_as_macro(db, hir_path.mod_path()?, None)
+            .and_then(|(_, import)| import)
+        {
+            return ImportResolution::new(db, import).into();
+        }
+
         None
     }
 

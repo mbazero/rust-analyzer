@@ -601,7 +601,7 @@ enum Foo {
                 let expected = exp_by_vis[new_vis];
                 check_node::<ast::AnyHasVisibility>(before, expected, |editor, node| {
                     let new_vis = new_vis.as_ref().map(|v| v.clone_for_update());
-                    node.set_visibility(editor, new_vis);
+                    node.set_visibility(editor, new_vis.as_ref());
                 })
             }
         }
