@@ -583,6 +583,11 @@ impl Module {
         Some(Module { id: parent_id })
     }
 
+    /// Iterates over all ancestor modules
+    pub fn ancestors(self, db: &dyn HirDatabase) -> impl Iterator<Item = Module> {
+        std::iter::successors(self.parent(db), |parent| parent.parent(db))
+    }
+
     /// Finds nearest non-block ancestor `Module` (`self` included).
     pub fn nearest_non_block_module(self, db: &dyn HirDatabase) -> Module {
         let mut id = self.id;

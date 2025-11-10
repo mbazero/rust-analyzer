@@ -175,7 +175,9 @@ impl SyntaxEditor {
             }
             Err(_) => node.clone_subtree(),
         };
-        new_node.detach();
+        // TODO: Restore or rename method
+        // - Commented out to preserve indent information, which comes from parents
+        // new_node.detach();
         new_node
     }
 

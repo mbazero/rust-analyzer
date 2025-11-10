@@ -1,9 +1,12 @@
 use crate::defs::NameClass;
 use crate::defs::NameRefClass;
+use crate::imports;
+use crate::imports::insert_use::AliasOrGlob;
 use crate::imports::insert_use::ImportGranularity;
 use crate::imports::insert_use::ImportScope;
 use crate::imports::insert_use::InsertUseConfig;
 use crate::imports::insert_use::insert_use;
+use crate::imports::insert_use::insert_use_with_alias_option;
 use crate::search::FileReference;
 use crate::search::FileReferenceNode;
 use crate::search::ReferenceCategory;
@@ -22,9 +25,11 @@ use hir::PrefixKind;
 use hir::Visibility;
 use hir::db::ExpandDatabase;
 use hir::{Module, Name, Semantics};
+use itertools::Itertools;
 use itertools::chain;
 use parser::T;
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use span::Edition;
 use syntax::AstNode;
 use syntax::SyntaxElement;
@@ -35,6 +40,7 @@ use syntax::ast::AnyHasVisibility;
 use syntax::ast::HasName;
 use syntax::ast::NameRef;
 use syntax::ast::PathSegmentKind;
+use syntax::ast::edit::AstNodeEdit;
 use syntax::ast::edit::IndentLevel;
 use syntax::ast::make;
 use syntax::ast::make::path_from_text_with_edition;
@@ -46,6 +52,52 @@ use syntax::syntax_editor::SyntaxEditor;
 use syntax::ted;
 
 use crate::{RootDatabase, defs::Definition, source_change::SourceChange};
+
+// Out ref resolution
+// Compute mapping between each out-ref and it's resolution item
+//   - Itself for fully qualified path
+//   - An inner use statement
+//   - An outer use statement
+//
+// As final step after the move:
+// - Loop through each mapping and apply appropriate resolution
+//   - Fully qualified path
+//      - Update inline
+//   - Inner use statement
+//      - Remove old and insert new
+//   - Outer use
+//      - Remove old from origin file
+//          - Only if there are no other refs using the use!
+//      - Insert new into target file
+
+// Update mutable clone of items to move
+//
+// SKIP OUT-REF RESOLUTION HERE, THAT WILL BE HANDLED AT THE END
+//
+// ADT def edits
+// - Def name
+// - Def visibilty
+// - Record visibility
+//
+// Trait def edits
+// - Def name
+// - Def visibiilty
+//
+// Const def edits
+// - Def name
+// - Def visibilty
+//
+// Static def edits
+// - Def name
+// - Def visibilty
+//
+// Impl block edits
+// - Assoc const visibility
+// - Assoc fn visibility
+// - Method visibility
+//
+// Impl trait block edits
+// - NOTHING! -> visibility inherited from def
 
 pub struct RenameMoveAdt {
     // Adt to rename-move.
@@ -62,13 +114,13 @@ pub struct RenameMoveAdt {
 }
 
 pub struct RenameMoveConfig<'a> {
-    sema: &'a Semantics<'a, RootDatabase>,
-    new_name: Name,
-    origin_mod: Module,
-    target_mod: Module,
-    target_path: &'a str, // HACK: Fix this
-    required_vis: Option<ast::Visibility>,
-    include_impls: bool,
+    pub sema: &'a Semantics<'a, RootDatabase>,
+    pub new_name: Name,
+    pub origin_mod: Module,
+    pub target_mod: Module,
+    pub target_path: &'a str, // HACK: Fix this
+    pub required_vis: Option<ast::Visibility>,
+    pub include_impls: bool,
 }
 
 struct Context<'a> {
@@ -98,7 +150,7 @@ impl RenameMoveDefinition {
         }
     }
 
-    pub fn rename_move(self, config: RenameMoveConfig) -> Option<SourceChange> {
+    pub fn rename_move(self, config: RenameMoveConfig<'_>) -> Option<SourceChange> {
         match self {
             RenameMoveDefinition::Module(module) => todo!(),
             RenameMoveDefinition::Function(function) => todo!(),
@@ -107,6 +159,37 @@ impl RenameMoveDefinition {
             RenameMoveDefinition::Static(_) => todo!(),
             RenameMoveDefinition::Trait(_) => todo!(),
         }
+    }
+}
+
+impl From<RenameMoveDefinition> for Definition {
+    fn from(value: RenameMoveDefinition) -> Self {
+        match value {
+            RenameMoveDefinition::Module(m) => Definition::Module(m),
+            RenameMoveDefinition::Function(f) => Definition::Function(f),
+            RenameMoveDefinition::Adt(a) => Definition::Adt(a),
+            RenameMoveDefinition::Const(c) => Definition::Const(c),
+            RenameMoveDefinition::Static(s) => Definition::Static(s),
+            RenameMoveDefinition::Trait(t) => Definition::Trait(t),
+        }
+    }
+}
+
+// HACK: Fix this
+struct NewPath {
+    name: Name,
+    name_str: String,      // TODO: Remove
+    full_path_str: String, // TODO: Remove
+    edition: Edition,
+}
+
+impl NewPath {
+    fn full_path(&self) -> ast::Path {
+        path_from_text_with_edition(&self.full_path_str, self.edition)
+    }
+
+    fn name_str(&self, db: &RootDatabase) -> String {
+        format!("{}", self.name.display(db, self.edition))
     }
 }
 
@@ -156,28 +239,37 @@ fn rename_move_adt(
         target_path,
         required_vis,
         include_impls,
-    }: RenameMoveConfig,
+    }: RenameMoveConfig<'_>,
 ) -> Option<SourceChange> {
     // TODO: Can get all of these directly from the adt
     let InFileWrapper { file_id: adt_file_id, value: adt_ast } = adt.source(sema.db)?;
-    let origin_mod = adt.module(sema.db);
-    let origin_file_id = origin_mod.as_source_file_id(sema.db)?.file_id(sema.db);
+    let adt_file_id = adt_file_id.file_id()?;
+    let origin_file_id_ed = origin_mod.definition_source(sema.db).file_id.file_id()?;
+    let origin_file_id = origin_file_id_ed.file_id(sema.db);
     let origin_mod_node = origin_mod.definition_source(sema.db).value.node();
 
     let target_mod_source = target_mod.definition_source(sema.db);
     let target_mod_node = target_mod_source.value.node();
-    let target_file_id = target_mod_source.file_id.file_id()?.file_id(sema.db);
+    let target_file_id_ed = target_mod_source.file_id.file_id()?;
+    let target_file_id = target_file_id_ed.file_id(sema.db);
 
     let edition = origin_mod.krate().edition(sema.db);
-    let new_name_str = format!("{}", new_name.display(sema.db, edition));
+
+    let new_path = NewPath {
+        name_str: format!("{}", new_name.display(sema.db, edition)),
+        full_path_str: target_path.to_owned(),
+        name: new_name,
+        edition,
+    };
 
     let mut scb = SourceChangeBuilder::new(origin_file_id);
     let make = SyntaxFactory::without_mappings();
 
     // Update adt
     let new_adt = scb.apply_edits_and_detach_mut(&adt_ast, |editor| {
-        adt_ast.set_name(editor, make::name(&new_name_str));
-        adt_ast.set_visibility(editor, required_vis.as_ref());
+        adt_ast.set_name(editor, make.name(&new_path.name_str));
+        // TODO: Overhaul vis upgrade
+        adt_ast.set_visibility_if_none(editor, required_vis.as_ref());
         // TODO: Replace set_vis_if_some with intelligent visibility upgrading
         match &adt_ast {
             ast::Adt::Enum(_) => {
@@ -295,335 +387,188 @@ fn rename_move_adt(
         }
     }
 
-    todo!()
+    // Update external refs
+    // TODO: Decide about filtering files
+    // - If you remove the filter, you'll have to pass the mapped source file nodes from the previous edits
+    RenameExternalRefs::new(sema, adt.into(), origin_file_id_ed, target_file_id_ed)?
+        .update_inline(&mut scb, &new_path)?;
+
+    Some(scb.finish())
 }
 
-impl RenameMoveAdt {
-    pub fn new(
-        sema: &Semantics<'_, RootDatabase>,
-        adt: hir::Adt,
-        new_name: Name,
-        src_mod: Module,
-        dst_mod: Module,
-        dst_path: &str, // HACK: Fix this
-    ) -> Self {
-        // TODO:
-        // - Do we need to sort by syntax start range, or does all_in_module already return in that order?
-        // - Do we need to have special filtering for impls defined in inline modules, or does all_in_module already perform that filtering?
-        let impls = hir::Impl::all_in_module(sema.db, src_mod)
+#[derive(Debug)]
+enum NameRefKind {
+    InUseTree,
+    Qualified,
+    UnQualified,
+}
+
+struct RichNameRef {
+    name_ref: NameRef,
+    kind: NameRefKind,
+    path: ast::Path,
+    import: Option<ImportResolution>,
+}
+
+struct RenameExternalRefs<'a> {
+    sema: &'a Semantics<'a, RootDatabase>,
+    refs: FxHashMap<EditionedFileId, Vec<RichNameRef>>,
+}
+
+impl<'a> RenameExternalRefs<'a> {
+    // TODO: Accept RenameMoveDefinition
+    // TODO: Maybe exclude origin and target files?
+    fn new(
+        sema: &'a Semantics<'a, RootDatabase>,
+        def: Definition,
+        origin_file_id: EditionedFileId,
+        target_file_id: EditionedFileId,
+    ) -> Option<Self> {
+        let refs = def
+            .usages(sema)
+            .all()
             .into_iter()
-            .filter(|imp| {
-                imp.self_ty(sema.db).as_adt() == Some(adt)
-                    && imp.source(sema.db).is_some_and(|src| !src.file_id.is_macro())
+            // .filter(|(file_id, _)| ![origin_file_id, target_file_id].contains(file_id))
+            .map(|(file_id, file_refs)| {
+                let refs = file_refs
+                    .into_iter()
+                    .filter_map(|FileReference { name, category, .. }| match name {
+                        FileReferenceNode::Name(_) => None,
+                        FileReferenceNode::NameRef(name_ref) => {
+                            let path = name_ref.syntax().ancestors().find_map(ast::Path::cast)?;
+                            let import = sema.resolve_import(&path.first_qualifier_or_self());
+                            let kind = if category.contains(ReferenceCategory::IMPORT) {
+                                NameRefKind::InUseTree
+                            } else if path.first_qualifier().is_some() {
+                                NameRefKind::Qualified
+                            } else {
+                                NameRefKind::UnQualified
+                            };
+                            RichNameRef { name_ref, kind, path, import }.into()
+                        }
+                        FileReferenceNode::Lifetime(_) => None,
+                        FileReferenceNode::FormatStringEntry(_, _) => None,
+                    })
+                    .collect();
+
+                (file_id, refs)
             })
             .collect();
-        Self {
-            adt,
-            impls_to_move: impls,
-            new_name,
-            src_mod,
-            dst_mod,
-            dst_path: dst_path.to_owned(),
-        }
+
+        Some(Self { sema, refs })
     }
 
-    pub fn into_source_change(self, sema: &Semantics<'_, RootDatabase>) -> Option<SourceChange> {
-        let edition = self.src_mod.krate().edition(sema.db);
-        let adt_source = self.adt.source(sema.db)?;
-        let src_file_id = self.src_mod.as_source_file_id(sema.db)?.file_id(sema.db);
+    fn update_inline(self, scb: &mut SourceChangeBuilder, new_path: &NewPath) -> Option<()> {
+        let RenameExternalRefs { sema, refs } = self;
+        for (file_id, refs) in refs {
+            // TODO: Wrap in per-file function that returns option
+            scb.edit_file(file_id.file_id(sema.db));
 
-        let src_mod_node = self.src_mod.definition_source(sema.db).value.node();
-
-        let dst_mod_source = self.dst_mod.definition_source(sema.db);
-        let dst_mod_node = dst_mod_source.value.node();
-        let dst_file_id = dst_mod_source.file_id.file_id()?.file_id(sema.db);
-
-        // TODO: Remove
-        #[allow(clippy::print_stdout)]
-        if std::env::var("SS") == Ok("1".to_owned()) {
-            println!("{src_mod_node:#?}");
-            println!("{dst_mod_node:#?}");
-        }
-
-        let adt_ast = adt_source.value;
-        // TODO: Rename with SyntaxEditor
-        let renamed_adt_ast = {
-            let clone = adt_ast.clone_for_update();
-            if let Some(name) = clone.name() {
-                let replacement =
-                    syntax::ast::make::name(&self.new_name.display(sema.db, edition).to_string())
-                        .clone_for_update();
-                ted::replace(name.syntax(), replacement.syntax());
-            }
-            clone
-        };
-        let impl_asts = self
-            .impls_to_move
-            .into_iter()
-            .map(|imp| imp.source(sema.db).map(|s| s.value))
-            .collect::<Option<Vec<_>>>()?;
-
-        let mut builder = SourceChangeBuilder::new(src_file_id);
-
-        // Out ref resolution
-        // Compute mapping between each out-ref and it's resolution item
-        //   - Itself for fully qualified path
-        //   - An inner use statement
-        //   - An outer use statement
-        //
-        // As final step after the move:
-        // - Loop through each mapping and apply appropriate resolution
-        //   - Fully qualified path
-        //      - Update inline
-        //   - Inner use statement
-        //      - Remove old and insert new
-        //   - Outer use
-        //      - Remove old from origin file
-        //          - Only if there are no other refs using the use!
-        //      - Insert new into target file
-
-        // Update mutable clone of items to move
-        //
-        // SKIP OUT-REF RESOLUTION HERE, THAT WILL BE HANDLED AT THE END
-        //
-        // ADT def edits
-        // - Def name
-        // - Def visibilty
-        // - Record visibility
-        //
-        // Trait def edits
-        // - Def name
-        // - Def visibiilty
-        //
-        // Const def edits
-        // - Def name
-        // - Def visibilty
-        //
-        // Static def edits
-        // - Def name
-        // - Def visibilty
-        //
-        // Impl block edits
-        // - Assoc const visibility
-        // - Assoc fn visibility
-        // - Method visibility
-        //
-        // Impl trait block edits
-        // - NOTHING! -> visibility inherited from def
-
-        // Delete items from origin
-        // TODO: use edit::remove item style pattern
-        builder.apply_edits_in_file(src_file_id, &src_mod_node, |editor| {
-            // TODO: Do we need clone_for_update?
-            let ranges =
-                chain![[adt_ast.syntax()], impl_asts.iter().map(ast::Impl::syntax)].map(|node| {
-                    SyntaxElement::from(node.clone_for_update()).range_with_neighboring_ws()
-                });
-
-            merge_element_ranges(ranges).into_iter().for_each(|range| {
-                // TODO: Fix whitespace handling for inline mods
-                // - Need to match against both prev and next tokens as curlies
-                // - Will need to add proper indent if there's something after a l_curly because the indent will have been deleted above
-                // - Logic will be easiest if you split by Module or SourceFile like for the addition edits
-
-                let indent = IndentLevel::from_element(range.start());
-
-                let replacement = match (
-                    range.start().prev_sibling_or_token().map(|s| s.kind()),
-                    range.end().next_sibling_or_token().map(|s| s.kind()),
-                ) {
-                    (Some(T!['{']), Some(T!['}'])) => vec![],
-                    (Some(T!['{']), Some(_)) => {
-                        vec![tokens::whitespace_indent("\n", indent).into()]
+            let mut import_muts: FxHashMap<_, _> = refs
+                .iter()
+                .filter_map(|RichNameRef { name_ref, kind, import, .. }| match kind {
+                    NameRefKind::InUseTree => {
+                        name_ref.syntax().ancestors().find_map(ast::UseTree::cast)
                     }
-                    (Some(_), Some(T!['}'])) => {
-                        vec![tokens::whitespace_indent("\n", indent).into()]
+                    NameRefKind::Qualified => None,
+                    NameRefKind::UnQualified => {
+                        import.as_ref().and_then(ImportResolution::use_tree)
                     }
-                    (Some(_), Some(_)) => {
-                        vec![tokens::whitespace_indent("\n\n", indent).into()]
-                    }
-                    _ => vec![],
-                };
-
-                editor.replace_all(range, replacement);
-            });
-        });
-
-        // TODO: Update internal references
-
-        // Move items to target
-        let items = chain![[renamed_adt_ast.into()], impl_asts.into_iter().map(ast::Item::from)];
-        match dst_mod_source.value {
-            ModuleSource::SourceFile(source_file) => {
-                builder.apply_edits_in_file(dst_file_id, &dst_mod_node, move |editor| {
-                    source_file.add_item_after_headers(editor, items);
                 })
-            }
-            ModuleSource::Module(module) => {
-                builder.apply_edits_in_file(dst_file_id, &dst_mod_node, move |editor| {
-                    module.add_item_after_headers(editor, items);
+                .unique()
+                .filter_map(|use_tree| {
+                    let use_tree_mut = scb.make_mut(use_tree.clone());
+                    let scope_mut = scb.make_import_scope_mut(
+                        ImportScope::find_insert_use_container(use_tree.syntax(), sema)?,
+                    );
+                    Some((use_tree, (use_tree_mut, scope_mut)))
                 })
-            }
-            ModuleSource::BlockExpr(_) => {
-                // TODO: Validate earlier
-                return None;
-            }
-        }
+                .collect();
 
-        // Update definition usages
-        let def = Definition::Adt(self.adt);
-        let usages = def.usages(sema).all();
-        for (file_id, refs) in usages.iter() {
-            // Special case to update refs in origin module
-            // - Add imports if there are any uncovered refs in the module (scope?)
-            // - Update names as normal
+            for RichNameRef { name_ref, kind, path, import } in refs {
+                match kind {
+                    NameRefKind::InUseTree => {
+                        // TODO: Maybe better UseTree parsing--follow existing conventions?
+                        // TODO: Do we need root_use_tree at all?
+                        let use_tree =
+                            name_ref.syntax().ancestors().find_map(ast::UseTree::cast)?;
 
-            // Unqualified name ref update
-            // - Just swap out the name for the ident
+                        if let Some((use_tree_mut, import_scope_mut)) =
+                            import_muts.remove(&use_tree)
+                        {
+                            // Remove old use tree
+                            use_tree_mut.remove_recursive();
 
-            // Qualified name ref update
-            // - Merge the paths somehow
-            let file_id = file_id.file_id(sema.db);
-            for FileReference { range, name, category } in refs {
-                builder.edit_file(file_id);
-                match name {
-                    FileReferenceNode::Name(_) => {
-                        builder.replace(
-                            *range,
-                            format!("{}", self.new_name.display(sema.db, edition)),
-                        );
-                    }
-                    FileReferenceNode::NameRef(name_ref) => {
-                        let path = full_path_of_name_ref(name_ref);
-                        let import_scope =
-                            ImportScope::find_insert_use_container(name_ref.syntax(), sema);
-
-                        // TODO: If the import is non-tree normal import, maybe just replace the full path in the path case
-                        if category.contains(ReferenceCategory::IMPORT) {
-                            if let Some(import_scope) = import_scope {
-                                let import_scope = builder.make_import_scope_mut(import_scope);
-
-                                if let Some(leaf_use_tree) =
-                                    name_ref.syntax().ancestors().find_map(ast::UseTree::cast)
-                                {
-                                    let leaf_use_tree = builder.make_mut(leaf_use_tree);
-                                    leaf_use_tree.remove_recursive();
-                                }
-
-                                let cfg = InsertUseConfig {
-                                    granularity: ImportGranularity::Crate, // or Module/Item/One
-                                    enforce_granularity: false, // infer style from existing file when false
-                                    prefix_kind: PrefixKind::ByCrate, // ByCrate | BySelf | Plain
-                                    group: true, // group into std/external/local blocks
-                                    skip_glob_imports: false, // allow merging into `*` imports
-                                };
-                                let path = path_from_text_with_edition(&self.dst_path, edition)
-                                    .clone_for_update();
-                                insert_use(&import_scope, path, &cfg);
-                            }
-                        } else if let Some(path) = path {
-                            if path.qualifier().is_some() {
-                                let mut segments = Vec::new();
-                                let mut current = Some(path.clone());
-                                while let Some(p) = current {
-                                    if let Some(segment) = p.segment() {
-                                        segments.push(segment);
-                                    }
-                                    current = p.qualifier();
-                                }
-                                segments.reverse();
-
-                                let dst_module_name = self
-                                    .dst_mod
-                                    .name(sema.db)
-                                    .map(|name| name.display(sema.db, edition).to_string());
-                                let old_type_name =
-                                    self.adt.name(sema.db).display(sema.db, edition).to_string();
-                                let new_type_name =
-                                    self.new_name.display(sema.db, edition).to_string();
-
-                                let mut new_segments = Vec::with_capacity(segments.len());
-                                for segment in &segments {
-                                    let segment_text = match segment.kind() {
-                                        Some(PathSegmentKind::CrateKw) => "crate".to_string(),
-                                        Some(PathSegmentKind::SuperKw) => "super".to_string(),
-                                        Some(PathSegmentKind::SelfKw) => "self".to_string(),
-                                        Some(PathSegmentKind::SelfTypeKw) => "Self".to_string(),
-                                        Some(PathSegmentKind::Name(name_ref)) => {
-                                            let mut text = name_ref.text().to_string();
-                                            if text == old_type_name {
-                                                text = new_type_name.clone();
-                                            }
-                                            text
-                                        }
-                                        _ => segment.syntax().to_string(),
-                                    };
-                                    new_segments.push(segment_text);
-                                }
-
-                                if let Some(dst_module_name) = dst_module_name {
-                                    if new_segments.len() >= 2 {
-                                        for idx in (0..new_segments.len() - 1).rev() {
-                                            if matches!(
-                                                segments[idx].kind(),
-                                                Some(PathSegmentKind::Name(_))
-                                            ) {
-                                                new_segments[idx] = dst_module_name.clone();
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let new_text = new_segments.join("::");
-                                builder.replace(path.syntax().text_range(), new_text);
-                            } else {
-                                builder.replace(
-                                    *range,
-                                    format!("{}", self.new_name.display(sema.db, edition)),
-                                );
-                            }
-                        } else {
-                            builder.replace(
-                                *range,
-                                format!("{}", self.new_name.display(sema.db, edition)),
+                            // Insert new use tree
+                            insert_use_with_alias_option(
+                                &import_scope_mut,
+                                new_path.full_path().clone_for_update(),
+                                &InsertUseConfig {
+                                    granularity: ImportGranularity::Crate,
+                                    enforce_granularity: false,
+                                    prefix_kind: PrefixKind::ByCrate,
+                                    group: true,
+                                    skip_glob_imports: false,
+                                },
+                                // TODO: Does this find the star token on the leaf use tree?
+                                // Mention that only case where we can be a glob here is if the def is an enum
+                                if use_tree.star_token().is_some() {
+                                    Some(AliasOrGlob::Glob)
+                                } else if let Some(rename) = use_tree.rename() {
+                                    Some(AliasOrGlob::Alias(rename))
+                                } else {
+                                    None
+                                },
                             );
                         }
                     }
-                    FileReferenceNode::Lifetime(_) | FileReferenceNode::FormatStringEntry(_, _) => {
-                        // TODO: Log something
-                        return None;
+                    NameRefKind::Qualified => {
+                        // TODO: Remove import if it becomes unused
+
+                        // Rename to fully qualified
+                        // TODO: Use make passed in as param
+                        scb.replace_ast(path, make::path_from_text(&new_path.full_path_str));
+                    }
+                    NameRefKind::UnQualified => {
+                        // Update import if not already updated
+                        if let Some(import) = import
+                            && let Some(use_tree) = import.use_tree()
+                            && let Some((use_tree_mut, import_scope_mut)) =
+                                import_muts.remove(&use_tree)
+                        {
+                            // Remove import if not glob
+                            // If the import is a glob, it must be a glob on the origin module of the definition,
+                            // which might resolve other usages in the current file. We could check for other usages
+                            // to determine if we can safely remove the glob import, but for now we just leave it.
+                            if !import.is_glob() {
+                                use_tree_mut.remove_recursive();
+                            }
+
+                            // Add new import
+                            insert_use_with_alias_option(
+                                &import_scope_mut,
+                                new_path.full_path().clone_for_update(),
+                                &InsertUseConfig {
+                                    granularity: ImportGranularity::Crate,
+                                    enforce_granularity: false,
+                                    prefix_kind: PrefixKind::ByCrate,
+                                    group: true,
+                                    skip_glob_imports: false,
+                                },
+                                None,
+                            );
+                        }
+
+                        // Rename name ref
+                        // TODO: Use make passed as a param
+                        scb.replace_ast(name_ref, make::name_ref(&new_path.name_str(sema.db)));
                     }
                 }
             }
         }
 
-        Some(builder.finish())
+        Some(())
     }
-}
-
-// TODO: Remove and use existing method or at least update algo based on those methods
-fn get_lca_mod(sema: &Semantics<'_, RootDatabase>, mod_a: Module, mod_b: Module) -> Option<Module> {
-    let [mod_a, mod_b] = [mod_a, mod_b].map(Definition::Module);
-    let [mut mod_a_path, mut mod_b_path] =
-        [&mod_a, &mod_b].map(|d| d.canonical_module_path(sema.db).into_iter().flatten());
-
-    let mut lca = None;
-    while let (Some(mod_a_segment), Some(mod_b_segment)) = (mod_a_path.next(), mod_b_path.next()) {
-        if mod_a_segment == mod_b_segment {
-            lca = Some(mod_a_segment);
-        } else {
-            break;
-        }
-    }
-    lca
-}
-
-#[derive(Debug)]
-enum NameRefKind {
-    InUseTree(ast::UseTree),
-    Qualified(ast::Path),
-    UnQualified(Option<ImportResolution>),
 }
 
 #[derive(Debug)]
@@ -667,9 +612,9 @@ impl<'a> ExternalRefs<'a> {
                 let file_refs = file_refs
                     .into_iter()
                     .filter_map(|FileReference { name, .. }| match name {
-                        FileReferenceNode::Name(_) => {
+                        FileReferenceNode::Name(name) => {
                             // NOTE: Should not have to worry about Names for rename-moves for supported subset of definitions
-                            None
+                            panic!("Found name: {name:?}");
                         }
                         FileReferenceNode::NameRef(name_ref) => {
                             let name_ref_class = NameRefClass::classify(sema, &name_ref)?;
@@ -743,8 +688,7 @@ pub mod bar;
 pub mod baz;
 pub mod buz;
 pub mod blast;
-
-pub fn main() {}
+pub mod destruct;
 
 //- /foo.rs
 pub struct Alpha;
@@ -764,6 +708,10 @@ impl Delta {
 pub enum Epsilon {
     VariantA,
     VariantB,
+}
+
+pub struct ForDestruct {
+    inner: i32,
 }
 
 //- /bar.rs
@@ -809,7 +757,7 @@ use crate::foo;
 
 // NOTE: Fail to get import_res for foo::Epsilon
 fn my_fun(eps: foo::Epsilon) {
-    use crate::foo::Epsilon::*;
+    use crate::foo::{Alpha, Epsilon::*};
 
     match eps {
         VariantA => {}
@@ -830,6 +778,20 @@ mod other_inner {
 
     const EPS: EpsRename = EpsRename::VariantA;
 }
+
+//- /destruct.rs
+use crate::foo::ForDestruct;
+
+fn do_destruct(d: ForDestruct) -> i32 {
+    let ForDestruct { inner } = d;
+    inner
+}
+
+fn do_destruct_param(ForDestruct { inner }: ForDestruct) -> i32 {
+    inner
+}
+
+
 "#;
 
         let (dbg_file, dbg_def) = std::env::var("DD")
@@ -839,50 +801,52 @@ mod other_inner {
             .expect("malformed debug");
 
         let (db, files) = RootDatabase::with_many_files(fixture);
-        let sema = Semantics::new(&db);
-        let edition = Edition::LATEST;
 
-        // TODO: Find in refs in glob
-        // - Actually, we could potentially determine if
+        attach_db(&db, || {
+            let sema = Semantics::new(&db);
+            let edition = Edition::LATEST;
 
-        let source_files: FxHashMap<_, _> = ["main", "foo", "bar", "baz", "buz", "blast"]
-            .into_iter()
-            .zip(&files)
-            .map(|(name, file)| (name, sema.parse(*file)))
-            .collect();
+            // TODO: Find in refs in glob
+            // - Actually, we could potentially determine if
 
-        dbg!(&source_files[dbg_file.as_str()]);
+            let source_files: FxHashMap<_, _> =
+                ["main", "foo", "bar", "baz", "buz", "blast", "destruct"]
+                    .into_iter()
+                    .zip(&files)
+                    .map(|(name, file)| (name, sema.parse(*file)))
+                    .collect();
 
-        let file_names: FxHashMap<_, _> = source_files
-            .iter()
-            .map(|(name, sf)| (sema.hir_file_for(sf.syntax()).file_id().unwrap(), *name))
-            .collect();
+            dbg!(&source_files[dbg_file.as_str()]);
 
-        let defs: FxHashMap<_, _> = source_files["foo"]
-            .items()
-            .filter_map(|i| ast::Adt::cast(i.syntax().clone()))
-            .map(|adt| sema.to_adt_def(&adt).unwrap())
-            .map(|adt| Definition::Adt(adt))
-            .map(|adt| {
-                let name = format!("{}", adt.name(sema.db).unwrap().display(sema.db, edition));
-                (name, adt)
-            })
-            .collect();
+            let file_names: FxHashMap<_, _> = source_files
+                .iter()
+                .map(|(name, sf)| (sema.hir_file_for(sf.syntax()).file_id().unwrap(), *name))
+                .collect();
 
-        let refs: FxHashMap<_, _> = defs
-            .iter()
-            .map(|(name, def)| {
-                let refs = attach_db(&db, || {
-                    ExternalRefs::compute(&sema, def.clone())
+            let defs: FxHashMap<_, _> = source_files["foo"]
+                .items()
+                .filter_map(|i| ast::Adt::cast(i.syntax().clone()))
+                .map(|adt| sema.to_adt_def(&adt).unwrap())
+                .map(|adt| Definition::Adt(adt))
+                .map(|adt| {
+                    let name = format!("{}", adt.name(sema.db).unwrap().display(sema.db, edition));
+                    (name, adt)
+                })
+                .collect();
+
+            let refs: FxHashMap<_, _> = defs
+                .iter()
+                .map(|(name, def)| {
+                    let refs = ExternalRefs::compute(&sema, def.clone())
                         .refs
                         .into_iter()
                         .map(|(file_id, refs)| (file_names[&file_id], refs))
-                        .collect::<FxHashMap<_, _>>()
-                });
-                (name.as_str(), refs)
-            })
-            .collect();
+                        .collect::<FxHashMap<_, _>>();
+                    (name.as_str(), refs)
+                })
+                .collect();
 
-        dbg!(&refs[dbg_def.as_str()][dbg_file.as_str()]);
+            dbg!(&refs[dbg_def.as_str()][dbg_file.as_str()]);
+        });
     }
 }

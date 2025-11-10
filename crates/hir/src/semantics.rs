@@ -26,7 +26,7 @@ use hir_expand::{
     attrs::collect_attrs,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
     db::ExpandDatabase,
-    files::{FileRangeWrapper, HirFileRange, InRealFile},
+    files::{FileRangeWrapper, HirFileRange, InFileWrapper, InRealFile},
     mod_path::{ModPath, PathKind},
     name::AsName,
 };
@@ -153,6 +153,19 @@ impl ImportResolution {
                 Self::ExternCrate(id.lookup(db).source(db)).into()
             }
         }
+    }
+
+    pub fn use_tree(&self) -> Option<ast::UseTree> {
+        match self {
+            ImportResolution::Import(in_file) | ImportResolution::Glob(in_file) => {
+                Some(in_file.value.clone())
+            }
+            ImportResolution::ExternCrate(_) => None,
+        }
+    }
+
+    pub fn is_glob(&self) -> bool {
+        matches!(self, Self::Glob(_))
     }
 }
 

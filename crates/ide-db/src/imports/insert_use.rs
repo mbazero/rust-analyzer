@@ -62,7 +62,7 @@ pub struct ImportScope {
     pub required_cfgs: Vec<ast::Attr>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum ImportScopeKind {
     File(ast::SourceFile),
     Module(ast::ItemList),
@@ -157,14 +157,20 @@ pub fn insert_use_as_alias(scope: &ImportScope, path: ast::Path, cfg: &InsertUse
         .expect("Failed to make ast node `Rename`");
     let alias = node.rename();
 
-    insert_use_with_alias_option(scope, path, cfg, alias);
+    insert_use_with_alias_option(scope, path, cfg, alias.map(AliasOrGlob::Alias));
 }
 
-fn insert_use_with_alias_option(
+#[derive(Debug, Clone)]
+pub enum AliasOrGlob {
+    Alias(ast::Rename),
+    Glob,
+}
+
+pub fn insert_use_with_alias_option(
     scope: &ImportScope,
     path: ast::Path,
     cfg: &InsertUseConfig,
-    alias: Option<ast::Rename>,
+    alias_or_glob: Option<AliasOrGlob>,
 ) {
     let _p = tracing::info_span!("insert_use_with_alias_option").entered();
     let mut mb = match cfg.granularity {
@@ -195,7 +201,12 @@ fn insert_use_with_alias_option(
         };
     }
 
-    let mut use_tree = make::use_tree(path, None, alias, false);
+    let (alias, add_star) = match alias_or_glob {
+        Some(AliasOrGlob::Alias(alias)) => (Some(alias), false),
+        Some(AliasOrGlob::Glob) => (None, true),
+        None => (None, false),
+    };
+    let mut use_tree = make::use_tree(path, None, alias, add_star);
     if mb == Some(MergeBehavior::One) && use_tree.path().is_some() {
         use_tree = use_tree.clone_for_update();
         use_tree.wrap_in_tree_list();

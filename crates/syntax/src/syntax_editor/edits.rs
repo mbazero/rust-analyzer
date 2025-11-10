@@ -437,6 +437,12 @@ pub trait SetVisibility: ast::HasVisibility {
             self.set_visibility(editor, new_vis);
         }
     }
+
+    fn set_visibility_if_none(&self, editor: &mut SyntaxEditor, new_vis: Option<&ast::Visibility>) {
+        if self.visibility().is_none() {
+            self.set_visibility(editor, new_vis);
+        }
+    }
 }
 
 impl<T: HasVisibility> SetVisibility for T {}

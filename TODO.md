@@ -1,4 +1,7 @@
 # Active
+- Add a bunch of tests for external ref updates and all different conditions
+- Clean up stuff below
+
 - Resolve glom external refs
     - Looks like there's existing functionality in resolver to get glob imports
 - Clean up external ref updating logic
@@ -74,6 +77,7 @@ struct OutRef {
 }
 
 Edge cases:
+- Proper alias updating
 - Ensure you can't rename-move non-top-level functions
   - At least those within an impl block
 - Support raw identifiers
