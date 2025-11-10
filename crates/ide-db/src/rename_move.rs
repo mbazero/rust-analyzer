@@ -818,6 +818,18 @@ fn my_fun(eps: foo::Epsilon) {
 
     if let foo::Epsilon::VariantA = eps {}
 }
+
+mod inner {
+    use crate::foo as fud;
+
+    const EPS: fud::Epsilon = fud::Epsilon::VariantA;
+}
+
+mod other_inner {
+    use crate::foo::Epsilon as EpsRename;
+
+    const EPS: EpsRename = EpsRename::VariantA;
+}
 "#;
 
         let (dbg_file, dbg_def) = std::env::var("DD")
