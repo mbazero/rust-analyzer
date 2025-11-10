@@ -294,6 +294,7 @@ impl Refs {
     }
 }
 
+// USEFUL: Find refs within a module
 fn find_refs_in_mod(
     ctx: &AssistContext<'_>,
     expandable: Expandable,
@@ -364,6 +365,7 @@ fn is_visible_from(ctx: &AssistContext<'_>, expandable: &Expandable, from: Modul
 // use foo::*$0;
 // use baz::Baz;
 // ↑ ---------------
+// USEFUL: Find imported defs
 fn find_imported_defs(ctx: &AssistContext<'_>, use_item: Use) -> Vec<Definition> {
     [Direction::Prev, Direction::Next]
         .into_iter()

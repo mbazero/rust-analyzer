@@ -1,3 +1,5 @@
+use crate::defs::NameClass;
+use crate::defs::NameRefClass;
 use crate::imports::insert_use::ImportGranularity;
 use crate::imports::insert_use::ImportScope;
 use crate::imports::insert_use::InsertUseConfig;
@@ -13,9 +15,12 @@ use hir::HasSource;
 use hir::ImportResolution;
 use hir::InFile;
 use hir::InFileWrapper;
+use hir::ModPath;
 use hir::ModuleSource;
+use hir::PathResolution;
 use hir::PrefixKind;
 use hir::Visibility;
+use hir::db::ExpandDatabase;
 use hir::{Module, Name, Semantics};
 use itertools::chain;
 use parser::T;
@@ -634,12 +639,26 @@ enum ExternalRef {
 }
 
 #[derive(Debug)]
-struct ExternalRefs {
-    refs: FxHashMap<EditionedFileId, Vec<ExternalRef>>,
+struct ExternalRefs<'a> {
+    refs: FxHashMap<EditionedFileId, Vec<NameRefInfo<'a>>>,
 }
 
-impl ExternalRefs {
-    fn compute(sema: &Semantics<'_, RootDatabase>, def: Definition) -> Self {
+#[derive(Debug)]
+struct NameRefInfo<'a> {
+    full_path: String,
+    immediate_path: ast::Path,
+    first_seg: ast::Path,
+    name_ref: NameRef,
+    name_ref_class: NameRefClass<'a>,
+    mod_path: Option<ModPath>,
+    path_res: Option<PathResolution>,
+    import_res: Option<ImportResolution>,
+    import_res_first_seg: Option<ImportResolution>,
+    in_use_tree: Option<ast::UseTree>,
+}
+
+impl<'a> ExternalRefs<'a> {
+    fn compute(sema: &Semantics<'a, RootDatabase>, def: Definition) -> Self {
         let refs = def
             .usages(sema)
             .all()
@@ -648,28 +667,47 @@ impl ExternalRefs {
                 let file_refs = file_refs
                     .into_iter()
                     .filter_map(|FileReference { name, .. }| match name {
-                        FileReferenceNode::Name(name) => {
-                            println!("FOUND NAME!!! {name}");
-                            let path = name.syntax().ancestors().find_map(ast::Path::cast)?;
-                            println!("Name path: {path}");
-                            ExternalRef::Name(name, sema.resolve_import(&path)).into()
+                        FileReferenceNode::Name(_) => {
+                            // NOTE: Should not have to worry about Names for rename-moves for supported subset of definitions
+                            None
                         }
                         FileReferenceNode::NameRef(name_ref) => {
-                            // TODO: Better in use stament check, per codebase convention
-                            let kind = if let Some(use_tree) =
-                                name_ref.syntax().ancestors().filter_map(ast::UseTree::cast).last()
-                            {
-                                NameRefKind::InUseTree(use_tree)
-                            } else {
-                                let path = full_path_of_name_ref(&name_ref)?;
-                                println!("NameRef path: {path}");
-                                if let Some(qualifier) = path.qualifier() {
-                                    NameRefKind::Qualified(qualifier)
-                                } else {
-                                    NameRefKind::UnQualified(sema.resolve_import(&path))
-                                }
+                            let name_ref_class = NameRefClass::classify(sema, &name_ref)?;
+                            // NOTE: Immediate path seems to get everything we want excluding potential variant suffix
+                            let immediate_path =
+                                name_ref.syntax().ancestors().find_map(ast::Path::cast)?;
+                            // NOTE: This gets the entire path, like "Epsilon::VariantA" for NameRef "Epsilon", which we don't actually want I don't think
+                            let full_path = full_path_of_name_ref(&name_ref)?;
+                            let mod_path = {
+                                let file_id = sema.hir_file_for(immediate_path.syntax());
+                                let span_map = sema.db.span_map(file_id);
+                                ModPath::from_src(sema.db, immediate_path.clone(), &mut |range| {
+                                    span_map.span_for_range(range).ctx
+                                })
                             };
-                            ExternalRef::NameRef(name_ref, kind).into()
+                            let path_res = sema.resolve_path(&immediate_path);
+                            let import_res = sema.resolve_import(&immediate_path);
+
+                            let first_seg = immediate_path.first_qualifier_or_self();
+                            let import_res_first_seg = sema.resolve_import(&first_seg);
+
+                            // TODO: Better in use stament check, per codebase convention
+                            let in_use_tree =
+                                name_ref.syntax().ancestors().filter_map(ast::UseTree::cast).last();
+
+                            NameRefInfo {
+                                full_path: format!("{full_path}"),
+                                first_seg,
+                                name_ref,
+                                name_ref_class,
+                                immediate_path,
+                                mod_path,
+                                path_res,
+                                import_res,
+                                import_res_first_seg,
+                                in_use_tree,
+                            }
+                            .into()
                         }
                         FileReferenceNode::Lifetime(_) => None,
                         FileReferenceNode::FormatStringEntry(_, _) => None,
@@ -685,8 +723,9 @@ impl ExternalRefs {
 
 #[cfg(test)]
 mod tests {
-    use hir::Semantics;
+    use hir::{Semantics, attach_db};
     use rustc_hash::FxHashMap;
+    use span::Edition;
     use syntax::{
         AstNode,
         ast::{self, HasModuleItem},
@@ -703,6 +742,7 @@ pub mod foo;
 pub mod bar;
 pub mod baz;
 pub mod buz;
+pub mod blast;
 
 pub fn main() {}
 
@@ -710,7 +750,16 @@ pub fn main() {}
 pub struct Alpha;
 pub struct Beta;
 pub struct Gamma;
+
 pub struct Delta;
+
+impl Delta {
+    pub fn delta_assoc() -> Self {
+        Self
+    }
+
+    pub fn delta_method(&self) {}
+}
 
 pub enum Epsilon {
     VariantA,
@@ -721,6 +770,7 @@ pub enum Epsilon {
 use crate::foo::Alpha;
 use super::foo::Beta;
 use crate::foo::Epsilon;
+use crate::foo::Delta;
 
 fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
     (a, b)
@@ -729,14 +779,19 @@ fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
 fn eps_fun(eps: Epsilon) {
     match eps {
         Epsilon::VariantA => {}
-        Epsilon::VariantB => {}
+        crate::foo::Epsilon::VariantB => {}
     }
 
     if let Epsilon::VariantA = eps {}
 }
 
+fn use_delta(delta: Delta) {
+    Delta::delta_assoc();
+    delta.delta_method();
+}
+
 //- /baz.rs
-use crate::foo::{Alpha, Beta};
+use crate::foo::{Alpha, Beta, Epsilon};
 
 fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
     (a, b)
@@ -748,51 +803,74 @@ use crate::foo::*;
 fn my_fun(a: Alpha, b: Beta) -> (Alpha, Beta) {
     (a, b)
 }
+
+//- /blast.rs
+use crate::foo;
+
+// NOTE: Fail to get import_res for foo::Epsilon
+fn my_fun(eps: foo::Epsilon) {
+    use crate::foo::Epsilon::*;
+
+    match eps {
+        VariantA => {}
+        VariantB => {}
+    }
+
+    if let foo::Epsilon::VariantA = eps {}
+}
 "#;
 
+        let (dbg_file, dbg_def) = std::env::var("DD")
+            .expect("no debug specified")
+            .split_once(':')
+            .map(|(x, y)| (x.to_owned(), y.to_owned()))
+            .expect("malformed debug");
+
         let (db, files) = RootDatabase::with_many_files(fixture);
-        let krate = db.test_crate();
         let sema = Semantics::new(&db);
+        let edition = Edition::LATEST;
 
         // TODO: Find in refs in glob
         // - Actually, we could potentially determine if
 
-        let sfs: FxHashMap<_, _> = ["main", "foo", "bar", "baz", "buz"]
+        let source_files: FxHashMap<_, _> = ["main", "foo", "bar", "baz", "buz", "blast"]
             .into_iter()
             .zip(&files)
             .map(|(name, file)| (name, sema.parse(*file)))
             .collect();
 
-        dbg!(sfs["bar"].syntax());
+        dbg!(&source_files[dbg_file.as_str()]);
 
-        let file_names: FxHashMap<_, _> = sfs
+        let file_names: FxHashMap<_, _> = source_files
             .iter()
             .map(|(name, sf)| (sema.hir_file_for(sf.syntax()).file_id().unwrap(), *name))
             .collect();
 
-        let defs: Vec<_> = sfs["foo"]
+        let defs: FxHashMap<_, _> = source_files["foo"]
             .items()
             .filter_map(|i| ast::Adt::cast(i.syntax().clone()))
             .map(|adt| sema.to_adt_def(&adt).unwrap())
             .map(|adt| Definition::Adt(adt))
+            .map(|adt| {
+                let name = format!("{}", adt.name(sema.db).unwrap().display(sema.db, edition));
+                (name, adt)
+            })
             .collect();
 
-        let [alpha, beta, gamma, delta, epsilon] = defs.try_into().unwrap();
-
-        dbg!(&alpha);
-        dbg!(&epsilon);
-
-        let refs: FxHashMap<_, _> = ExternalRefs::compute(&sema, alpha)
-            .refs
-            .into_iter()
-            .map(|(file_id, refs)| (file_names[&file_id], refs))
+        let refs: FxHashMap<_, _> = defs
+            .iter()
+            .map(|(name, def)| {
+                let refs = attach_db(&db, || {
+                    ExternalRefs::compute(&sema, def.clone())
+                        .refs
+                        .into_iter()
+                        .map(|(file_id, refs)| (file_names[&file_id], refs))
+                        .collect::<FxHashMap<_, _>>()
+                });
+                (name.as_str(), refs)
+            })
             .collect();
 
-        dbg!(refs);
-
-        // dbg!(defs);
-
-        // dbg!(&bar.syntax());
-        // dbg!(&baz.syntax());
+        dbg!(&refs[dbg_def.as_str()][dbg_file.as_str()]);
     }
 }

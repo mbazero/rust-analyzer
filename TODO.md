@@ -74,6 +74,8 @@ struct OutRef {
 }
 
 Edge cases:
+- Ensure you can't rename-move non-top-level functions
+  - At least those within an impl block
 - Support raw identifiers
 - Derive macros, etc must be moved as well
 - Adt defined within function etc
