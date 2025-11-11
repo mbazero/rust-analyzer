@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 
 use hir::Semantics;
 use syntax::{
-    Direction, NodeOrToken, SyntaxKind, SyntaxNode, algo,
+    Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, algo,
     ast::{
         self, AstNode, HasAttrs, HasModuleItem, HasVisibility, PathSegmentKind,
         edit_in_place::Removable, make,
@@ -440,6 +440,7 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
         if let Some((.., node)) = post_group {
             cov_mark::hit!(insert_group_new_group);
             ted::insert(ted::Position::before(&node), use_item.syntax());
+            // USEFUL: Non-trivia sibling
             if let Some(node) = algo::non_trivia_sibling(node.into(), Direction::Prev) {
                 ted::insert(ted::Position::after(node), make::tokens::single_newline());
             }
@@ -470,6 +471,8 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
     };
     // there are no imports in this file at all
     // so put the import after all inner module attributes and possible license header comments
+    //
+    // USEFUL: Insert after headers
     if let Some(last_inner_element) = scope_syntax
         .children_with_tokens()
         // skip the curly brace

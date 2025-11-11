@@ -302,22 +302,147 @@ mod tests {
     // TODO: Remove
     #[test]
     #[allow(clippy::dbg_macro)]
-    fn test_sandbox() {
+    fn test_print() {
         let sf = SourceFile::parse(
             r#"
-mod {
-    struct Hello;
-
-    // Comment
-
-    struct World;
-}
+use crate::foo::{Foo, Bar};
 "#,
             Edition::LATEST,
         )
         .tree();
 
         dbg!(sf);
+    }
+
+    // TODO: Remove
+    #[test]
+    fn test_sandbox() {
+        check(
+            "crate::fizz::FizzStruct",
+            r#"
+mod foo {
+    pub(crate) struct $0FooStruct;
+    pub(crate) struct FooOtherStruct;
+}
+
+mod fizz {}
+
+mod bar {
+    use crate::foo::FooStruct;
+    fn use_foo(f: FooStruct) -> FooStruct { f }
+}
+
+mod beta {
+    use crate::foo::{FooStruct, FooOtherStruct};
+    fn use_foo(f: (FooStruct, FooOtherStruct)) -> (FooStruct, FooOtherStruct) { f }
+}
+"#,
+            r#"
+mod foo {
+    pub(crate) struct FooOtherStruct;
+}
+
+mod fizz {
+    pub(crate) struct FizzStruct;
+}
+
+mod bar {
+    use crate::fizz::FizzStruct;
+    fn use_foo(f: FizzStruct) -> FizzStruct { f }
+}
+
+mod beta {
+    use crate::fizz::FizzStruct;
+    use crate::foo::FooOtherStruct;
+    fn use_foo(f: (FizzStruct, FooOtherStruct)) -> (FizzStruct, FooOtherStruct) { f }
+}
+"#,
+        );
+    }
+
+    // TODO: Alias checks
+    // TODO: Nested import
+    // TODO: Variant glob import
+    // TODO: Variant normal import
+    #[test]
+    fn test_rename_move_external_refs_updated_properly() {
+        check(
+            "crate::target::TargetStruct",
+            r#"
+//- /main.rs
+mod origin;
+mod target;
+mod crate_import;
+mod super_import;
+mod glob_import;
+mod mod_qualified_ref;
+mod mod_qualified_ref_from_glob;
+mod crate_qualified_ref;
+mod super_qualified_ref;
+mod nested_super_qualified_ref;
+//- /origin.rs
+pub(crate) mod inner {
+    pub(crate) struct $0OriginStruct;
+}
+//- /target.rs
+//- /crate_import.rs
+use crate::origin::inner::OriginStruct;
+struct Inner(OriginStruct);
+//- /super_import.rs
+use super::origin::inner::OriginStruct;
+struct Inner(OriginStruct);
+//- /glob_import.rs
+use crate::origin::inner::*;
+struct Inner(OriginStruct);
+//- /mod_qualified_ref.rs
+use super::origin::inner;
+struct Inner(inner::OriginStruct);
+//- /mod_qualified_ref_from_glob.rs
+use super::origin::*;
+struct Inner(inner::OriginStruct);
+//- /crate_qualified_ref.rs
+struct Inner(crate::origin::inner::OriginStruct);
+//- /super_qualified_ref.rs
+struct Inner(super::origin::inner::OriginStruct);
+//- /nested_super_qualified_ref.rs
+use crate::origin::inner::OriginStruct;
+mod inner {
+    struct Inner(super::OriginStruct);
+}
+"#,
+            r#"
+//- /origin.rs
+pub(crate) mod inner {}
+//- /target.rs
+pub(crate) struct TargetStruct;
+//- /crate_import.rs
+use crate::target::TargetStruct;
+struct Inner(TargetStruct);
+//- /super_import.rs
+use crate::target::TargetStruct;
+
+struct Inner(TargetStruct);
+//- /glob_import.rs
+use crate::origin::inner::*;
+use crate::target::TargetStruct;
+struct Inner(TargetStruct);
+//- /mod_qualified_ref.rs
+use super::origin::inner;
+struct Inner(crate::target::TargetStruct);
+//- /mod_qualified_ref_from_glob.rs
+use super::origin::*;
+struct Inner(crate::target::TargetStruct);
+//- /crate_qualified_ref.rs
+struct Inner(crate::target::TargetStruct);
+//- /super_qualified_ref.rs
+struct Inner(crate::target::TargetStruct);
+//- /nested_super_qualified_ref.rs
+use crate::target::TargetStruct;
+mod inner {
+    struct Inner(crate::target::TargetStruct);
+}
+"#,
+        )
     }
 
     // TODO: Fix spacing on use statements
@@ -347,7 +472,6 @@ mod fizz {
 
 mod bar {
     use crate::fizz::FizzStruct;
-
 
     fn use_foo(f: FizzStruct) -> FizzStruct { f }
 }
@@ -404,12 +528,12 @@ mod fizz {
 
 mod bar {
     use crate::fizz::FizzStruct;
-
     fn use_foo(f: FizzStruct) -> FizzStruct { f }
 }
 
 mod beta {
-    use crate::{fizz::FizzStruct, foo::FooOtherStruct};
+    use crate::fizz::FizzStruct;
+    use crate::foo::FooOtherStruct;
     fn use_foo(f: (FizzStruct, FooOtherStruct)) -> (FizzStruct, FooOtherStruct) { f }
 }
 

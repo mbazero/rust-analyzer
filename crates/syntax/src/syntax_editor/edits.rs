@@ -173,8 +173,6 @@ impl ast::Module {
             first_non_ws.filter(|x| Some(x) != r_curly.as_ref())
         });
 
-        dbg!(&last_header, &first_body);
-
         let (prefix_ws, body_indent, insert_pos) = if let Some(last_header) = &last_header {
             ("\n\n", IndentLevel::from_element(last_header), Position::after(last_header))
         } else if let Some(l_curly) = &l_curly {
@@ -253,7 +251,7 @@ impl ast::SourceFile {
         };
 
         let prefix_ws = if last_header.is_some() { "\n\n" } else { "" };
-        let postfix_ws = if first_body.is_some() { "\n\n" } else { "" };
+        let postfix_ws = if first_body.is_some() { "\n\n" } else { "\n" };
 
         let elements = chain![
             tokens::whitespace_indent_opt(prefix_ws, indent).map(Into::into),

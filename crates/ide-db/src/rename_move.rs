@@ -1,3 +1,5 @@
+use std::iter;
+
 use crate::defs::NameClass;
 use crate::defs::NameRefClass;
 use crate::imports;
@@ -13,6 +15,7 @@ use crate::search::ReferenceCategory;
 use crate::source_change::SourceChangeBuilder;
 use crate::source_change::TreeMutator;
 use crate::syntax_helpers::node_ext::full_path_of_name_ref;
+use base_db::SourceDatabase;
 use hir::EditionedFileId;
 use hir::HasSource;
 use hir::ImportResolution;
@@ -396,18 +399,35 @@ fn rename_move_adt(
     Some(scb.finish())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum NameRefKind {
-    InUseTree,
-    Qualified,
-    UnQualified,
+    InUseTree(ast::UseTree),
+    Qualified(ast::Path),
+    UnQualified { import_is_glob: bool, import_use_tree: ast::UseTree },
 }
 
+#[derive(Debug, Clone)]
 struct RichNameRef {
-    name_ref: NameRef,
+    name_ref: ast::NameRef,
     kind: NameRefKind,
-    path: ast::Path,
-    import: Option<ImportResolution>,
+}
+
+impl RichNameRef {
+    fn into_mut(self, scb: &mut SourceChangeBuilder) -> Self {
+        Self {
+            name_ref: scb.make_mut(self.name_ref),
+            kind: match self.kind {
+                NameRefKind::InUseTree(use_tree) => NameRefKind::InUseTree(scb.make_mut(use_tree)),
+                NameRefKind::Qualified(path) => NameRefKind::Qualified(scb.make_mut(path)),
+                NameRefKind::UnQualified { import_is_glob, import_use_tree } => {
+                    NameRefKind::UnQualified {
+                        import_is_glob,
+                        import_use_tree: scb.make_mut(import_use_tree),
+                    }
+                }
+            },
+        }
+    }
 }
 
 struct RenameExternalRefs<'a> {
@@ -436,15 +456,21 @@ impl<'a> RenameExternalRefs<'a> {
                         FileReferenceNode::Name(_) => None,
                         FileReferenceNode::NameRef(name_ref) => {
                             let path = name_ref.syntax().ancestors().find_map(ast::Path::cast)?;
-                            let import = sema.resolve_import(&path.first_qualifier_or_self());
                             let kind = if category.contains(ReferenceCategory::IMPORT) {
-                                NameRefKind::InUseTree
+                                NameRefKind::InUseTree(
+                                    name_ref.syntax().ancestors().find_map(ast::UseTree::cast)?,
+                                )
                             } else if path.first_qualifier().is_some() {
-                                NameRefKind::Qualified
+                                NameRefKind::Qualified(path)
                             } else {
-                                NameRefKind::UnQualified
+                                let import_res =
+                                    sema.resolve_import(&path.first_qualifier_or_self())?;
+                                NameRefKind::UnQualified {
+                                    import_is_glob: import_res.is_glob(),
+                                    import_use_tree: import_res.use_tree()?,
+                                }
                             };
-                            RichNameRef { name_ref, kind, path, import }.into()
+                            RichNameRef { name_ref, kind }.into()
                         }
                         FileReferenceNode::Lifetime(_) => None,
                         FileReferenceNode::FormatStringEntry(_, _) => None,
@@ -460,96 +486,102 @@ impl<'a> RenameExternalRefs<'a> {
 
     fn update_inline(self, scb: &mut SourceChangeBuilder, new_path: &NewPath) -> Option<()> {
         let RenameExternalRefs { sema, refs } = self;
+
         for (file_id, refs) in refs {
+            // TODO: Remove
+            debug::print_fname(sema.db, file_id);
+
             // TODO: Wrap in per-file function that returns option
             scb.edit_file(file_id.file_id(sema.db));
 
-            let mut import_muts: FxHashMap<_, _> = refs
+            let use_trees: Vec<_> = refs
                 .iter()
-                .filter_map(|RichNameRef { name_ref, kind, import, .. }| match kind {
-                    NameRefKind::InUseTree => {
-                        name_ref.syntax().ancestors().find_map(ast::UseTree::cast)
-                    }
-                    NameRefKind::Qualified => None,
-                    NameRefKind::UnQualified => {
-                        import.as_ref().and_then(ImportResolution::use_tree)
-                    }
-                })
-                .unique()
-                .filter_map(|use_tree| {
-                    let use_tree_mut = scb.make_mut(use_tree.clone());
-                    let scope_mut = scb.make_import_scope_mut(
-                        ImportScope::find_insert_use_container(use_tree.syntax(), sema)?,
-                    );
-                    Some((use_tree, (use_tree_mut, scope_mut)))
+                .map(|RichNameRef { kind, .. }| match kind {
+                    NameRefKind::InUseTree(use_tree) => Some(use_tree),
+                    NameRefKind::Qualified(_) => None,
+                    NameRefKind::UnQualified { import_use_tree, .. } => Some(import_use_tree),
                 })
                 .collect();
 
-            for RichNameRef { name_ref, kind, path, import } in refs {
-                match kind {
-                    NameRefKind::InUseTree => {
-                        // TODO: Maybe better UseTree parsing--follow existing conventions?
-                        // TODO: Do we need root_use_tree at all?
-                        let use_tree =
-                            name_ref.syntax().ancestors().find_map(ast::UseTree::cast)?;
+            let mut import_scope_muts: FxHashMap<_, _> = use_trees
+                .iter()
+                .flatten()
+                .unique()
+                .filter_map(|&use_tree| {
+                    let import_scope = scb.make_import_scope_mut(
+                        ImportScope::find_insert_use_container(use_tree.syntax(), sema)?,
+                    );
+                    Some((use_tree.clone(), import_scope))
+                })
+                .collect();
 
-                        if let Some((use_tree_mut, import_scope_mut)) =
-                            import_muts.remove(&use_tree)
+            let ref_muts: Vec<_> = refs.iter().cloned().map(|r| r.into_mut(scb)).collect();
+
+            for (use_tree, ref_mut) in iter::zip(use_trees, ref_muts) {
+                match ref_mut.kind {
+                    NameRefKind::InUseTree(use_tree_mut) => {
+                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree.unwrap())
                         {
-                            // Remove old use tree
-                            use_tree_mut.remove_recursive();
+                            // TODO: Does this find the star token on the leaf use tree?
+                            // Mention that only case where we can be a glob here is if the def is an enum
+                            let alias_or_glob = if use_tree_mut.star_token().is_some() {
+                                Some(AliasOrGlob::Glob)
+                            } else if let Some(rename) = use_tree_mut.rename() {
+                                Some(AliasOrGlob::Alias(rename))
+                            } else {
+                                None
+                            };
 
                             // Insert new use tree
                             insert_use_with_alias_option(
                                 &import_scope_mut,
                                 new_path.full_path().clone_for_update(),
                                 &InsertUseConfig {
-                                    granularity: ImportGranularity::Crate,
+                                    granularity: ImportGranularity::Module,
                                     enforce_granularity: false,
                                     prefix_kind: PrefixKind::ByCrate,
                                     group: true,
                                     skip_glob_imports: false,
                                 },
-                                // TODO: Does this find the star token on the leaf use tree?
-                                // Mention that only case where we can be a glob here is if the def is an enum
-                                if use_tree.star_token().is_some() {
-                                    Some(AliasOrGlob::Glob)
-                                } else if let Some(rename) = use_tree.rename() {
-                                    Some(AliasOrGlob::Alias(rename))
-                                } else {
-                                    None
-                                },
+                                alias_or_glob,
                             );
+
+                            // Remove old use tree
+                            use_tree_mut.remove_recursive();
                         }
                     }
-                    NameRefKind::Qualified => {
+                    NameRefKind::Qualified(path_mut) => {
                         // TODO: Remove import if it becomes unused
 
                         // Rename to fully qualified
                         // TODO: Use make passed in as param
-                        scb.replace_ast(path, make::path_from_text(&new_path.full_path_str));
+                        ted::replace(
+                            path_mut.syntax(),
+                            make::path_from_text(&new_path.full_path_str)
+                                .clone_for_update()
+                                .syntax(),
+                        );
                     }
-                    NameRefKind::UnQualified => {
-                        // Update import if not already updated
-                        if let Some(import) = import
-                            && let Some(use_tree) = import.use_tree()
-                            && let Some((use_tree_mut, import_scope_mut)) =
-                                import_muts.remove(&use_tree)
-                        {
-                            // Remove import if not glob
-                            // If the import is a glob, it must be a glob on the origin module of the definition,
-                            // which might resolve other usages in the current file. We could check for other usages
-                            // to determine if we can safely remove the glob import, but for now we just leave it.
-                            if !import.is_glob() {
-                                use_tree_mut.remove_recursive();
-                            }
+                    NameRefKind::UnQualified {
+                        import_is_glob,
+                        import_use_tree: import_use_tree_mut,
+                    } => {
+                        // Rename name ref
+                        // TODO: Use make passed as a param
+                        ted::replace(
+                            ref_mut.name_ref.syntax(),
+                            make::name_ref(&new_path.name_str(sema.db)).clone_for_update().syntax(),
+                        );
 
+                        // Update import if not already updated
+                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree.unwrap())
+                        {
                             // Add new import
                             insert_use_with_alias_option(
                                 &import_scope_mut,
                                 new_path.full_path().clone_for_update(),
                                 &InsertUseConfig {
-                                    granularity: ImportGranularity::Crate,
+                                    granularity: ImportGranularity::Module,
                                     enforce_granularity: false,
                                     prefix_kind: PrefixKind::ByCrate,
                                     group: true,
@@ -557,11 +589,15 @@ impl<'a> RenameExternalRefs<'a> {
                                 },
                                 None,
                             );
-                        }
 
-                        // Rename name ref
-                        // TODO: Use make passed as a param
-                        scb.replace_ast(name_ref, make::name_ref(&new_path.name_str(sema.db)));
+                            // Remove old import if not glob
+                            // If the import is a glob, it must be a glob on the origin module of the definition,
+                            // which might resolve other usages in the current file. We could check for other usages
+                            // to determine if we can safely remove the glob import, but for now we just leave it.
+                            if !import_is_glob {
+                                import_use_tree_mut.remove_recursive();
+                            }
+                        }
                     }
                 }
             }
@@ -666,6 +702,25 @@ impl<'a> ExternalRefs<'a> {
     }
 }
 
+// TODO: Remove
+pub mod debug {
+    use super::*;
+
+    pub fn print_fname(db: &RootDatabase, file_id: EditionedFileId) -> Option<()> {
+        let fid = file_id.file_id(db);
+        let sr_id = db.file_source_root(fid).source_root_id(db);
+        let sr = db.source_root(sr_id).source_root(db);
+        let vpath = sr.path_for_file(&fid)?;
+        let (stem, ext) = vpath.name_and_extension()?;
+        let name = Some(match ext {
+            Some(ext) => format!("{stem}.{ext}"),
+            None => stem.to_string(),
+        });
+        println!("{name:?}");
+        Some(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use hir::{Semantics, attach_db};
@@ -680,6 +735,7 @@ mod tests {
     use crate::{RootDatabase, defs::Definition, rename_move::ExternalRefs};
 
     #[test]
+    #[ignore]
     fn test_print_syntax() {
         let fixture = r#"
 //- /main.rs
