@@ -318,52 +318,391 @@ use crate::foo::{Foo, Bar};
     #[test]
     fn test_sandbox() {
         check(
-            "crate::fizz::FizzStruct",
+            "crate::target::TargetStruct",
             r#"
-mod foo {
-    pub(crate) struct $0FooStruct;
-    pub(crate) struct FooOtherStruct;
+mod origin {
+    pub enum $0OriginStruct {
+        VariantA,
+        VariantB,
+    }
 }
 
-mod fizz {}
+mod target {}
 
-mod bar {
-    use crate::foo::FooStruct;
-    fn use_foo(f: FooStruct) -> FooStruct { f }
-}
+mod direct_import_inner {
+    use crate::origin::OriginStruct;
 
-mod beta {
-    use crate::foo::{FooStruct, FooOtherStruct};
-    fn use_foo(f: (FooStruct, FooOtherStruct)) -> (FooStruct, FooOtherStruct) { f }
+    fn foo(s: OriginStruct) -> i32 {
+        use OriginStruct::{VariantA, VariantB};
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
 }
 "#,
             r#"
-mod foo {
-    pub(crate) struct FooOtherStruct;
+mod origin {}
+
+mod target {
+    pub enum TargetStruct {
+        VariantA,
+        VariantB,
+    }
 }
 
-mod fizz {
-    pub(crate) struct FizzStruct;
-}
+mod direct_import_inner {
+    use crate::target::TargetStruct;
 
-mod bar {
-    use crate::fizz::FizzStruct;
-    fn use_foo(f: FizzStruct) -> FizzStruct { f }
-}
-
-mod beta {
-    use crate::fizz::FizzStruct;
-    use crate::foo::FooOtherStruct;
-    fn use_foo(f: (FizzStruct, FooOtherStruct)) -> (FizzStruct, FooOtherStruct) { f }
+    fn foo(s: TargetStruct) -> i32 {
+        use TargetStruct::{VariantA, VariantB};
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
 }
 "#,
         );
     }
 
-    // TODO: Alias checks
-    // TODO: Nested import
-    // TODO: Variant glob import
-    // TODO: Variant normal import
+    #[test]
+    fn external_aliased_def_imports_are_update_properly() {
+        check(
+            "crate::target::TargetStruct",
+            r#"
+mod origin {
+    pub struct $0OriginStruct;
+    pub struct OriginOtherStruct;
+}
+
+mod target {}
+
+mod crate_usage {
+    use crate::origin::OriginStruct as AliasStruct;
+    fn foo(s: AliasStruct) -> AliasStruct { s }
+}
+
+mod super_usage {
+    use super::origin::OriginStruct as AliasStruct;
+    fn foo(s: AliasStruct) -> AliasStruct { s }
+}
+
+mod grouped_usage {
+    use crate::origin::{OriginStruct as AliasStruct, OriginOtherStruct};
+    fn foo(s: AliasStruct) -> AliasStruct { s }
+    fn bar(s: OriginOtherStruct) -> OriginOtherStruct { s }
+}
+"#,
+            r#"
+mod origin {
+    pub struct OriginOtherStruct;
+}
+
+mod target {
+    pub struct TargetStruct;
+}
+
+mod crate_usage {
+    use crate::target::TargetStruct as AliasStruct;
+    fn foo(s: AliasStruct) -> AliasStruct { s }
+}
+
+mod super_usage {
+    use crate::target::TargetStruct as AliasStruct;
+
+    fn foo(s: AliasStruct) -> AliasStruct { s }
+}
+
+mod grouped_usage {
+    use crate::origin::OriginOtherStruct;
+    use crate::target::TargetStruct as AliasStruct;
+    fn foo(s: AliasStruct) -> AliasStruct { s }
+    fn bar(s: OriginOtherStruct) -> OriginOtherStruct { s }
+}
+"#,
+        )
+    }
+
+    // TODO: Add module conflict detection
+    #[test]
+    fn external_mod_imports_are_update_properly() {
+        check(
+            "crate::target::TargetStruct",
+            r#"
+mod origin {
+    pub struct $0OriginStruct;
+    pub struct OriginOtherStruct;
+}
+
+mod other {
+    pub struct OtherStruct;
+}
+
+mod target {
+    pub struct TargetOtherStruct;
+}
+
+mod normal {
+    use crate::origin;
+    fn foo(s: origin::OriginStruct) -> origin::OriginStruct { s }
+    fn bar(s: origin::OriginOtherStruct) -> origin::OriginOtherStruct { s }
+}
+
+mod grouped {
+    use crate::{origin, other};
+    fn foo(s: origin::OriginStruct) -> origin::OriginStruct { s }
+    fn bar(s: origin::OriginOtherStruct) -> origin::OriginOtherStruct { s }
+    fn baz(s: other::OtherStruct) -> other::OtherStruct { s }
+}
+
+mod aliased {
+    use crate::origin as aliased;
+    fn foo(s: aliased::OriginStruct) -> aliased::OriginStruct { s }
+    fn bar(s: aliased::OriginOtherStruct) -> aliased::OriginOtherStruct { s }
+}
+
+mod globbed {
+    use crate::origin::*;
+    fn foo(s: OriginStruct) -> OriginStruct { s }
+    fn bar(s: OriginOtherStruct) -> OriginOtherStruct { s }
+}
+
+mod target_already_imported {
+    use crate::origin;
+    use crate::target;
+    fn foo(s: origin::OriginStruct) -> origin::OriginStruct { s }
+    fn bar(s: target::TargetOtherStruct) -> target::TargetOtherStruct { s }
+}
+
+mod conflicting_alias_present {
+    use crate::origin;
+    use crate::other as target;
+    fn foo(s: origin::OriginStruct) -> origin::OriginStruct { s }
+    fn bar(s: target::OtherStruct) -> target::OtherStruct { s }
+}
+"#,
+            r#"
+mod origin {
+    pub struct OriginOtherStruct;
+}
+
+mod other {
+    pub struct OtherStruct;
+}
+
+mod target {
+    pub struct TargetStruct;
+
+    pub struct TargetOtherStruct;
+}
+
+mod normal {
+    use crate::origin;
+    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    fn bar(s: origin::OriginOtherStruct) -> origin::OriginOtherStruct { s }
+}
+
+mod grouped {
+    use crate::{origin, other};
+    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    fn bar(s: origin::OriginOtherStruct) -> origin::OriginOtherStruct { s }
+    fn baz(s: other::OtherStruct) -> other::OtherStruct { s }
+}
+
+mod aliased {
+    use crate::origin as aliased;
+    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    fn bar(s: aliased::OriginOtherStruct) -> aliased::OriginOtherStruct { s }
+}
+
+mod globbed {
+    use crate::origin::*;
+    use crate::target::TargetStruct;
+    fn foo(s: TargetStruct) -> TargetStruct { s }
+    fn bar(s: OriginOtherStruct) -> OriginOtherStruct { s }
+}
+
+mod target_already_imported {
+    use crate::origin;
+    use crate::target;
+    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    fn bar(s: target::TargetOtherStruct) -> target::TargetOtherStruct { s }
+}
+
+mod conflicting_alias_present {
+    use crate::origin;
+    use crate::other as target;
+    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    fn bar(s: target::OtherStruct) -> target::OtherStruct { s }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn external_variant_imports_are_updated_properly() {
+        check(
+            "crate::target::TargetStruct",
+            r#"
+mod origin {
+    pub enum $0OriginStruct {
+        VariantA,
+        VariantB,
+    }
+}
+
+mod target {}
+
+mod enum_relative {
+    use crate::origin::OriginStruct;
+
+    fn foo(s: OriginStruct) -> i32 {
+        match s {
+            OriginStruct::VariantA => 0,
+            OriginStruct::VariantB => 1,
+        }
+    }
+}
+
+mod mod_relative {
+    use crate::origin;
+
+    fn foo(s: origin::OriginStruct) -> i32 {
+        match s {
+            origin::OriginStruct::VariantA => 0,
+            origin::OriginStruct::VariantB => 1,
+        }
+    }
+}
+
+mod direct_import_header {
+    use crate::origin::OriginStruct::{self, VariantA, VariantB};
+
+    fn foo(s: OriginStruct) -> i32 {
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+
+mod direct_import_inner {
+    use crate::origin::OriginStruct;
+
+    fn foo(s: OriginStruct) -> i32 {
+        use OriginStruct::{VariantA, VariantB};
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+
+mod glob_import_header {
+    use crate::origin::OriginStruct::{self, *};
+
+    fn foo(s: OriginStruct) -> i32 {
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+
+mod glob_import_inner {
+    use crate::origin::OriginStruct;
+
+    fn foo(s: OriginStruct) -> i32 {
+        use OriginStruct::*;
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+"#,
+            r#"
+mod origin {}
+
+mod target {
+    pub enum TargetStruct {
+        VariantA,
+        VariantB,
+    }
+}
+
+mod enum_relative {
+    use crate::target::TargetStruct;
+
+    fn foo(s: TargetStruct) -> i32 {
+        match s {
+            TargetStruct::VariantA => 0,
+            TargetStruct::VariantB => 1,
+        }
+    }
+}
+
+mod mod_relative {
+    use crate::origin;
+
+    fn foo(s: crate::target::TargetStruct) -> i32 {
+        match s {
+            crate::target::TargetStruct::VariantA => 0,
+            crate::target::TargetStruct::VariantB => 1,
+        }
+    }
+}
+
+mod direct_import_header {
+    use crate::target::TargetStruct::{self, VariantA, VariantB};
+
+    fn foo(s: TargetStruct) -> i32 {
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+
+mod direct_import_inner {
+    use crate::target::TargetStruct;
+
+    fn foo(s: TargetStruct) -> i32 {
+        use TargetStruct::{VariantA, VariantB};
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+
+mod glob_import_header {
+    use crate::target::TargetStruct::{self, *};
+
+    fn foo(s: TargetStruct) -> i32 {
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+
+mod glob_import_inner {
+    use crate::target::TargetStruct;
+
+    fn foo(s: TargetStruct) -> i32 {
+        use TargetStruct::*;
+        match s {
+            VariantA => 0,
+            VariantB => 1,
+        }
+    }
+}
+"#,
+        );
+    }
+
     #[test]
     fn test_rename_move_external_refs_updated_properly() {
         check(

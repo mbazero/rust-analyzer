@@ -143,7 +143,7 @@ impl ImportScope {
 
 /// Insert an import path into the given file/node. A `merge` value of none indicates that no import merging is allowed to occur.
 pub fn insert_use(scope: &ImportScope, path: ast::Path, cfg: &InsertUseConfig) {
-    insert_use_with_alias_option(scope, path, cfg, None);
+    insert_use_tree(scope, make::use_tree(path, None, None, false), cfg);
 }
 
 pub fn insert_use_as_alias(scope: &ImportScope, path: ast::Path, cfg: &InsertUseConfig) {
@@ -157,22 +157,11 @@ pub fn insert_use_as_alias(scope: &ImportScope, path: ast::Path, cfg: &InsertUse
         .expect("Failed to make ast node `Rename`");
     let alias = node.rename();
 
-    insert_use_with_alias_option(scope, path, cfg, alias.map(AliasOrGlob::Alias));
+    insert_use_tree(scope, make::use_tree(path, None, alias, false), cfg)
 }
 
-#[derive(Debug, Clone)]
-pub enum AliasOrGlob {
-    Alias(ast::Rename),
-    Glob,
-}
-
-pub fn insert_use_with_alias_option(
-    scope: &ImportScope,
-    path: ast::Path,
-    cfg: &InsertUseConfig,
-    alias_or_glob: Option<AliasOrGlob>,
-) {
-    let _p = tracing::info_span!("insert_use_with_alias_option").entered();
+pub fn insert_use_tree(scope: &ImportScope, mut use_tree: ast::UseTree, cfg: &InsertUseConfig) {
+    let _p = tracing::info_span!("insert_use_tree").entered();
     let mut mb = match cfg.granularity {
         ImportGranularity::Crate => Some(MergeBehavior::Crate),
         ImportGranularity::Module => Some(MergeBehavior::Module),
@@ -201,12 +190,6 @@ pub fn insert_use_with_alias_option(
         };
     }
 
-    let (alias, add_star) = match alias_or_glob {
-        Some(AliasOrGlob::Alias(alias)) => (Some(alias), false),
-        Some(AliasOrGlob::Glob) => (None, true),
-        None => (None, false),
-    };
-    let mut use_tree = make::use_tree(path, None, alias, add_star);
     if mb == Some(MergeBehavior::One) && use_tree.path().is_some() {
         use_tree = use_tree.clone_for_update();
         use_tree.wrap_in_tree_list();

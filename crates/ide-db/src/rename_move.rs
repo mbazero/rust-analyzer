@@ -2,13 +2,12 @@ use std::iter;
 
 use crate::defs::NameClass;
 use crate::defs::NameRefClass;
-use crate::imports;
-use crate::imports::insert_use::AliasOrGlob;
+
 use crate::imports::insert_use::ImportGranularity;
 use crate::imports::insert_use::ImportScope;
 use crate::imports::insert_use::InsertUseConfig;
 use crate::imports::insert_use::insert_use;
-use crate::imports::insert_use::insert_use_with_alias_option;
+use crate::imports::insert_use::insert_use_tree;
 use crate::search::FileReference;
 use crate::search::FileReferenceNode;
 use crate::search::ReferenceCategory;
@@ -42,7 +41,6 @@ use syntax::ast;
 use syntax::ast::AnyHasVisibility;
 use syntax::ast::HasName;
 use syntax::ast::NameRef;
-use syntax::ast::PathSegmentKind;
 use syntax::ast::edit::AstNodeEdit;
 use syntax::ast::edit::IndentLevel;
 use syntax::ast::make;
@@ -179,6 +177,7 @@ impl From<RenameMoveDefinition> for Definition {
 }
 
 // HACK: Fix this
+#[derive(Debug)]
 struct NewPath {
     name: Name,
     name_str: String,      // TODO: Remove
@@ -187,8 +186,19 @@ struct NewPath {
 }
 
 impl NewPath {
+    fn name_path(&self) -> ast::Path {
+        make::path_from_text_with_edition(&self.name_str, self.edition)
+    }
+
     fn full_path(&self) -> ast::Path {
-        path_from_text_with_edition(&self.full_path_str, self.edition)
+        make::path_from_text_with_edition(&self.full_path_str, self.edition)
+    }
+
+    fn full_path_for_import(&self, use_tree_list: Option<ast::UseTreeList>) -> ast::Path {
+        let path = self.full_path();
+        let use_tree = make::use_tree(path, use_tree_list, None, false);
+        dbg!(&use_tree);
+        use_tree.syntax().first_child().and_then(ast::Path::cast).unwrap()
     }
 
     fn name_str(&self, db: &RootDatabase) -> String {
@@ -515,39 +525,69 @@ impl<'a> RenameExternalRefs<'a> {
                 })
                 .collect();
 
+            dbg!(&import_scope_muts);
+
             let ref_muts: Vec<_> = refs.iter().cloned().map(|r| r.into_mut(scb)).collect();
 
+            // TODO: Prioritize updating in-use-tree first
+            // - This might already happen as a consequence of the return order of usages (it probably does)
             for (use_tree, ref_mut) in iter::zip(use_trees, ref_muts) {
                 match ref_mut.kind {
                     NameRefKind::InUseTree(use_tree_mut) => {
-                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree.unwrap())
-                        {
-                            // TODO: Does this find the star token on the leaf use tree?
-                            // Mention that only case where we can be a glob here is if the def is an enum
-                            let alias_or_glob = if use_tree_mut.star_token().is_some() {
-                                Some(AliasOrGlob::Glob)
-                            } else if let Some(rename) = use_tree_mut.rename() {
-                                Some(AliasOrGlob::Alias(rename))
+                        let use_tree = use_tree.unwrap(); // HACK!
+                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree) {
+                            // TODO: Unify this with import update for unqualified refs
+                            // - Also, discriminate between definition import updates and module import updates
+                            // - This branch will always hit def import updates
+                            // - The unqualified branch will only hit defs as well
+                            // - The qualified branch will only hit module updates, I think, if we add the smart module updating
+
+                            let qualifiers: Vec<_> = use_tree_mut
+                                .syntax()
+                                .first_child()
+                                .and_then(ast::Path::cast)
+                                .as_ref()
+                                .map(ast::Path::qualifiers)
+                                .into_iter()
+                                .flatten()
+                                .collect();
+
+                            if qualifiers.is_empty()
+                                && use_tree_mut.parent_use_tree_list().is_none()
+                            {
+                                // Unqualified use without a use tree can be treated as a normal unqualified ref
+                                // The name must be imported in another use statement, which will be updated appropriately
+                                ted::replace(
+                                    ref_mut.name_ref.syntax(),
+                                    make::name_ref(&new_path.name_str(sema.db))
+                                        .clone_for_update()
+                                        .syntax(),
+                                );
+                            // TODO: Handle module-qualified path
                             } else {
-                                None
-                            };
+                                // Insert new use tree
+                                insert_use_tree(
+                                    &import_scope_mut,
+                                    // TODO: Does this find the star token on the leaf use tree?
+                                    // Mention that only case where we can be a glob here is if the def is an enum
+                                    make::use_tree(
+                                        new_path.full_path(),
+                                        use_tree.use_tree_list(),
+                                        use_tree.rename(),
+                                        use_tree.star_token().is_some(),
+                                    ),
+                                    &InsertUseConfig {
+                                        granularity: ImportGranularity::Module,
+                                        enforce_granularity: false,
+                                        prefix_kind: PrefixKind::ByCrate,
+                                        group: true,
+                                        skip_glob_imports: false,
+                                    },
+                                );
 
-                            // Insert new use tree
-                            insert_use_with_alias_option(
-                                &import_scope_mut,
-                                new_path.full_path().clone_for_update(),
-                                &InsertUseConfig {
-                                    granularity: ImportGranularity::Module,
-                                    enforce_granularity: false,
-                                    prefix_kind: PrefixKind::ByCrate,
-                                    group: true,
-                                    skip_glob_imports: false,
-                                },
-                                alias_or_glob,
-                            );
-
-                            // Remove old use tree
-                            use_tree_mut.remove_recursive();
+                                // Remove old use tree
+                                use_tree_mut.remove_recursive();
+                            }
                         }
                     }
                     NameRefKind::Qualified(path_mut) => {
@@ -573,13 +613,15 @@ impl<'a> RenameExternalRefs<'a> {
                             make::name_ref(&new_path.name_str(sema.db)).clone_for_update().syntax(),
                         );
 
+                        let use_tree = use_tree.unwrap(); // HACK!
+
                         // Update import if not already updated
-                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree.unwrap())
-                        {
+                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree) {
                             // Add new import
-                            insert_use_with_alias_option(
+                            insert_use_tree(
                                 &import_scope_mut,
-                                new_path.full_path().clone_for_update(),
+                                // TODO: Explain with a comment why this use tree is different from above
+                                make::use_tree(new_path.full_path(), None, None, false),
                                 &InsertUseConfig {
                                     granularity: ImportGranularity::Module,
                                     enforce_granularity: false,
@@ -587,7 +629,6 @@ impl<'a> RenameExternalRefs<'a> {
                                     group: true,
                                     skip_glob_imports: false,
                                 },
-                                None,
                             );
 
                             // Remove old import if not glob

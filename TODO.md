@@ -11,7 +11,11 @@
     - Tree traversal to build data structure
 
 # Inbox
+- Add visibility for import update
 - Make RM data structures operate on raw ast::Items
+- Remove any external ref mod imports that are no longer used
+- Add generalized add import conflict detection
+  - This is really only an issue when you add a smart module import
 
 # Random Notes
 Rename-move (RM) is triggered by normal rename code action with a fully qualified rename path--e.g.
