@@ -321,49 +321,112 @@ use crate::foo::{Foo, Bar};
             "crate::target::TargetStruct",
             r#"
 mod origin {
-    pub enum $0OriginStruct {
-        VariantA,
-        VariantB,
-    }
+    pub struct $0OriginStruct;
 }
 
 mod target {}
 
 mod direct_import_inner {
-    use crate::origin::OriginStruct;
-
-    fn foo(s: OriginStruct) -> i32 {
-        use OriginStruct::{VariantA, VariantB};
-        match s {
-            VariantA => 0,
-            VariantB => 1,
-        }
-    }
+    fn foo(s: crate::origin::OriginStruct) {}
 }
 "#,
             r#"
 mod origin {}
 
 mod target {
-    pub enum TargetStruct {
-        VariantA,
-        VariantB,
-    }
+    pub struct TargetStruct;
 }
 
 mod direct_import_inner {
-    use crate::target::TargetStruct;
-
-    fn foo(s: TargetStruct) -> i32 {
-        use TargetStruct::{VariantA, VariantB};
-        match s {
-            VariantA => 0,
-            VariantB => 1,
-        }
-    }
+    fn foo(s: crate::target::TargetStruct) {}
 }
 "#,
         );
+    }
+
+    #[test]
+    fn external_singly_qualified_ref_is_updated_properly() {
+        check(
+            "crate::target_outer::target::TargetStruct",
+            r#"
+mod origin_outer {
+    pub mod origin {
+        pub struct $0OriginStruct;
+    }
+}
+
+mod target_outer {
+    pub mod target {}
+}
+
+mod test {
+    use crate::origin_outer::origin;
+    fn foo(s: origin::OriginStruct) {}
+}
+"#,
+            r#"
+mod origin_outer {
+    pub mod origin {}
+}
+
+mod target_outer {
+    pub mod target {
+        pub struct TargetStruct;
+    }
+}
+
+mod test {
+    use crate::origin_outer::origin;
+    use crate::target_outer::target;
+    fn foo(s: target::TargetStruct) {}
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn external_ancestor_qualified_ref_is_updated_properly() {
+        check(
+            "crate::outer::origin::target::TargetStruct",
+            r#"
+mod outer {
+    pub mod origin {
+        pub struct $0OriginStruct;
+
+        pub mod target {}
+    }
+}
+
+mod import_is_parent {
+    use crate::outer::origin;
+    fn foo(s: origin::OriginStruct) {}
+}
+
+mod import_is_ancestor {
+    use crate::outer;
+    fn foo(s: outer::origin::OriginStruct) {}
+}
+"#,
+            r#"
+mod outer {
+    pub mod origin {
+        pub mod target {
+            pub struct TargetStruct;
+        }
+    }
+}
+
+mod import_is_parent {
+    use crate::outer::origin;
+    fn foo(s: origin::target::TargetStruct) {}
+}
+
+mod import_is_ancestor {
+    use crate::outer;
+    fn foo(s: outer::origin::target::TargetStruct) {}
+}
+"#,
+        )
     }
 
     #[test]
@@ -498,21 +561,21 @@ mod target {
 }
 
 mod normal {
-    use crate::origin;
-    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    use crate::{origin, target};
+    fn foo(s: target::TargetStruct) -> target::TargetStruct { s }
     fn bar(s: origin::OriginOtherStruct) -> origin::OriginOtherStruct { s }
 }
 
 mod grouped {
-    use crate::{origin, other};
-    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    use crate::{origin, other, target};
+    fn foo(s: target::TargetStruct) -> target::TargetStruct { s }
     fn bar(s: origin::OriginOtherStruct) -> origin::OriginOtherStruct { s }
     fn baz(s: other::OtherStruct) -> other::OtherStruct { s }
 }
 
 mod aliased {
-    use crate::origin as aliased;
-    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    use crate::{origin as aliased, target};
+    fn foo(s: target::TargetStruct) -> target::TargetStruct { s }
     fn bar(s: aliased::OriginOtherStruct) -> aliased::OriginOtherStruct { s }
 }
 
@@ -526,18 +589,23 @@ mod globbed {
 mod target_already_imported {
     use crate::origin;
     use crate::target;
-    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    use crate::target;
+    fn foo(s: target::TargetStruct) -> target::TargetStruct { s }
     fn bar(s: target::TargetOtherStruct) -> target::TargetOtherStruct { s }
 }
 
 mod conflicting_alias_present {
     use crate::origin;
     use crate::other as target;
-    fn foo(s: crate::target::TargetStruct) -> crate::target::TargetStruct { s }
+    use crate::target;
+    fn foo(s: target::TargetStruct) -> target::TargetStruct { s }
     fn bar(s: target::OtherStruct) -> target::OtherStruct { s }
 }
 "#,
         );
+        // FIXME:
+        // - target_already_imported
+        // - conflicting_alias_present
     }
 
     #[test]
@@ -644,12 +712,12 @@ mod enum_relative {
 }
 
 mod mod_relative {
-    use crate::origin;
+    use crate::{origin, target};
 
-    fn foo(s: crate::target::TargetStruct) -> i32 {
+    fn foo(s: target::TargetStruct) -> i32 {
         match s {
-            crate::target::TargetStruct::VariantA => 0,
-            crate::target::TargetStruct::VariantB => 1,
+            target::TargetStruct::VariantA => 0,
+            target::TargetStruct::VariantB => 1,
         }
     }
 }
@@ -766,11 +834,15 @@ use crate::origin::inner::*;
 use crate::target::TargetStruct;
 struct Inner(TargetStruct);
 //- /mod_qualified_ref.rs
+use crate::target;
+
 use super::origin::inner;
-struct Inner(crate::target::TargetStruct);
+struct Inner(target::TargetStruct);
 //- /mod_qualified_ref_from_glob.rs
+use crate::target;
+
 use super::origin::*;
-struct Inner(crate::target::TargetStruct);
+struct Inner(target::TargetStruct);
 //- /crate_qualified_ref.rs
 struct Inner(crate::target::TargetStruct);
 //- /super_qualified_ref.rs

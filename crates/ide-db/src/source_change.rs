@@ -9,6 +9,7 @@ use crate::imports::insert_use::{ImportScope, ImportScopeKind};
 use crate::text_edit::{TextEdit, TextEditBuilder};
 use crate::{SnippetCap, assists::Command, syntax_helpers::tree_diff::diff};
 use base_db::AnchoredPathBuf;
+use hir::{ImportResolution, InFile};
 use itertools::Itertools;
 use macros::UpmapFromRaFixture;
 use nohash_hasher::IntMap;
@@ -395,6 +396,10 @@ impl SourceChangeBuilder {
         self.mutated_tree.get_or_insert_with(|| TreeMutator::new(node.syntax())).make_mut(&node)
     }
 
+    pub fn make_in_file_mut<N: AstNode>(&mut self, in_file: InFile<N>) -> InFile<N> {
+        InFile { file_id: in_file.file_id, value: self.make_mut(in_file.value) }
+    }
+
     pub fn make_import_scope_mut(&mut self, scope: ImportScope) -> ImportScope {
         ImportScope {
             kind: match scope.kind.clone() {
@@ -405,6 +410,17 @@ impl SourceChangeBuilder {
             required_cfgs: scope.required_cfgs.iter().map(|it| self.make_mut(it.clone())).collect(),
         }
     }
+
+    pub fn make_import_res_mut(&mut self, res: ImportResolution) -> ImportResolution {
+        match res {
+            ImportResolution::Import(it) => ImportResolution::Import(self.make_in_file_mut(it)),
+            ImportResolution::Glob(it) => ImportResolution::Glob(self.make_in_file_mut(it)),
+            ImportResolution::ExternCrate(it) => {
+                ImportResolution::ExternCrate(self.make_in_file_mut(it))
+            }
+        }
+    }
+
     /// Returns a copy of the `node`, suitable for mutation.
     ///
     /// Syntax trees in rust-analyzer are typically immutable, and mutating

@@ -11,11 +11,29 @@
     - Tree traversal to build data structure
 
 # Inbox
+- Implement smart qualified ref update
 - Add visibility for import update
 - Make RM data structures operate on raw ast::Items
 - Remove any external ref mod imports that are no longer used
 - Add generalized add import conflict detection
   - This is really only an issue when you add a smart module import
+  
+# Qualified external ref update
+Qualified external ref means that the origin mod is a descendent of the import mod.
+```rust
+use crate::foo::bar;
+let x = bar::baz::origin::OriginStruct;
+```
+Origin mod `origin` is a descendent of import mod `bar`. Thus the qualified ref can be relative to the import mod.
+
+## Qualified ref is single-qualifier mod import
+- Import new target mod
+- Update qualified ref to be single-qualifier import from the new target mod
+
+## Target mod is descendent
+If target mod is also a descendent of the import mod:
+- Don't change the import
+- Update qualified ref to reflect the new descendent path
 
 # Random Notes
 Rename-move (RM) is triggered by normal rename code action with a fully qualified rename path--e.g.

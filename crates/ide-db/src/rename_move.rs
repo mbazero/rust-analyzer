@@ -3,6 +3,7 @@ use std::iter;
 use crate::defs::NameClass;
 use crate::defs::NameRefClass;
 
+use crate::helpers::mod_path_to_ast;
 use crate::imports::insert_use::ImportGranularity;
 use crate::imports::insert_use::ImportScope;
 use crate::imports::insert_use::InsertUseConfig;
@@ -21,6 +22,7 @@ use hir::ImportResolution;
 use hir::InFile;
 use hir::InFileWrapper;
 use hir::ModPath;
+use hir::ModuleDef;
 use hir::ModuleSource;
 use hir::PathResolution;
 use hir::PrefixKind;
@@ -41,6 +43,7 @@ use syntax::ast;
 use syntax::ast::AnyHasVisibility;
 use syntax::ast::HasName;
 use syntax::ast::NameRef;
+use syntax::ast::PathSegmentKind;
 use syntax::ast::edit::AstNodeEdit;
 use syntax::ast::edit::IndentLevel;
 use syntax::ast::make;
@@ -183,6 +186,7 @@ struct NewPath {
     name_str: String,      // TODO: Remove
     full_path_str: String, // TODO: Remove
     edition: Edition,
+    module: Module,
 }
 
 impl NewPath {
@@ -194,10 +198,36 @@ impl NewPath {
         make::path_from_text_with_edition(&self.full_path_str, self.edition)
     }
 
+    fn relative_path_from(&self, db: &RootDatabase, root: &Module) -> Option<ast::Path> {
+        let modules: Vec<_> = std::iter::successors(Some(self.module), |m| m.parent(db))
+            .take_while_inclusive(|m| m != root)
+            .collect();
+        if modules.last() != Some(root) {
+            return None;
+        }
+        let segments =
+            modules.into_iter().rev().filter_map(|m| m.name(db)).chain([self.name.clone()]);
+        let mod_path = ModPath::from_segments(hir::PathKind::Plain, segments);
+        Some(mod_path_to_ast(&mod_path, self.edition))
+    }
+
+    fn rel_path_from_target_mod(&self, db: &RootDatabase) -> ast::Path {
+        let mod_path = ModPath::from_segments(
+            hir::PathKind::Plain,
+            [self.module.name(db).unwrap(), self.name.clone()],
+        );
+        mod_path_to_ast(&mod_path, self.edition)
+    }
+
+    // HACK!
+    fn mod_full_path(&self) -> ast::Path {
+        let mod_path = self.full_path_str.rsplit_once("::").unwrap().0;
+        make::path_from_text_with_edition(&mod_path, self.edition)
+    }
+
     fn full_path_for_import(&self, use_tree_list: Option<ast::UseTreeList>) -> ast::Path {
         let path = self.full_path();
         let use_tree = make::use_tree(path, use_tree_list, None, false);
-        dbg!(&use_tree);
         use_tree.syntax().first_child().and_then(ast::Path::cast).unwrap()
     }
 
@@ -272,6 +302,7 @@ fn rename_move_adt(
         name_str: format!("{}", new_name.display(sema.db, edition)),
         full_path_str: target_path.to_owned(),
         name: new_name,
+        module: target_mod,
         edition,
     };
 
@@ -412,8 +443,8 @@ fn rename_move_adt(
 #[derive(Debug, Clone)]
 enum NameRefKind {
     InUseTree(ast::UseTree),
-    Qualified(ast::Path),
-    UnQualified { import_is_glob: bool, import_use_tree: ast::UseTree },
+    Qualified { ref_path: ast::Path, first_qual_import: Option<ImportResolution> },
+    UnQualified { name_ref_import: ImportResolution },
 }
 
 #[derive(Debug, Clone)]
@@ -428,13 +459,13 @@ impl RichNameRef {
             name_ref: scb.make_mut(self.name_ref),
             kind: match self.kind {
                 NameRefKind::InUseTree(use_tree) => NameRefKind::InUseTree(scb.make_mut(use_tree)),
-                NameRefKind::Qualified(path) => NameRefKind::Qualified(scb.make_mut(path)),
-                NameRefKind::UnQualified { import_is_glob, import_use_tree } => {
-                    NameRefKind::UnQualified {
-                        import_is_glob,
-                        import_use_tree: scb.make_mut(import_use_tree),
-                    }
-                }
+                NameRefKind::Qualified { ref_path, first_qual_import } => NameRefKind::Qualified {
+                    ref_path: scb.make_mut(ref_path),
+                    first_qual_import: first_qual_import.map(|i| scb.make_import_res_mut(i)),
+                },
+                NameRefKind::UnQualified { name_ref_import } => NameRefKind::UnQualified {
+                    name_ref_import: scb.make_import_res_mut(name_ref_import),
+                },
             },
         }
     }
@@ -463,27 +494,38 @@ impl<'a> RenameExternalRefs<'a> {
                 let refs = file_refs
                     .into_iter()
                     .filter_map(|FileReference { name, category, .. }| match name {
-                        FileReferenceNode::Name(_) => None,
+                        FileReferenceNode::Name(_) => unreachable!("Got FileReferenceNode::Name"),
                         FileReferenceNode::NameRef(name_ref) => {
-                            let path = name_ref.syntax().ancestors().find_map(ast::Path::cast)?;
+                            let ref_path =
+                                name_ref.syntax().ancestors().find_map(ast::Path::cast).unwrap();
                             let kind = if category.contains(ReferenceCategory::IMPORT) {
                                 NameRefKind::InUseTree(
-                                    name_ref.syntax().ancestors().find_map(ast::UseTree::cast)?,
+                                    name_ref
+                                        .syntax()
+                                        .ancestors()
+                                        .find_map(ast::UseTree::cast)
+                                        .unwrap(),
                                 )
-                            } else if path.first_qualifier().is_some() {
-                                NameRefKind::Qualified(path)
+                            } else if let Some(first_qual) = ref_path.first_qualifier() {
+                                NameRefKind::Qualified {
+                                    ref_path,
+                                    first_qual_import: sema.resolve_import(&first_qual),
+                                }
                             } else {
-                                let import_res =
-                                    sema.resolve_import(&path.first_qualifier_or_self())?;
                                 NameRefKind::UnQualified {
-                                    import_is_glob: import_res.is_glob(),
-                                    import_use_tree: import_res.use_tree()?,
+                                    // TODO: What is the only case where we will fail to resolve an
+                                    // import for an unqualified ref? Answer, for a usage within the
+                                    // same scope as the definition. For now, we can just skip
+                                    // these, but we really need to do a better job of this when we
+                                    // properly handle internal refs. The proper answer is perhaps
+                                    // to exclude the move items range from the search scope.
+                                    name_ref_import: sema.resolve_import(&ref_path)?,
                                 }
                             };
                             RichNameRef { name_ref, kind }.into()
                         }
-                        FileReferenceNode::Lifetime(_) => None,
-                        FileReferenceNode::FormatStringEntry(_, _) => None,
+                        FileReferenceNode::Lifetime(_) => unreachable!(),
+                        FileReferenceNode::FormatStringEntry(_, _) => unreachable!(),
                     })
                     .collect();
 
@@ -498,18 +540,19 @@ impl<'a> RenameExternalRefs<'a> {
         let RenameExternalRefs { sema, refs } = self;
 
         for (file_id, refs) in refs {
-            // TODO: Remove
-            debug::print_fname(sema.db, file_id);
-
             // TODO: Wrap in per-file function that returns option
             scb.edit_file(file_id.file_id(sema.db));
 
             let use_trees: Vec<_> = refs
                 .iter()
                 .map(|RichNameRef { kind, .. }| match kind {
-                    NameRefKind::InUseTree(use_tree) => Some(use_tree),
-                    NameRefKind::Qualified(_) => None,
-                    NameRefKind::UnQualified { import_use_tree, .. } => Some(import_use_tree),
+                    NameRefKind::InUseTree(use_tree) => Some(use_tree.clone()),
+                    NameRefKind::Qualified { first_qual_import, .. } => {
+                        first_qual_import.as_ref().and_then(|i| i.use_tree())
+                    }
+                    NameRefKind::UnQualified { name_ref_import, .. } => {
+                        Some(name_ref_import.use_tree().unwrap())
+                    }
                 })
                 .collect();
 
@@ -517,7 +560,7 @@ impl<'a> RenameExternalRefs<'a> {
                 .iter()
                 .flatten()
                 .unique()
-                .filter_map(|&use_tree| {
+                .filter_map(|use_tree| {
                     let import_scope = scb.make_import_scope_mut(
                         ImportScope::find_insert_use_container(use_tree.syntax(), sema)?,
                     );
@@ -525,16 +568,15 @@ impl<'a> RenameExternalRefs<'a> {
                 })
                 .collect();
 
-            dbg!(&import_scope_muts);
-
             let ref_muts: Vec<_> = refs.iter().cloned().map(|r| r.into_mut(scb)).collect();
 
             // TODO: Prioritize updating in-use-tree first
             // - This might already happen as a consequence of the return order of usages (it probably does)
+            // - Actually, maybe better to split this into import (use) updates and normal ref updates
             for (use_tree, ref_mut) in iter::zip(use_trees, ref_muts) {
                 match ref_mut.kind {
                     NameRefKind::InUseTree(use_tree_mut) => {
-                        let use_tree = use_tree.unwrap(); // HACK!
+                        let use_tree = use_tree.unwrap();
                         if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree) {
                             // TODO: Unify this with import update for unqualified refs
                             // - Also, discriminate between definition import updates and module import updates
@@ -590,22 +632,77 @@ impl<'a> RenameExternalRefs<'a> {
                             }
                         }
                     }
-                    NameRefKind::Qualified(path_mut) => {
+                    NameRefKind::Qualified { ref_path: ref_path_mut, .. } => {
                         // TODO: Remove import if it becomes unused
 
-                        // Rename to fully qualified
-                        // TODO: Use make passed in as param
-                        ted::replace(
-                            path_mut.syntax(),
-                            make::path_from_text(&new_path.full_path_str)
-                                .clone_for_update()
-                                .syntax(),
-                        );
+                        let ref_module = (|| {
+                            let path = use_tree.as_ref().map(|ut| ut.path().unwrap())?;
+                            match self.sema.resolve_path(&path)? {
+                                PathResolution::Def(ModuleDef::Module(m)) => Some(m),
+                                _ => None,
+                            }
+                        })();
+
+                        if let Some(ref_module) = ref_module
+                            && new_path.module.ancestors(self.sema.db).contains(&ref_module)
+                        {
+                            // If the target module is a descendent of the imported module, we don't
+                            // touch the import and just update the qualified reference to reflect
+                            // the new relative path.
+                            ted::replace(
+                                ref_path_mut.syntax(),
+                                new_path
+                                    .relative_path_from(&sema.db, &ref_module)
+                                    .unwrap()
+                                    .clone_for_update()
+                                    .syntax(),
+                            );
+                        } else if ref_module.is_some()
+                            && ref_path_mut.qualifiers().exactly_one().is_ok()
+                        {
+                            // TODO: Explain why the ref_module.is_some() check ensures that we have
+                            // a relative path instead of a crate modpath. Actually, better yet,
+                            // convert the ref_path into a ModPath and get the type from that.
+
+                            // If the qualified ref is single-module relative import from the origin
+                            // module, we mirror this behavior in the updated import. That is, we
+                            // import the target module and update the reference to be relative to
+                            // the target module.
+                            ted::replace(
+                                ref_path_mut.syntax(),
+                                new_path
+                                    .rel_path_from_target_mod(sema.db)
+                                    .clone_for_update()
+                                    .syntax(),
+                            );
+
+                            if let Some(import_scope_mut) =
+                                import_scope_muts.remove(&use_tree.unwrap())
+                            {
+                                // Add new import
+                                insert_use_tree(
+                                    &import_scope_mut,
+                                    // TODO: Explain with a comment why this use tree is different from above
+                                    make::use_tree(new_path.mod_full_path(), None, None, false),
+                                    &InsertUseConfig {
+                                        granularity: ImportGranularity::Module,
+                                        enforce_granularity: false,
+                                        prefix_kind: PrefixKind::ByCrate,
+                                        group: true,
+                                        skip_glob_imports: false,
+                                    },
+                                );
+                            }
+                        } else {
+                            // Otherwise, we don't attempt to be smart about things and just update
+                            // the ref to be a fullly-qualified path.
+                            ted::replace(
+                                ref_path_mut.syntax(),
+                                new_path.full_path().clone_for_update().syntax(),
+                            );
+                        }
                     }
-                    NameRefKind::UnQualified {
-                        import_is_glob,
-                        import_use_tree: import_use_tree_mut,
-                    } => {
+                    NameRefKind::UnQualified { name_ref_import: import_mut } => {
                         // Rename name ref
                         // TODO: Use make passed as a param
                         ted::replace(
@@ -613,10 +710,9 @@ impl<'a> RenameExternalRefs<'a> {
                             make::name_ref(&new_path.name_str(sema.db)).clone_for_update().syntax(),
                         );
 
-                        let use_tree = use_tree.unwrap(); // HACK!
-
                         // Update import if not already updated
-                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree) {
+                        if let Some(import_scope_mut) = import_scope_muts.remove(&use_tree.unwrap())
+                        {
                             // Add new import
                             insert_use_tree(
                                 &import_scope_mut,
@@ -635,8 +731,8 @@ impl<'a> RenameExternalRefs<'a> {
                             // If the import is a glob, it must be a glob on the origin module of the definition,
                             // which might resolve other usages in the current file. We could check for other usages
                             // to determine if we can safely remove the glob import, but for now we just leave it.
-                            if !import_is_glob {
-                                import_use_tree_mut.remove_recursive();
+                            if !import_mut.is_glob() {
+                                import_mut.use_tree().unwrap().remove_recursive();
                             }
                         }
                     }
