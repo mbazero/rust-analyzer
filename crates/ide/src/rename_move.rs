@@ -351,6 +351,64 @@ mod target_already_imported {
     }
 
     #[test]
+    fn internal_ref_imported_internally_has_no_import_added() {
+        check(
+            "crate::target::TargetStruct",
+            r#"
+//- /main.rs
+mod origin;
+mod target;
+
+//- /origin.rs
+pub struct $0OriginStruct;
+
+
+
+//- /target.rs
+
+"#,
+            r#"
+"#,
+        );
+    }
+
+    #[test]
+    fn internal_plain_ref_imported_externally_has_import_added() {}
+
+    #[test]
+    fn internal_plain_ref_imported_internally_has_no_import_added() {}
+
+    #[test]
+    fn internal_super_ref_is_converted_to_crate_ref() {}
+
+    #[test]
+    fn internal_crate_ref_is_not_changed() {}
+
+    #[test]
+    fn internal_absolute_ref_is_not_changed() {}
+
+    #[test]
+    fn internal_plain_import_has_import_added() {}
+
+    #[test]
+    fn internal_super_import_is_converted_to_crate_import() {}
+
+    #[test]
+    fn internal_crate_import_is_not_changed() {}
+
+    #[test]
+    fn internal_unused_plain_import_has_import_added() {}
+
+    #[test]
+    fn internal_unused_super_import_is_converted_to_crate_import() {}
+
+    #[test]
+    fn external_import_resolving_only_internal_refs_is_removed() {}
+
+    #[test]
+    fn external_import_resolving_both_internal_and_external_refs_is_retained() {}
+
+    #[test]
     fn external_singly_qualified_ref_is_updated_properly() {
         check(
             "crate::target_outer::target::TargetStruct",

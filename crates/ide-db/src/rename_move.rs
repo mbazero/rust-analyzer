@@ -412,8 +412,12 @@ fn rename_move_adt(
         });
     });
 
+    // Update internal refs
+    let items: Vec<_> =
+        chain![[new_adt.into()], new_adt_impls.into_iter().map(ast::Item::from)].collect();
+    // let internal_refs = items.iter().map(|item| item.sy)
+
     // Move items to target
-    let items = chain![[new_adt.into()], new_adt_impls.into_iter().map(ast::Item::from)];
     match target_mod_source.value {
         ModuleSource::SourceFile(source_file) => {
             scb.apply_edits_in_file(target_file_id, &target_mod_node, move |editor| {
@@ -438,6 +442,11 @@ fn rename_move_adt(
         .update_inline(&mut scb, &new_path)?;
 
     Some(scb.finish())
+}
+
+enum ImportLocation {
+    InsideMoveRange,
+    OutsideMoveRange,
 }
 
 #[derive(Debug, Clone)]
