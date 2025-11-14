@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use hir::Semantics;
 use itertools::{FoldWhile, Itertools};
 use syntax::{
-    Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, ToSmolStr, algo,
+    Direction, NodeOrToken, SyntaxKind, SyntaxNode, ToSmolStr, algo,
     ast::{
         self, AstNode, HasAttrs, HasModuleItem, HasVisibility, PathSegmentKind,
         edit_in_place::Removable, make,
@@ -206,16 +206,16 @@ pub fn insert_use_tree(scope: &ImportScope, mut use_tree: ast::UseTree, cfg: &In
     if let Some(mb) = mb {
         // merge into existing imports if possible and the import doesn't already exist
         match compute_merge(scope, &use_item, mb, cfg.skip_glob_imports) {
-            MergeResult::ImportsEqual => {
+            MergeResult::ImportAlreadyExists => {
                 return;
             }
-            MergeResult::Merged { existing_use, merged_use } => {
+            MergeResult::CanMerge { existing_use, merged_use } => {
                 ted::replace(existing_use.syntax(), merged_use.syntax());
                 return;
             }
-            MergeResult::None => {}
+            MergeResult::CannotMerge => {}
         }
-    } else if let MergeResult::ImportsEqual =
+    } else if let MergeResult::ImportAlreadyExists =
         compute_merge(scope, &use_item, MergeBehavior::Crate, true)
     {
         // return if a speculative merge indicates that the import already exists
@@ -229,9 +229,9 @@ pub fn insert_use_tree(scope: &ImportScope, mut use_tree: ast::UseTree, cfg: &In
 
 #[derive(Debug, Clone)]
 enum MergeResult {
-    None,
-    ImportsEqual,
-    Merged { existing_use: ast::Use, merged_use: ast::Use },
+    ImportAlreadyExists,
+    CanMerge { existing_use: ast::Use, merged_use: ast::Use },
+    CannotMerge,
 }
 
 fn compute_merge(
@@ -245,13 +245,13 @@ fn compute_merge(
         .children()
         .filter_map(ast::Use::cast)
         .filter(|use_| !(skip_glob_imports && use_.is_simple_glob()))
-        .fold_while(MergeResult::None, |res, existing_use| {
+        .fold_while(MergeResult::CannotMerge, |res, existing_use| {
             match try_merge_imports(&existing_use, &use_item, mb) {
                 Some(merged_use) if existing_use.to_smolstr() == merged_use.to_smolstr() => {
-                    FoldWhile::Done(MergeResult::ImportsEqual)
+                    FoldWhile::Done(MergeResult::ImportAlreadyExists)
                 }
-                Some(merged_use) if matches!(res, MergeResult::None) => {
-                    FoldWhile::Continue(MergeResult::Merged { existing_use, merged_use })
+                Some(merged_use) if matches!(res, MergeResult::CannotMerge) => {
+                    FoldWhile::Continue(MergeResult::CanMerge { existing_use, merged_use })
                 }
                 _ => FoldWhile::Continue(res),
             }
