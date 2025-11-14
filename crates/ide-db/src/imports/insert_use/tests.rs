@@ -171,6 +171,19 @@ fn insert_existing() {
 }
 
 #[test]
+fn insert_existing_with_sibling_import() {
+    check_crate(
+        "crate::second",
+        r"
+use crate::first;
+use crate::second;",
+        r"
+use crate::first;
+use crate::second;",
+    )
+}
+
+#[test]
 fn insert_start() {
     check_none(
         "std::bar::AA",

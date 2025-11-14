@@ -5,8 +5,9 @@ mod tests;
 use std::cmp::Ordering;
 
 use hir::Semantics;
+use itertools::{FoldWhile, Itertools};
 use syntax::{
-    Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, algo,
+    Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, ToSmolStr, algo,
     ast::{
         self, AstNode, HasAttrs, HasModuleItem, HasVisibility, PathSegmentKind,
         edit_in_place::Removable, make,
@@ -162,6 +163,7 @@ pub fn insert_use_as_alias(scope: &ImportScope, path: ast::Path, cfg: &InsertUse
 
 pub fn insert_use_tree(scope: &ImportScope, mut use_tree: ast::UseTree, cfg: &InsertUseConfig) {
     let _p = tracing::info_span!("insert_use_tree").entered();
+
     let mut mb = match cfg.granularity {
         ImportGranularity::Crate => Some(MergeBehavior::Crate),
         ImportGranularity::Module => Some(MergeBehavior::Module),
@@ -203,14 +205,36 @@ pub fn insert_use_tree(scope: &ImportScope, mut use_tree: ast::UseTree, cfg: &In
 
     // merge into existing imports if possible
     if let Some(mb) = mb {
+        enum MergeResult {
+            None,
+            ImportsEqual,
+            Merged { existing_use: ast::Use, merged_use: ast::Use },
+        }
+
         let filter = |it: &_| !(cfg.skip_glob_imports && ast::Use::is_simple_glob(it));
-        for existing_use in
-            scope.as_syntax_node().children().filter_map(ast::Use::cast).filter(filter)
-        {
-            if let Some(merged) = try_merge_imports(&existing_use, &use_item, mb) {
-                ted::replace(existing_use.syntax(), merged.syntax());
+        let merge_result =
+            scope.as_syntax_node().children().filter_map(ast::Use::cast).filter(filter).fold_while(
+                MergeResult::None,
+                |res, existing_use| match try_merge_imports(&existing_use, &use_item, mb) {
+                    Some(merged_use) if existing_use.to_smolstr() == merged_use.to_smolstr() => {
+                        FoldWhile::Done(MergeResult::ImportsEqual)
+                    }
+                    Some(merged_use) if matches!(res, MergeResult::None) => {
+                        FoldWhile::Continue(MergeResult::Merged { existing_use, merged_use })
+                    }
+                    _ => FoldWhile::Continue(res),
+                },
+            );
+
+        match merge_result.into_inner() {
+            MergeResult::ImportsEqual => {
                 return;
             }
+            MergeResult::Merged { existing_use, merged_use } => {
+                ted::replace(existing_use.syntax(), merged_use.syntax());
+                return;
+            }
+            MergeResult::None => {}
         }
     }
     // either we weren't allowed to merge or there is no import that fits the merge conditions

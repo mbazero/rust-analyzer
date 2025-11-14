@@ -326,8 +326,11 @@ mod origin {
 
 mod target {}
 
-mod direct_import_inner {
-    fn foo(s: crate::origin::OriginStruct) {}
+mod target_already_imported {
+    use crate::origin;
+    use crate::target;
+    fn foo(s: origin::OriginStruct) -> origin::OriginStruct { s }
+    fn bar(s: target::TargetOtherStruct) -> target::TargetOtherStruct { s }
 }
 "#,
             r#"
@@ -337,8 +340,11 @@ mod target {
     pub struct TargetStruct;
 }
 
-mod direct_import_inner {
-    fn foo(s: crate::target::TargetStruct) {}
+mod target_already_imported {
+    use crate::origin;
+    use crate::target;
+    fn foo(s: target::TargetStruct) -> target::TargetStruct { s }
+    fn bar(s: target::TargetOtherStruct) -> target::TargetOtherStruct { s }
 }
 "#,
         );
@@ -588,7 +594,6 @@ mod globbed {
 
 mod target_already_imported {
     use crate::origin;
-    use crate::target;
     use crate::target;
     fn foo(s: target::TargetStruct) -> target::TargetStruct { s }
     fn bar(s: target::TargetOtherStruct) -> target::TargetOtherStruct { s }
