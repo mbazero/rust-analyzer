@@ -203,30 +203,9 @@ pub fn insert_use_tree(scope: &ImportScope, mut use_tree: ast::UseTree, cfg: &In
         ted::insert(ted::Position::first_child_of(use_item.syntax()), attr);
     }
 
-    // merge into existing imports if possible
     if let Some(mb) = mb {
-        enum MergeResult {
-            None,
-            ImportsEqual,
-            Merged { existing_use: ast::Use, merged_use: ast::Use },
-        }
-
-        let filter = |it: &_| !(cfg.skip_glob_imports && ast::Use::is_simple_glob(it));
-        let merge_result =
-            scope.as_syntax_node().children().filter_map(ast::Use::cast).filter(filter).fold_while(
-                MergeResult::None,
-                |res, existing_use| match try_merge_imports(&existing_use, &use_item, mb) {
-                    Some(merged_use) if existing_use.to_smolstr() == merged_use.to_smolstr() => {
-                        FoldWhile::Done(MergeResult::ImportsEqual)
-                    }
-                    Some(merged_use) if matches!(res, MergeResult::None) => {
-                        FoldWhile::Continue(MergeResult::Merged { existing_use, merged_use })
-                    }
-                    _ => FoldWhile::Continue(res),
-                },
-            );
-
-        match merge_result.into_inner() {
+        // merge into existing imports if possible and the import doesn't already exist
+        match compute_merge(scope, &use_item, mb, cfg.skip_glob_imports) {
             MergeResult::ImportsEqual => {
                 return;
             }
@@ -236,10 +215,48 @@ pub fn insert_use_tree(scope: &ImportScope, mut use_tree: ast::UseTree, cfg: &In
             }
             MergeResult::None => {}
         }
+    } else if let MergeResult::ImportsEqual =
+        compute_merge(scope, &use_item, MergeBehavior::Crate, true)
+    {
+        // return if a speculative merge indicates that the import already exists
+        return;
     }
+
     // either we weren't allowed to merge or there is no import that fits the merge conditions
     // so look for the place we have to insert to
     insert_use_(scope, use_item, cfg.group);
+}
+
+#[derive(Debug, Clone)]
+enum MergeResult {
+    None,
+    ImportsEqual,
+    Merged { existing_use: ast::Use, merged_use: ast::Use },
+}
+
+fn compute_merge(
+    scope: &ImportScope,
+    use_item: &ast::Use,
+    mb: MergeBehavior,
+    skip_glob_imports: bool,
+) -> MergeResult {
+    scope
+        .as_syntax_node()
+        .children()
+        .filter_map(ast::Use::cast)
+        .filter(|use_| !(skip_glob_imports && use_.is_simple_glob()))
+        .fold_while(MergeResult::None, |res, existing_use| {
+            match try_merge_imports(&existing_use, &use_item, mb) {
+                Some(merged_use) if existing_use.to_smolstr() == merged_use.to_smolstr() => {
+                    FoldWhile::Done(MergeResult::ImportsEqual)
+                }
+                Some(merged_use) if matches!(res, MergeResult::None) => {
+                    FoldWhile::Continue(MergeResult::Merged { existing_use, merged_use })
+                }
+                _ => FoldWhile::Continue(res),
+            }
+        })
+        .into_inner()
 }
 
 pub fn ast_to_remove_for_path_in_use_stmt(path: &ast::Path) -> Option<Box<dyn Removable>> {

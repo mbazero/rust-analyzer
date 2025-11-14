@@ -609,7 +609,6 @@ mod conflicting_alias_present {
 "#,
         );
         // FIXME:
-        // - target_already_imported
         // - conflicting_alias_present
     }
 
